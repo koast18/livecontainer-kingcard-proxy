@@ -42,7 +42,9 @@ for f in $SRCS; do
   base="$(basename "${f%.*}")_$(echo "$f" | cksum | awk '{print $1}')"
   o="$OBJDIR/${base}.o"
   echo ">> compile $f"
-  clang $CFLAGS -c "$f" -o "$o"
+  EXTRA=""
+  if [[ "$f" == *webkit_proxy.m ]]; then EXTRA="-fno-objc-arc"; fi
+  clang $CFLAGS $EXTRA -c "$f" -o "$o"
   OBJS="$OBJS $o"
 done
 

@@ -43,7 +43,8 @@
     });
     dispatch_resume(timer);
     // keep timer retained by associated object? static dictionary not needed in ObjC; use dispatch_source_t property.
-    objc_setAssociatedObject(self, @selector(start), timer, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    static char kStatsTimerKey;
+    objc_setAssociatedObject(self, &kStatsTimerKey, timer, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
 - (void)flushNow {
