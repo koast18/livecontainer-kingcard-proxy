@@ -109,9 +109,12 @@ async function loadStatus() {
   if (s.error) { $('cfgMsg').textContent = '状态获取失败: '+s.error; return; }
   $('proxyEnabled').checked = !!s.proxyEnabled;
   $('blockNonTcp').checked = !!s.blockNonTcp;
-  $('proxyType').value = s.proxyType || 'http';
-  $('proxyHost').value = s.proxyHost || '';
-  $('proxyPort').value = s.proxyPort || '';
+  const editing = document.activeElement && ['proxyType','proxyHost','proxyPort'].indexOf(document.activeElement.id) >= 0;
+  if (!editing) {
+    $('proxyType').value = s.proxyType || 'http';
+    $('proxyHost').value = s.proxyHost || '';
+    $('proxyPort').value = s.proxyPort || '';
+  }
   $('version').textContent = s.version || '—';
   $('dataDir').textContent = s.dataDirectory || '—';
   $('port').textContent = s.serverPort || '—';
