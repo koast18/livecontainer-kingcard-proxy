@@ -1,0 +1,40 @@
+name: Build LCProxy
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build dylib and IPA
+        run: |
+          set -euo pipefail
+          ./Scripts/build_all.sh
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          VER="$(cat version.txt | tr -d ' \r\n')"
+          gh release create "$TAG" \
+            "build/LCProxyControl-${VER}.dylib" \
+            "build/LCProxyConsole-${VER}.ipa" \
+            --title "LCProxy ${VER}" \
+            --notes "LCProxy 控制台 IPA + LCProxyControl dylib。添加 AltStore 源：https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/AltStore/altstore-source.json"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: lcproxy-${{ github.ref_name }}
+          path: |
+            build/*.dylib
+            build/*.ipa

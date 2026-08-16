@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LCProxy 控制台</title>
+<style>
+:root { color-scheme: dark; }
+body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:#0d1117; color:#e6edf3; }
+header { padding:18px 16px 10px; border-bottom:1px solid #21262d; }
+header h1 { margin:0; font-size:20px; }
+header .sub { color:#8b949e; font-size:13px; margin-top:4px; }
+main { padding:16px; max-width:760px; margin:0 auto; }
+.card { background:#161b22; border:1px solid #30363d; border-radius:12px; padding:16px; margin-bottom:14px; }
+.card h2 { margin:0 0 12px; font-size:16px; }
+.row { display:flex; align-items:center; justify-content:space-between; padding:8px 0; border-bottom:1px solid #21262d; }
+.row:last-child { border-bottom:none; }
+.k { color:#8b949e; }
+.v { font-weight:600; }
+input[type=text], input[type=number] { background:#0d1117; border:1px solid #30363d; color:#e6edf3; border-radius:8px; padding:8px 10px; width:100%; box-sizing:border-box; }
+button { background:#238636; color:#fff; border:none; border-radius:8px; padding:10px 14px; font-size:15px; cursor:pointer; }
+button.secondary { background:#30363d; }
+.switch { position:relative; width:48px; height:26px; display:inline-block; flex:0 0 auto; }
+.switch input { opacity:0; width:0; height:0; }
+.slider { position:absolute; cursor:pointer; inset:0; background:#30363d; border-radius:26px; transition:.2s; }
+.slider:before { content:""; position:absolute; height:20px; width:20px; left:3px; top:3px; background:#fff; border-radius:50%; transition:.2s; }
+.switch input:checked + .slider { background:#238636; }
+.switch input:checked + .slider:before { transform:translateX(22px); }
+table { width:100%; border-collapse:collapse; font-size:13px; }
+th,td { text-align:right; padding:6px 8px; border-bottom:1px solid #21262d; }
+th:first-child,td:first-child { text-align:left; }
+.msg { color:#58a6ff; font-size:13px; margin-top:8px; min-height:18px; }
+.badge { display:inline-block; padding:2px 8px; border-radius:10px; font-size:12px; }
+.badge.on { background:#1f6feb33; color:#58a6ff; }
+.badge.off { background:#f8514933; color:#f85149; }
+</style>
+</head>
+<body>
+<header>
+  <h1>LCProxy 控制台</h1>
+  <div class="sub">LiveContainer 任意 App 走 HTTP 代理 · 10 分钟流量统计</div>
+</header>
+<main>
+  <div class="card">
+    <h2>代理控制</h2>
+    <div class="row"><span class="k">启用代理</span>
+      <label class="switch"><input type="checkbox" id="proxyEnabled"><span class="slider"></span></label>
+    </div>
+    <div class="row"><span class="k">丢弃非 TCP（UDP/QUIC）</span>
+      <label class="switch"><input type="checkbox" id="blockNonTcp"><span class="slider"></span></label>
+    </div>
+    <div class="row" style="display:block">
+      <label class="k">代理类型</label>
+      <input type="text" id="proxyType" value="http">
+      <label class="k">代理地址</label>
+      <input type="text" id="proxyHost" placeholder="192.168.1.10">
+      <label class="k">端口</label>
+      <input type="number" id="proxyPort" placeholder="8080">
+      <div style="margin-top:12px"><button id="saveConfig">保存并应用</button></div>
+      <div class="msg" id="cfgMsg"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>流量统计（蜂窝网络）</h2>
+    <div class="row"><span class="k">当前网络</span><span class="v" id="net">…</span></div>
+    <div class="row"><span class="k">累计上传</span><span class="v" id="totalUp">…</span></div>
+    <div class="row"><span class="k">累计下载</span><span class="v" id="totalDown">…</span></div>
+    <div class="row"><span class="k">按 App 明细</span><span class="v" id="appList">…</span></div>
+    <table>
+      <thead><tr><th>时段（10 分钟）</th><th>上传</th><th>下载</th></tr></thead>
+      <tbody id="buckets"></tbody>
+    </table>
+    <div style="margin-top:10px"><button class="secondary" id="resetStats">清空统计</button></div>
+    <div class="msg" id="statsMsg"></div>
+  </div>
+
+  <div class="card">
+    <h2>关于</h2>
+    <div class="row"><span class="k">版本</span><span class="v" id="version">…</span></div>
+    <div class="row"><span class="k">数据目录</span><span class="v" id="dataDir">…</span></div>
+    <div class="row"><span class="k">控制端口</span><span class="v" id="port">…</span></div>
+    <p class="msg">提示：修改代理地址或端口后，建议重启一次被代理 App，确保 WKWebView 等系统组件也使用新配置。</p>
+  </div>
+</main>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const api = async (path, opts) => {
+  const r = await fetch(path, {headers:{'Content-Type':'application/json'}, ...opts});
+  let j = null; try { j = await r.json(); } catch(e) {}
+  if (!r.ok) return {error:(j&&j.error)||('HTTP '+r.status)};
+  return j;
+};
+const fmt = n => {
+  n = Number(n||0);
+  if (n >= 1024*1024*1024) return (n/1024/1024/1024).toFixed(2)+' GB';
+  if (n >= 1024*1024) return (n/1024/1024).toFixed(2)+' MB';
+  if (n >= 1024) return (n/1024).toFixed(1)+' KB';
+  return n+' B';
+};
+const fmtTime = ts => {
+  const d = new Date(ts*1000);
+  const p = x => String(x).padStart(2,'0');
+  return d.getMonth()+1+'/'+d.getDate()+' '+p(d.getHours())+':'+p(d.getMinutes());
+};
+async function loadStatus() {
+  const s = await api('/api/status');
+  if (s.error) { $('cfgMsg').textContent = '状态获取失败: '+s.error; return; }
+  $('proxyEnabled').checked = !!s.proxyEnabled;
+  $('blockNonTcp').checked = !!s.blockNonTcp;
+  $('proxyType').value = s.proxyType || 'http';
+  $('proxyHost').value = s.proxyHost || '';
+  $('proxyPort').value = s.proxyPort || '';
+  $('version').textContent = s.version || '—';
+  $('dataDir').textContent = s.dataDirectory || '—';
+  $('port').textContent = s.serverPort || '—';
+}
+async function loadStats() {
+  const s = await api('/api/stats');
+  if (s.error) { $('statsMsg').textContent = '统计获取失败: '+s.error; return; }
+  $('net').innerHTML = s.cellular ? "<span class='badge on'>蜂窝</span>" : "<span class='badge off'>Wi-Fi/其他</span>";
+  $('totalUp').textContent = fmt(s.totalUpload);
+  $('totalDown').textContent = fmt(s.totalDownload);
+  const apps = (s.apps||[]).map(a => a.bundleId+' '+fmt(a.totalUpload)+'↑ '+fmt(a.totalDownload)+'↓').join('<br>') || '—';
+  $('appList').innerHTML = apps;
+  const rows = (s.buckets||[]).slice(-48).reverse().map(b =>
+    '<tr><td>'+fmtTime(b.start)+'</td><td>'+fmt(b.upload)+'</td><td>'+fmt(b.download)+'</td></tr>'
+  ).join('');
+  $('buckets').innerHTML = rows || '<tr><td colspan=3 style="text-align:center;color:#8b949e">暂无数据</td></tr>';
+}
+$('saveConfig').onclick = async () => {
+  const body = {
+    proxyEnabled: $('proxyEnabled').checked,
+    blockNonTcp: $('blockNonTcp').checked,
+    proxyType: $('proxyType').value.trim() || 'http',
+    proxyHost: $('proxyHost').value.trim(),
+    proxyPort: parseInt($('proxyPort').value || '0', 10)
+  };
+  const r = await api('/api/config', {method:'POST', body:JSON.stringify(body)});
+  $('cfgMsg').textContent = r.error ? ('保存失败: '+r.error) : '已保存并应用（部分系统组件需重启 App 生效）';
+  loadStatus();
+};
+$('resetStats').onclick = async () => {
+  const r = await api('/api/reset-stats', {method:'POST', body:'{}'});
+  $('statsMsg').textContent = r.error ? ('失败: '+r.error) : '统计已清空';
+  loadStats();
+};
+async function refresh() { await loadStatus(); await loadStats(); }
+setInterval(refresh, 5000);
+refresh();
+</script>
+</body>
+</html>
