@@ -12,9 +12,9 @@ for (const ch of src) {
   const code = ch.charCodeAt(0);
   if (ch === "\\") out += "\\\\";
   else if (ch === '"') out += '\\"';
-  else if (ch === "\n") out += "\n";
+  else if (ch === "\n") out += "\\n";
   else if (ch === "\r") out += "";
-  else if (ch === "\t") out += "\t";
+  else if (ch === "\t") out += "\\t";
   else if (code < 0x20) out += "\\x" + code.toString(16).padStart(2, "0");
   else out += ch;
 }
