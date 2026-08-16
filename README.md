@@ -1,4 +1,4 @@
-# LCProxy Control for LiveContainer
+# LiveProxy Control for LiveContainer
 
 依赖 [`ios-proxy-dylib`](https://github.com/xiaobright/dsh-anchored-standard)（实际使用其中的 `livecontainer-proxychains`）的 HTTP 代理能力，为 LiveContainer 内任意 App 提供一个控制用 IPA 和配套 dylib。
 
@@ -42,13 +42,13 @@ AltStore/           AltStore 源
 产物：
 
 - `build/LCProxyControl.dylib` / `LCProxyControl-<version>.dylib`
-- `build/LCProxyConsole.ipa` / `LCProxyConsole-<version>.ipa`
+- `build/LiveProxyConsole.ipa` / `LiveProxyConsole-<version>.ipa`
 
 两个产物均**故意不签名**，由 LiveContainer 导入/签名时用你导入的证书处理。
 
 ## 使用
 
-1. 将 `LCProxyConsole.ipa` 导入 LiveContainer 并打开。
+1. 将 `LiveProxyConsole.ipa` 导入 LiveContainer 并打开。
 2. 首次打开会自动下载 dylib 到 LiveContainer `Tweaks` 目录，按提示退出并重新打开。
 3. 重新打开后进入控制台：
    - 自定义代理：选择“自定义代理”，填写代理地址/端口，打开「启用代理」。
@@ -64,6 +64,8 @@ https://raw.githubusercontent.com/koast18/livecontainer-kingcard-proxy/master/Al
 ```
 
 该地址固定不变；更新版本时只需更新仓库中的 `AltStore/altstore-source.json` 并打新 tag，Actions 会自动构建并发布 Release 资产。
+
+> 配置读取：dylib 只会读取自己管理的 `<LC Documents>/LCProxy/proxychains.conf`，不会扫描系统其他 `proxychains.conf`，避免配置互相干扰。
 
 ## 流量统计说明
 

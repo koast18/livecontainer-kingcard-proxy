@@ -1,4 +1,4 @@
-name: Build LCProxy
+name: Build LiveProxy
 
 on:
   push:
@@ -29,14 +29,14 @@ jobs:
           VER="$(cat version.txt | tr -d ' \r\n')"
           gh release create "$TAG" \
             "build/LCProxyControl-${VER}.dylib" \
-            "build/LCProxyConsole-${VER}.ipa" \
-            --title "LCProxy ${VER}" \
-            --notes "LCProxy 控制台 IPA + LCProxyControl dylib。添加 AltStore 源：https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/master/AltStore/altstore-source.json"
+            "build/LiveProxyConsole-${VER}.ipa" \
+            --title "LiveProxy ${VER}" \
+            --notes "LiveProxy 控制台 IPA + LCProxyControl dylib。添加 AltStore 源：https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/master/AltStore/altstore-source.json"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: lcproxy-${{ github.ref_name }}
+          name: liveproxy-${{ github.ref_name }}
           path: |
             build/*.dylib
             build/*.ipa

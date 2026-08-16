@@ -63,7 +63,7 @@ static NSMutableString *gDiag = nil;
     if (!url) return nil;
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
     req.timeoutInterval = 60;
-    [req setValue:@"LCProxyConsole/1.0" forHTTPHeaderField:@"User-Agent"];
+    [req setValue:@"LiveProxyConsole/1.0" forHTTPHeaderField:@"User-Agent"];
     NSHTTPURLResponse *resp = nil;
     NSError *err = nil;
     NSData *data = [NSURLConnection sendSynchronousRequest:req returningResponse:&resp error:&err];
