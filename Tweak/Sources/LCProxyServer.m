@@ -4,12 +4,13 @@
 #import "LCProxyPaths.h"
 #import "ConsoleHTML.h"
 #import "lcproxy_bridge.h"
+#import "LCProxyKing.h"
 #import "GCDWebServer.h"
 #import "GCDWebServerDataRequest.h"
 #import "GCDWebServerDataResponse.h"
 #import "GCDWebServerRequest.h"
 
-static NSString *const LCProxyVersion = @"0.1.0";
+static NSString *const LCProxyVersion = @"0.2.0";
 static const NSUInteger LCProxyDefaultPort = 19092;
 
 @interface LCProxyServer ()
@@ -69,6 +70,7 @@ static const NSUInteger LCProxyDefaultPort = 19092;
     d[@"serverPort"] = @(self.port);
     d[@"version"] = LCProxyVersion;
     d[@"dataDirectory"] = LCProxyDataDirectory();
+    d[@"king"] = [[LCProxyKing shared] status];
     return d;
 }
 
@@ -98,7 +100,9 @@ static const NSUInteger LCProxyDefaultPort = 19092;
                    processBlock:^GCDWebServerResponse *(GCDWebServerRequest *request) {
         NSDictionary *body = [self jsonBody:request];
         NSMutableDictionary *merged = [NSMutableDictionary dictionaryWithDictionary:[[LCProxyConfig shared] load]];
-        for (NSString *key in @[@"proxyEnabled", @"blockNonTcp", @"proxyType", @"proxyHost", @"proxyPort"]) {
+        for (NSString *key in @[@"proxyEnabled", @"blockNonTcp", @"proxyMode", @"proxyType", @"proxyHost", @"proxyPort",
+                                 @"kingUpstreamHost", @"kingUpstreamPort", @"kingRefreshURL",
+                                 @"kingGuidOverride", @"kingTokenOverride"]) {
             if (body[key] != nil) merged[key] = body[key];
         }
         if (![[LCProxyConfig shared] saveSettings:merged]) {
@@ -106,6 +110,14 @@ static const NSUInteger LCProxyDefaultPort = 19092;
         }
         [[LCProxyConfig shared] applyToRuntime];
         return [self json:[self configPayload]];
+    }];
+
+    [server addHandlerForMethod:@"POST" path:@"/api/king/refresh" requestClass:[GCDWebServerDataRequest class]
+                   processBlock:^GCDWebServerResponse *(GCDWebServerRequest *request) {
+        BOOL ok = [[LCProxyKing shared] refreshCredentials];
+        NSMutableDictionary *resp = [NSMutableDictionary dictionaryWithDictionary:[[LCProxyKing shared] status]];
+        resp[@"ok"] = @(ok);
+        return [self json:resp];
     }];
 
     [server addHandlerForMethod:@"POST" path:@"/api/reset-stats" requestClass:[GCDWebServerDataRequest class]

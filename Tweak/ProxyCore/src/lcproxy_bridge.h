@@ -8,6 +8,7 @@ extern "C" {
 #endif
 
 // Runtime proxy controls (applied immediately in addition to proxychains.conf)
+void lcproxy_socket_set_bypass(int on);
 void lcproxy_control_set_enabled(int enabled);
 int  lcproxy_control_get_enabled(void);
 void lcproxy_control_set_block_non_tcp(int enabled);

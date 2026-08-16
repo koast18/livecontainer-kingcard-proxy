@@ -141,6 +141,10 @@ static int lc_bypass_get(void) {
     return (int)(intptr_t)pthread_getspecific(lc_bypass_key);
 }
 
+void lcproxy_socket_set_bypass(int on) {
+    lc_bypass_set(on);
+}
+
 static int64_t lc_now_bucket_start(void) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);

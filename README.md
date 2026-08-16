@@ -7,6 +7,10 @@
 - **代理开关**：随时启用/禁用 HTTP 代理，不修改 `proxychains.conf` 也能立即生效。
 - **丢弃非 TCP**：开关 `block_non_tcp`，禁止 UDP/QUIC/ICMP/raw socket 绕过代理。
 - **代理地址配置**：在控制台修改 `http host port`，保存后写回共享 `proxychains.conf`。
+- **王卡代理**：上游可切换为“王卡代理”或“自定义代理”。王卡模式内置本地转发器：
+  - 自动请求 `GUID,TOKEN`，优先经王卡代理隧道取号，失败后自动回退直连取号。
+  - 转发 CONNECT 时自动附加 `Q-GUID` / `Q-Token` 头。
+  - 取号失败或上游拒绝时自动刷新凭证并重试。
 - **蜂窝流量统计**：
   - 按 10 分钟时段（bucket）记录上传/下载字节。
   - 只在检测到蜂窝网络（无 Wi-Fi）时累计。
@@ -46,7 +50,9 @@ AltStore/           AltStore 源
 
 1. 将 `LCProxyConsole.ipa` 导入 LiveContainer 并打开。
 2. 首次打开会自动下载 dylib 到 LiveContainer `Tweaks` 目录，按提示退出并重新打开。
-3. 重新打开后进入控制台，配置代理地址并打开「启用代理」。
+3. 重新打开后进入控制台：
+   - 自定义代理：选择“自定义代理”，填写代理地址/端口，打开「启用代理」。
+   - 王卡代理：选择“王卡代理”，可修改上游地址/端口与取号接口，打开「启用代理」；保存后会自动取号。
 4. 被代理的 App 也需在 LiveContainer 中加载 `LCProxyControl.dylib`（通常配置为全部 App 注入）。
 
 ## AltStore 源

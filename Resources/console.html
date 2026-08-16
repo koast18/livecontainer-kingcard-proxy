@@ -50,12 +50,32 @@ th:first-child,td:first-child { text-align:left; }
       <label class="switch"><input type="checkbox" id="blockNonTcp"><span class="slider"></span></label>
     </div>
     <div class="row" style="display:block">
-      <label class="k">代理类型</label>
-      <input type="text" id="proxyType" value="http">
-      <label class="k">代理地址</label>
-      <input type="text" id="proxyHost" placeholder="192.168.1.10">
-      <label class="k">端口</label>
-      <input type="number" id="proxyPort" placeholder="8080">
+      <label class="k">上游模式</label>
+      <select id="proxyMode">
+        <option value="custom">自定义代理</option>
+        <option value="kingcard">王卡代理</option>
+      </select>
+      <div id="customFields" style="margin-top:10px">
+        <label class="k">代理类型</label>
+        <input type="text" id="proxyType" value="http">
+        <label class="k">代理地址</label>
+        <input type="text" id="proxyHost" placeholder="192.168.1.10">
+        <label class="k">端口</label>
+        <input type="number" id="proxyPort" placeholder="8080">
+      </div>
+      <div id="kingFields" style="display:none;margin-top:10px">
+        <label class="k">王卡上游地址</label>
+        <input type="text" id="kingUpstreamHost" placeholder="157.148.54.212">
+        <label class="k">王卡上游端口</label>
+        <input type="number" id="kingUpstreamPort" placeholder="8091">
+        <label class="k">取号接口</label>
+        <input type="text" id="kingRefreshURL" placeholder="http://kc.iikira.com/kingcard">
+        <div class="row"><span class="k">转发器</span><span class="v" id="kingRunning">…</span></div>
+        <div class="row"><span class="k">最近取号</span><span class="v" id="kingRefresh">…</span></div>
+        <div class="row"><span class="k">来源</span><span class="v" id="kingSource">…</span></div>
+        <div class="msg" id="kingError"></div>
+        <div style="margin-top:8px"><button class="secondary" id="kingRefreshBtn">立即刷新凭证</button></div>
+      </div>
       <div style="margin-top:12px"><button id="saveConfig">保存并应用</button></div>
       <div class="msg" id="cfgMsg"></div>
     </div>
@@ -104,20 +124,35 @@ const fmtTime = ts => {
   const p = x => String(x).padStart(2,'0');
   return d.getMonth()+1+'/'+d.getDate()+' '+p(d.getHours())+':'+p(d.getMinutes());
 };
+function syncModeUI() {
+  const mode = $('proxyMode').value;
+  $('customFields').style.display = mode === 'kingcard' ? 'none' : 'block';
+  $('kingFields').style.display = mode === 'kingcard' ? 'block' : 'none';
+}
 async function loadStatus() {
   const s = await api('/api/status');
   if (s.error) { $('cfgMsg').textContent = '状态获取失败: '+s.error; return; }
   $('proxyEnabled').checked = !!s.proxyEnabled;
   $('blockNonTcp').checked = !!s.blockNonTcp;
-  const editing = document.activeElement && ['proxyType','proxyHost','proxyPort'].indexOf(document.activeElement.id) >= 0;
+  $('proxyMode').value = s.proxyMode || 'custom';
+  const editing = document.activeElement && ['proxyType','proxyHost','proxyPort','kingUpstreamHost','kingUpstreamPort','kingRefreshURL'].indexOf(document.activeElement.id) >= 0;
   if (!editing) {
     $('proxyType').value = s.proxyType || 'http';
     $('proxyHost').value = s.proxyHost || '';
     $('proxyPort').value = s.proxyPort || '';
+    $('kingUpstreamHost').value = s.kingUpstreamHost || '157.148.54.212';
+    $('kingUpstreamPort').value = s.kingUpstreamPort || 8091;
+    $('kingRefreshURL').value = s.kingRefreshURL || 'http://kc.iikira.com/kingcard';
   }
+  const king = s.king || {};
+  $('kingRunning').textContent = king.running ? '运行中' : '未运行';
+  $('kingRefresh').textContent = king.lastRefresh || '—';
+  $('kingSource').textContent = king.lastSource || '—';
+  $('kingError').textContent = king.lastError || '';
   $('version').textContent = s.version || '—';
   $('dataDir').textContent = s.dataDirectory || '—';
   $('port').textContent = s.serverPort || '—';
+  syncModeUI();
 }
 async function loadStats() {
   const s = await api('/api/stats');
@@ -132,13 +167,24 @@ async function loadStats() {
   ).join('');
   $('buckets').innerHTML = rows || '<tr><td colspan=3 style="text-align:center;color:#8b949e">暂无数据</td></tr>';
 }
+$('proxyMode').onchange = syncModeUI;
+$('kingRefreshBtn').onclick = async () => {
+  $('kingError').textContent = '刷新中…';
+  const r = await api('/api/king/refresh', {method:'POST', body:'{}'});
+  $('kingError').textContent = r.error ? ('刷新失败: '+r.error) : (r.lastError || (r.lastRefreshSuccess ? '刷新成功' : '刷新失败'));
+  loadStatus();
+};
 $('saveConfig').onclick = async () => {
   const body = {
     proxyEnabled: $('proxyEnabled').checked,
     blockNonTcp: $('blockNonTcp').checked,
+    proxyMode: $('proxyMode').value,
     proxyType: $('proxyType').value.trim() || 'http',
     proxyHost: $('proxyHost').value.trim(),
-    proxyPort: parseInt($('proxyPort').value || '0', 10)
+    proxyPort: parseInt($('proxyPort').value || '0', 10),
+    kingUpstreamHost: $('kingUpstreamHost').value.trim() || '157.148.54.212',
+    kingUpstreamPort: parseInt($('kingUpstreamPort').value || '0', 10),
+    kingRefreshURL: $('kingRefreshURL').value.trim() || 'http://kc.iikira.com/kingcard'
   };
   const r = await api('/api/config', {method:'POST', body:JSON.stringify(body)});
   $('cfgMsg').textContent = r.error ? ('保存失败: '+r.error) : '已保存并应用（部分系统组件需重启 App 生效）';
