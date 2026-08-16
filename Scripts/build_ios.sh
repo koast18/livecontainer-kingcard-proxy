@@ -59,6 +59,8 @@ clang -dynamiclib -arch $ARCH -mios-version-min=$MIN -isysroot "$SDK" \
   -framework SystemConfiguration \
   -framework CFNetwork \
   -framework Security \
+  -framework CoreServices \
+  -lz \
   -o "$OUT"
 
 cp "$OUT" "build/LCProxyControl-${VER}.dylib"
