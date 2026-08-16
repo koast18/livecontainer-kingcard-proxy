@@ -13,10 +13,10 @@ header .sub { color:#8b949e; font-size:13px; margin-top:4px; }
 main { padding:16px; max-width:760px; margin:0 auto; }
 .card { background:#161b22; border:1px solid #30363d; border-radius:12px; padding:16px; margin-bottom:14px; }
 .card h2 { margin:0 0 12px; font-size:16px; }
-.row { display:flex; align-items:center; justify-content:space-between; padding:8px 0; border-bottom:1px solid #21262d; }
+.row { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; padding:8px 0; border-bottom:1px solid #21262d; }
 .row:last-child { border-bottom:none; }
-.k { color:#8b949e; }
-.v { font-weight:600; }
+.k { color:#8b949e; flex:0 0 auto; }
+.v { font-weight:600; word-break:break-all; overflow-wrap:anywhere; text-align:right; min-width:0; }
 input[type=text], input[type=number] { background:#0d1117; border:1px solid #30363d; color:#e6edf3; border-radius:8px; padding:8px 10px; width:100%; box-sizing:border-box; }
 button { background:#238636; color:#fff; border:none; border-radius:8px; padding:10px 14px; font-size:15px; cursor:pointer; }
 button.secondary { background:#30363d; }
