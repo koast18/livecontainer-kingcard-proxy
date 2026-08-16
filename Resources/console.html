@@ -113,6 +113,8 @@ const api = async (path, opts) => {
   if (!r.ok) return {error:(j&&j.error)||('HTTP '+r.status)};
   return j;
 };
+let dirty = false;
+function markDirty() { dirty = true; }
 const fmt = n => {
   n = Number(n||0);
   if (n >= 1024*1024*1024) return (n/1024/1024/1024).toFixed(2)+' GB';
@@ -133,18 +135,6 @@ function syncModeUI() {
 async function loadStatus() {
   const s = await api('/api/status');
   if (s.error) { $('cfgMsg').textContent = '状态获取失败: '+s.error; return; }
-  $('proxyEnabled').checked = !!s.proxyEnabled;
-  $('blockNonTcp').checked = !!s.blockNonTcp;
-  $('proxyMode').value = s.proxyMode || 'custom';
-  const editing = document.activeElement && ['proxyType','proxyHost','proxyPort','kingUpstreamHost','kingUpstreamPort','kingRefreshURL'].indexOf(document.activeElement.id) >= 0;
-  if (!editing) {
-    $('proxyType').value = s.proxyType || 'http';
-    $('proxyHost').value = s.proxyHost || '';
-    $('proxyPort').value = s.proxyPort || '';
-    $('kingUpstreamHost').value = s.kingUpstreamHost || '157.148.54.212';
-    $('kingUpstreamPort').value = s.kingUpstreamPort || 8091;
-    $('kingRefreshURL').value = s.kingRefreshURL || 'http://kc.iikira.com/kingcard';
-  }
   const king = s.king || {};
   $('kingRunning').textContent = king.running ? '运行中' : '未运行';
   $('kingRefresh').textContent = king.lastRefresh || '—';
@@ -154,6 +144,16 @@ async function loadStatus() {
   $('version').textContent = s.version || '—';
   $('dataDir').textContent = s.dataDirectory || '—';
   $('port').textContent = s.serverPort || '—';
+  if (dirty) return;
+  $('proxyEnabled').checked = !!s.proxyEnabled;
+  $('blockNonTcp').checked = !!s.blockNonTcp;
+  $('proxyMode').value = s.proxyMode || 'custom';
+  $('proxyType').value = s.proxyType || 'http';
+  $('proxyHost').value = s.proxyHost || '';
+  $('proxyPort').value = s.proxyPort || '';
+  $('kingUpstreamHost').value = s.kingUpstreamHost || '157.148.54.212';
+  $('kingUpstreamPort').value = s.kingUpstreamPort || 8091;
+  $('kingRefreshURL').value = s.kingRefreshURL || 'http://kc.iikira.com/kingcard';
   syncModeUI();
 }
 async function loadStats() {
@@ -169,7 +169,9 @@ async function loadStats() {
   ).join('');
   $('buckets').innerHTML = rows || '<tr><td colspan=3 style="text-align:center;color:#8b949e">暂无数据</td></tr>';
 }
-$('proxyMode').onchange = syncModeUI;
+$('proxyMode').onchange = () => { markDirty(); syncModeUI(); };
+['proxyEnabled','blockNonTcp'].forEach(id => { $(id).addEventListener('change', markDirty); });
+['proxyType','proxyHost','proxyPort','kingUpstreamHost','kingUpstreamPort','kingRefreshURL'].forEach(id => { $(id).addEventListener('input', markDirty); });
 $('kingRefreshBtn').onclick = async () => {
   $('kingError').textContent = '刷新中…';
   const r = await api('/api/king/refresh', {method:'POST', body:'{}'});
@@ -189,6 +191,7 @@ $('saveConfig').onclick = async () => {
     kingRefreshURL: $('kingRefreshURL').value.trim() || 'http://kc.iikira.com/kingcard'
   };
   const r = await api('/api/config', {method:'POST', body:JSON.stringify(body)});
+  if (!r.error) dirty = false;
   $('cfgMsg').textContent = r.error ? ('保存失败: '+r.error) : '已保存并应用（部分系统组件需重启 App 生效）';
   loadStatus();
 };
