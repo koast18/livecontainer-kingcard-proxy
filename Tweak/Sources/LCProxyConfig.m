@@ -2,6 +2,7 @@
 #import "LCProxyPaths.h"
 #import "lcproxy_bridge.h"
 #import "LCProxyKing.h"
+#include "webkit_proxy.h"
 
 static NSString *const LCProxySettingsFile = @"settings.json";
 static NSString *const LCProxyConfFile = @"proxychains.conf";
@@ -104,6 +105,10 @@ static NSString *const LCProxyConfFile = @"proxychains.conf";
     NSDictionary *s = [self load];
     BOOL enabled = [s[@"proxyEnabled"] boolValue];
     BOOL block = [s[@"blockNonTcp"] boolValue];
+    // Re-read our dedicated proxychains.conf so changes made through the
+    // console take effect without restarting the whole process.
+    lcproxy_control_reload_config();
+    livecontainer_reload_webkit_proxy();
     lcproxy_control_set_enabled(enabled ? 1 : 0);
     lcproxy_control_set_block_non_tcp(block ? 1 : 0);
     [[LCProxyKing shared] applyConfig:s];

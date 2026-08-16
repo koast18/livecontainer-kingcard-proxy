@@ -6,6 +6,7 @@ extern "C" {
 #endif
 
 void livecontainer_install_webkit_proxy(void);
+void livecontainer_reload_webkit_proxy(void);
 
 #ifdef __cplusplus
 }

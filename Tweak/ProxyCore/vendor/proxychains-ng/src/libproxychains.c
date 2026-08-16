@@ -808,6 +808,13 @@ no_proxy:
 	proxychains_write_log(LOG_PREFIX "no usable proxy config, proxychains disabled\n");
 }
 
+void lcproxy_control_reload_config(void) {
+	proxychains_got_chain_data = 0;
+	proxychains_proxy_count = 0;
+	get_chain_data(proxychains_pd, &proxychains_proxy_count, &proxychains_ct);
+	proxychains_write_log(LOG_PREFIX "config reloaded, proxy_count=%u\n", proxychains_proxy_count);
+}
+
 /*******  HOOK FUNCTIONS  *******/
 
 #define EXPAND( args...) args

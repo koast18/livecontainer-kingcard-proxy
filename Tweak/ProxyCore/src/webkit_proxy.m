@@ -173,3 +173,22 @@ void livecontainer_install_webkit_proxy(void) {
         }
     }
 }
+
+void livecontainer_reload_webkit_proxy(void) {
+    if (g_lc_proxy_config) {
+        nw_release(g_lc_proxy_config);
+        g_lc_proxy_config = NULL;
+    }
+    if (!lc_create_proxy_config()) {
+        proxychains_write_log("[proxychains] webkit proxy reload: no usable HTTP proxy found\n");
+        return;
+    }
+    Class wds = NSClassFromString(@"WKWebsiteDataStore");
+    if (wds) {
+        id (*msg)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+        id defaultStore = msg(wds, sel_registerName("defaultDataStore"));
+        lc_apply_proxy_to_store(defaultStore);
+        proxychains_write_log("[proxychains] webkit proxy reloaded\n");
+    }
+}
+
