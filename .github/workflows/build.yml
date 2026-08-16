@@ -31,7 +31,7 @@ jobs:
             "build/LCProxyControl-${VER}.dylib" \
             "build/LCProxyConsole-${VER}.ipa" \
             --title "LCProxy ${VER}" \
-            --notes "LCProxy 控制台 IPA + LCProxyControl dylib。添加 AltStore 源：https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/AltStore/altstore-source.json"
+            --notes "LCProxy 控制台 IPA + LCProxyControl dylib。添加 AltStore 源：https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/master/AltStore/altstore-source.json"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

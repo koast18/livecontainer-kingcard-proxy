@@ -54,7 +54,7 @@ AltStore/           AltStore 源
 在 AltStore/SideStore 中添加：
 
 ```
-https://raw.githubusercontent.com/koast18/livecontainer-kingcard-proxy/main/AltStore/altstore-source.json
+https://raw.githubusercontent.com/koast18/livecontainer-kingcard-proxy/master/AltStore/altstore-source.json
 ```
 
 该地址固定不变；更新版本时只需更新仓库中的 `AltStore/altstore-source.json` 并打新 tag，Actions 会自动构建并发布 Release 资产。
