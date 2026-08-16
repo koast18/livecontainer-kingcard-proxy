@@ -17,6 +17,7 @@ static void LCProxyKingLog(const char *line) {
 @property (nonatomic, copy) NSString *lastRefresh;
 @property (nonatomic, copy) NSString *lastSource;
 @property (nonatomic, copy) NSString *lastError;
+@property (nonatomic, copy) NSString *lastDiagnostics;
 @property (nonatomic, assign) BOOL lastRefreshSuccess;
 @end
 
@@ -124,6 +125,9 @@ static void LCProxyKingLog(const char *line) {
                                       3, 300, 10000,
                                       guid, sizeof(guid), token, sizeof(token),
                                       &diag, source, sizeof(source));
+    char dbgbuf[4096];
+    kp_debug_recent(dbgbuf, sizeof(dbgbuf));
+    self.lastDiagnostics = [NSString stringWithUTF8String:dbgbuf] ?: @"";
     if (rc != 0) {
         [self.lock lock];
         self.lastRefreshSuccess = NO;
@@ -179,6 +183,7 @@ static void LCProxyKingLog(const char *line) {
     d[@"lastRefresh"] = self.lastRefresh ?: @"";
     d[@"lastSource"] = self.lastSource ?: @"";
     d[@"lastError"] = self.lastError ?: @"";
+    d[@"lastDiagnostics"] = self.lastDiagnostics ?: @"";
     NSString *guid = @"";
     if (self.forwarder) {
         // forwarder doesn't expose getter; keep status without raw creds

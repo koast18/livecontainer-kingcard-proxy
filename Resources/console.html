@@ -74,6 +74,7 @@ th:first-child,td:first-child { text-align:left; }
         <div class="row"><span class="k">最近取号</span><span class="v" id="kingRefresh">…</span></div>
         <div class="row"><span class="k">来源</span><span class="v" id="kingSource">…</span></div>
         <div class="msg" id="kingError"></div>
+        <div class="msg" id="kingDiag" style="white-space:pre-wrap;font-size:12px;color:#8b949e"></div>
         <div style="margin-top:8px"><button class="secondary" id="kingRefreshBtn">立即刷新凭证</button></div>
       </div>
       <div style="margin-top:12px"><button id="saveConfig">保存并应用</button></div>
@@ -149,6 +150,7 @@ async function loadStatus() {
   $('kingRefresh').textContent = king.lastRefresh || '—';
   $('kingSource').textContent = king.lastSource || '—';
   $('kingError').textContent = king.lastError || '';
+  $('kingDiag').textContent = king.lastDiagnostics || '';
   $('version').textContent = s.version || '—';
   $('dataDir').textContent = s.dataDirectory || '—';
   $('port').textContent = s.serverPort || '—';

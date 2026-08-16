@@ -921,6 +921,8 @@ HOOKFUNC(int, connect, int sock, const struct sockaddr *addr, unsigned int len) 
 	PFUNC();
 	PDEBUG("connect called: sock=%d family=%u\n", sock, addr ? (unsigned)addr->sa_family : 0u);
 
+	if(lc_bypass_get())
+		return true_connect(sock, addr, len);
 	if(!proxychains_proxy_count || lc_proxy_disabled)
 		return true_connect(sock, addr, len);
 	int socktype = 0, flags = 0, ret = 0;
@@ -1043,6 +1045,8 @@ HOOKFUNC(int, connectx, int sock, const sa_endpoints_t *endpoints,
 	(void)extlen;
 	(void)pcid;
 	(void)connid;
+	if(lc_bypass_get())
+		return true_connectx(sock, endpoints, associd, flags, ext, extlen, pcid, connid);
 	if(!proxychains_proxy_count || !endpoints || !endpoints->sae_dstaddr ||
 	   endpoints->sae_dstaddrlen < sizeof(struct sockaddr) || flags != 0 ||
 	   ext != NULL || extlen != 0 || pcid != NULL || connid != NULL) {
