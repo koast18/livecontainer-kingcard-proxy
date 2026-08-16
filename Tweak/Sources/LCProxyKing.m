@@ -80,7 +80,9 @@ static void LCProxyKingLog(const char *line) {
         if (kp_forwarder_start(fw) == 0) {
             self.forwarder = fw;
             [self.lock unlock];
-            [self refreshCredentials];
+            dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+                [self refreshCredentials];
+            });
             return;
         }
         kp_forwarder_free(fw);
