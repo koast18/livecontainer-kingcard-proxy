@@ -100,6 +100,9 @@ th:first-child,td:first-child { text-align:left; }
     <h2>关于</h2>
     <div class="row"><span class="k">版本</span><span class="v" id="version">…</span></div>
     <div class="row"><span class="k">数据目录</span><span class="v" id="dataDir">…</span></div>
+    <div class="row"><span class="k">代理配置</span><span class="v" id="confPath">…</span></div>
+    <div class="row"><span class="k">配置存在</span><span class="v" id="confExists">…</span></div>
+    <div class="row"><span class="k">核心代理数</span><span class="v" id="proxyCount">…</span></div>
     <div class="row"><span class="k">控制端口</span><span class="v" id="port">…</span></div>
     <p class="msg">提示：修改代理地址或端口后，建议重启一次被代理 App，确保 WKWebView 等系统组件也使用新配置。</p>
   </div>
@@ -143,6 +146,9 @@ async function loadStatus() {
   $('kingDiag').textContent = king.lastDiagnostics || '';
   $('version').textContent = s.version || '—';
   $('dataDir').textContent = s.dataDirectory || '—';
+  $('confPath').textContent = s.proxychainsConfPath || '—';
+  $('confExists').textContent = s.proxychainsConfExists ? '是' : '否';
+  $('proxyCount').textContent = s.proxyCount != null ? String(s.proxyCount) : '—';
   $('port').textContent = s.serverPort || '—';
   if (dirty) return;
   $('proxyEnabled').checked = !!s.proxyEnabled;

@@ -108,7 +108,6 @@ static NSString *const LCProxyConfFile = @"proxychains.conf";
     // Re-read our dedicated proxychains.conf so changes made through the
     // console take effect without restarting the whole process.
     lcproxy_control_reload_config();
-    livecontainer_reload_webkit_proxy();
     lcproxy_control_set_enabled(enabled ? 1 : 0);
     lcproxy_control_set_block_non_tcp(block ? 1 : 0);
     [[LCProxyKing shared] applyConfig:s];

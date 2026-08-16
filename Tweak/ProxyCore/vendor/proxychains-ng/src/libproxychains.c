@@ -187,6 +187,9 @@ void lcproxy_control_set_block_non_tcp(int enabled) {
 int lcproxy_control_get_block_non_tcp(void) {
     return proxychains_block_non_tcp;
 }
+int lcproxy_control_get_proxy_count(void) {
+    return (int)proxychains_proxy_count;
+}
 
 int lcproxy_stats_is_cellular(void) {
     time_t now = time(NULL);

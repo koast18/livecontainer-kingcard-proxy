@@ -5,12 +5,13 @@
 #import "ConsoleHTML.h"
 #import "lcproxy_bridge.h"
 #import "LCProxyKing.h"
+#include "webkit_proxy.h"
 #import "GCDWebServer.h"
 #import "GCDWebServerDataRequest.h"
 #import "GCDWebServerDataResponse.h"
 #import "GCDWebServerRequest.h"
 
-static NSString *const LCProxyVersion = @"0.3.4";
+static NSString *const LCProxyVersion = @"0.3.5";
 static const NSUInteger LCProxyDefaultPort = 19092;
 
 @interface LCProxyServer ()
@@ -66,10 +67,14 @@ static const NSUInteger LCProxyDefaultPort = 19092;
     NSDictionary *cfg = [[LCProxyConfig shared] load];
     NSMutableDictionary *d = [NSMutableDictionary dictionaryWithDictionary:cfg];
     d[@"cellular"] = @(lcproxy_stats_is_cellular() != 0);
-    d[@"proxyCount"] = @(0); // proxychains core keeps this private; UI doesn't rely on it
+    d[@"proxyCount"] = @(lcproxy_control_get_proxy_count());
     d[@"serverPort"] = @(self.port);
     d[@"version"] = LCProxyVersion;
     d[@"dataDirectory"] = LCProxyDataDirectory();
+    d[@"proxychainsConfPath"] = [[LCProxyConfig shared] proxychainsConfPath];
+    d[@"proxychainsConfExists"] = @([[NSFileManager defaultManager] fileExistsAtPath:[[LCProxyConfig shared] proxychainsConfPath]]);
+    d[@"settingsPath"] = [[LCProxyConfig shared] settingsPath];
+    d[@"settingsExists"] = @([[NSFileManager defaultManager] fileExistsAtPath:[[LCProxyConfig shared] settingsPath]]);
     d[@"king"] = [[LCProxyKing shared] status];
     return d;
 }
@@ -109,6 +114,7 @@ static const NSUInteger LCProxyDefaultPort = 19092;
             return [self jsonError:@"保存配置失败" statusCode:500];
         }
         [[LCProxyConfig shared] applyToRuntime];
+        livecontainer_reload_webkit_proxy();
         return [self json:[self configPayload]];
     }];
 
