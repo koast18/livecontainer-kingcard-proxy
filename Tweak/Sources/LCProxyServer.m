@@ -5,13 +5,15 @@
 #import "ConsoleHTML.h"
 #import "lcproxy_bridge.h"
 #import "LCProxyKing.h"
+#import "KPKIngCore.h"
 #include "webkit_proxy.h"
+#include <arpa/inet.h>
 #import "GCDWebServer.h"
 #import "GCDWebServerDataRequest.h"
 #import "GCDWebServerDataResponse.h"
 #import "GCDWebServerRequest.h"
 
-static NSString *const LCProxyVersion = @"0.3.9";
+static NSString *const LCProxyVersion = @"0.3.10";
 static const NSUInteger LCProxyDefaultPort = 19092;
 
 @interface LCProxyServer ()
@@ -79,6 +81,80 @@ static const NSUInteger LCProxyDefaultPort = 19092;
     return d;
 }
 
+#pragma mark - Proxy exit IP test
+
+- (NSString *)extractIPFromString:(NSString *)text {
+    if (!text.length) return nil;
+    NSCharacterSet *separators = [NSCharacterSet characterSetWithCharactersInString:@" \t\r\n,;"];
+    NSArray *tokens = [text componentsSeparatedByCharactersInSet:separators];
+    for (NSString *token in tokens) {
+        NSString *t = [token stringByTrimmingCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"[]:"]];
+        if (!t.length) continue;
+        struct in_addr addr4;
+        struct in6_addr addr6;
+        if (inet_pton(AF_INET, t.UTF8String, &addr4) == 1) return t;
+        if (inet_pton(AF_INET6, t.UTF8String, &addr6) == 1) return t;
+    }
+    return nil;
+}
+
+- (NSDictionary *)proxyTestResult {
+    NSDictionary *settings = [[LCProxyConfig shared] load];
+    BOOL enabled = [settings[@"proxyEnabled"] boolValue];
+    NSString *mode = [settings[@"proxyMode"] isKindOfClass:[NSString class]] ? settings[@"proxyMode"] : @"custom";
+
+    NSString *upstreamHost = nil;
+    NSInteger upstreamPort = 0;
+    if (enabled && [mode isEqualToString:@"kingcard"]) {
+        upstreamHost = @"127.0.0.1";
+        upstreamPort = 18080;
+    } else if (enabled) {
+        upstreamHost = [settings[@"proxyHost"] isKindOfClass:[NSString class]] && [settings[@"proxyHost"] length] ? settings[@"proxyHost"] : nil;
+        upstreamPort = [settings[@"proxyPort"] respondsToSelector:@selector(integerValue)] ? [settings[@"proxyPort"] integerValue] : 0;
+    }
+    if (!upstreamHost.length || upstreamPort <= 0) {
+        return @{@"ok": @NO, @"error": @"代理未启用或代理地址无效", @"results": @[]};
+    }
+
+    NSArray<NSString *> *sources = @[
+        @"http://ip.3322.net",
+        @"http://ifconfig.me/ip",
+        @"http://icanhazip.com",
+        @"http://ip.sb",
+        @"http://members.3322.org/dyndns/getip",
+        @"http://ip-api.com/line/?fields=query",
+        @"http://myip.ipip.net",
+    ];
+
+    NSMutableArray *results = [NSMutableArray array];
+    for (NSString *urlString in sources) {
+        NSURL *url = [NSURL URLWithString:urlString];
+        if (!url.host.length) continue;
+        NSString *host = url.host;
+        NSInteger port = url.port ? url.port.integerValue : 80;
+        NSString *path = url.path.length ? url.path : @"/";
+        if (url.query.length) path = [path stringByAppendingFormat:@"?%@", url.query];
+
+        char body[2048] = {0};
+        int rc = kp_http_get_via_proxy(upstreamHost.UTF8String, (int)upstreamPort,
+                                       host.UTF8String, (int)port, path.UTF8String,
+                                       "", "", 8000,
+                                       body, sizeof(body));
+        NSString *text = rc == 0 ? [NSString stringWithUTF8String:body] : nil;
+        NSString *ip = [self extractIPFromString:text];
+        NSMutableDictionary *item = [NSMutableDictionary dictionary];
+        item[@"url"] = urlString;
+        item[@"rc"] = @(rc);
+        item[@"ip"] = ip ?: @"";
+        item[@"body"] = text ? [text substringToIndex:MIN(text.length, 120)] : @"";
+        [results addObject:item];
+        if (ip.length) {
+            return @{@"ok": @YES, @"ip": ip, @"source": urlString, @"results": results};
+        }
+    }
+    return @{@"ok": @NO, @"error": @"所有 IP 源均失败，请检查代理/转发器", @"results": results};
+}
+
 #pragma mark - Start
 
 - (BOOL)start {
@@ -124,6 +200,11 @@ static const NSUInteger LCProxyDefaultPort = 19092;
         NSMutableDictionary *resp = [NSMutableDictionary dictionaryWithDictionary:[[LCProxyKing shared] status]];
         resp[@"ok"] = @(ok);
         return [self json:resp];
+    }];
+
+    [server addHandlerForMethod:@"POST" path:@"/api/proxy-test" requestClass:[GCDWebServerDataRequest class]
+                   processBlock:^GCDWebServerResponse *(GCDWebServerRequest *request) {
+        return [self json:[self proxyTestResult]];
     }];
 
     [server addHandlerForMethod:@"POST" path:@"/api/reset-stats" requestClass:[GCDWebServerDataRequest class]

@@ -996,6 +996,8 @@ static void kp_pipe(int a, int b) {
     while ((r = recv(a, buf, sizeof(buf), 0)) > 0) {
         if (kp_send_all(b, buf, (size_t)r) != 0) break;
     }
+    // 单向 EOF 时主动关闭对端，避免另一个方向的 pipe 线程永久阻塞。
+    shutdown(b, SHUT_RDWR);
 }
 
 static void *kp_pipe_helper(void *arg) {
@@ -1023,20 +1025,34 @@ static int kp_pipe_up_and_client(int up, int client, pthread_t *t1, pthread_t *t
 // 建立上游 CONNECT（带当前凭证），返回上游 fd 或 -1；resp 填上游响应
 static int kp_connect_upstream(kp_forwarder *fw, const char *host, int port,
                                char *resp, size_t resp_cap, size_t *resp_len) {
+    kp_dbg("[fw] upstream connect %s:%d", fw->upstream_host, fw->upstream_port);
     int up = kp_connect_host(fw->upstream_host, fw->upstream_port, 10000);
-    if (up < 0) return -1;
+    if (up < 0) {
+        kp_dbg("[fw] upstream connect failed");
+        return -1;
+    }
+    // 隧道建立后不应再受 connect 阶段的 10s 超时影响，清掉 socket 超时。
+    struct timeval zero = {0, 0};
+    setsockopt(up, SOL_SOCKET, SO_RCVTIMEO, &zero, sizeof(zero));
+    setsockopt(up, SOL_SOCKET, SO_SNDTIMEO, &zero, sizeof(zero));
+
     char guid[128], token[128];
     kp_forwarder_creds(fw, guid, sizeof(guid), token, sizeof(token));
+    kp_dbg("[fw] CONNECT %s:%d guid=%c… token=%c…", host, port,
+           guid[0] ? guid[0] : '?', token[0] ? token[0] : '?');
     char creq[1024];
     if (kp_build_connect_request(host, port, guid, token, creq, sizeof(creq)) != 0 ||
         kp_send_all(up, creq, strlen(creq)) != 0) {
+        kp_dbg("[fw] send upstream CONNECT failed");
         KP_CLOSESOCK(up);
         return -1;
     }
     if (kp_recv_until(up, resp, resp_cap, resp_len, 10000) != 0) {
+        kp_dbg("[fw] upstream CONNECT response timeout/closed");
         KP_CLOSESOCK(up);
         return -1;
     }
+    kp_dbg("[fw] upstream CONNECT response: %.80s", resp);
     return up;
 }
 
@@ -1083,6 +1099,7 @@ static void kp_handle_client(kp_forwarder *fw, int client) {
     // 分支 1：HTTP 代理绝对 URI（GET/HEAD/POST http://host/path）
     if (kp_parse_absolute_uri(reqbuf, strlen(reqbuf), method, sizeof(method),
                               host, sizeof(host), &port, path, sizeof(path)) == 0) {
+        kp_dbg("[fw] HTTP absolute URI: %s http://%s:%d%s", method, host, port, path);
         char rebuilt[4096];
         int rn = kp_rebuild_proxy_request(reqbuf, strlen(reqbuf), method, host, port, path,
                                           rebuilt, sizeof(rebuilt));
@@ -1140,6 +1157,8 @@ static void kp_handle_client(kp_forwarder *fw, int client) {
         KP_CLOSESOCK(client);
         return;
     }
+
+    kp_dbg("[fw] CONNECT target %s:%d", host, port);
 
     // loopback 目标：本机直连透传（保护控制台 19092 / 本地服务不被劫持送上游）
     if (strncmp(host, "127.", 4) == 0 || strcmp(host, "localhost") == 0 ||
@@ -1302,6 +1321,7 @@ int kp_forwarder_start(kp_forwarder *fw) {
         fw->listen_fd = -1;
         return -1;
     }
+    kp_dbg("[fw] forwarder listening on %s:%d", fw->listen_host, fw->listen_port);
     return 0;
 }
 

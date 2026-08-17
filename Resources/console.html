@@ -78,6 +78,9 @@ th:first-child,td:first-child { text-align:left; }
         <div style="margin-top:8px"><button class="secondary" id="kingRefreshBtn">立即刷新凭证</button></div>
       </div>
       <div style="margin-top:12px"><button id="saveConfig">保存并应用</button></div>
+      <div style="margin-top:8px"><button class="secondary" id="testProxyBtn">测试代理出口 IP</button></div>
+      <div class="msg" id="proxyTestMsg"></div>
+      <div class="msg" id="proxyTestDetail" style="white-space:pre-wrap;font-size:12px;color:#8b949e"></div>
       <div class="msg" id="cfgMsg"></div>
     </div>
   </div>
@@ -200,6 +203,23 @@ $('saveConfig').onclick = async () => {
   if (!r.error) dirty = false;
   $('cfgMsg').textContent = r.error ? ('保存失败: '+r.error) : '已保存并应用（部分系统组件需重启 App 生效）';
   loadStatus();
+};
+$('testProxyBtn').onclick = async () => {
+  $('proxyTestMsg').textContent = '测试中…';
+  $('proxyTestDetail').textContent = '';
+  const r = await api('/api/proxy-test', {method:'POST', body:'{}'});
+  if (r.error) {
+    $('proxyTestMsg').textContent = '测试失败: '+r.error;
+  } else if (r.ok) {
+    $('proxyTestMsg').textContent = '出口 IP: '+r.ip+'（'+r.source+'）';
+  } else {
+    $('proxyTestMsg').textContent = '测试失败: '+(r.error||'未知错误');
+  }
+  const lines = (r.results||[]).map(x => {
+    const info = x.ip ? ('IP '+x.ip) : ('rc='+x.rc+(x.body?' '+x.body:''));
+    return x.url+' -> '+info;
+  }).join('\n');
+  $('proxyTestDetail').textContent = lines;
 };
 $('resetStats').onclick = async () => {
   const r = await api('/api/reset-stats', {method:'POST', body:'{}'});
