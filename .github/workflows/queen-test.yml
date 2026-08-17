@@ -24,8 +24,12 @@ jobs:
       - name: Run reference Python fetch_q_token
         run: |
           set -euo pipefail
-          python3 -m pip install --user -q -r Tools/queen_proxy_kit/requirements.txt
-          python3 Tools/queen_proxy_kit/fetch_q_token.py --phone "${{ github.event.inputs.phone }}" --timeout 10 --max-attempts 1
+          PHONE="${{ github.event.inputs.phone }}"
+          PHONE="${PHONE:-18812341234}"
+          python3 -m venv .venv
+          . .venv/bin/activate
+          pip install -q -r Tools/queen_proxy_kit/requirements.txt
+          python3 Tools/queen_proxy_kit/fetch_q_token.py --phone "$PHONE" --timeout 10 --max-attempts 1
 
       - name: Compile and run native Queen client
         run: |
