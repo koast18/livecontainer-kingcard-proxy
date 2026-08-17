@@ -13,7 +13,7 @@
 #import "GCDWebServerDataResponse.h"
 #import "GCDWebServerRequest.h"
 
-static NSString *const LCProxyVersion = @"0.3.16";
+static NSString *const LCProxyVersion = @"0.4.0";
 static const NSUInteger LCProxyDefaultPort = 19092;
 
 @interface LCProxyServer ()
@@ -69,6 +69,7 @@ static const NSUInteger LCProxyDefaultPort = 19092;
     NSDictionary *cfg = [[LCProxyConfig shared] load];
     NSMutableDictionary *d = [NSMutableDictionary dictionaryWithDictionary:cfg];
     d[@"cellular"] = @(lcproxy_stats_is_cellular() != 0);
+    d[@"effectiveMode"] = [[LCProxyConfig shared] effectiveProxyModeForSettings:cfg];
     d[@"proxyCount"] = @(lcproxy_control_get_proxy_count());
     d[@"serverPort"] = @(self.port);
     d[@"version"] = LCProxyVersion;
@@ -102,22 +103,27 @@ static const NSUInteger LCProxyDefaultPort = 19092;
     NSDictionary *settings = [[LCProxyConfig shared] load];
     BOOL enabled = [settings[@"proxyEnabled"] boolValue];
     NSString *mode = [settings[@"proxyMode"] isKindOfClass:[NSString class]] ? settings[@"proxyMode"] : @"custom";
+    NSString *effectiveMode = [[LCProxyConfig shared] effectiveProxyModeForSettings:settings];
 
     NSString *upstreamHost = nil;
     NSInteger upstreamPort = 0;
-    if (enabled && [mode isEqualToString:@"kingcard"]) {
+    BOOL direct = NO;
+    if (enabled && [effectiveMode isEqualToString:@"direct"]) {
+        direct = YES;
+    } else if (enabled && [effectiveMode isEqualToString:@"kingcard"]) {
         upstreamHost = @"127.0.0.1";
         upstreamPort = 18080;
     } else if (enabled) {
         upstreamHost = [settings[@"proxyHost"] isKindOfClass:[NSString class]] && [settings[@"proxyHost"] length] ? settings[@"proxyHost"] : nil;
         upstreamPort = [settings[@"proxyPort"] respondsToSelector:@selector(integerValue)] ? [settings[@"proxyPort"] integerValue] : 0;
     }
-    if (!upstreamHost.length || upstreamPort <= 0) {
+    if (!direct && (!upstreamHost.length || upstreamPort <= 0)) {
         return @{@"url": urlString ?: @"", @"rc": @(-1), @"ip": @"", @"body": @"代理未启用或代理地址无效", @"ok": @NO};
     }
 
     // 王卡模式：先确保转发器在运行，再确保本地有 GUID/TOKEN。
-    if (enabled && [mode isEqualToString:@"kingcard"]) {
+    // 如果自动直连已生效，则不需要本地转发器参与 IP 测试。
+    if (enabled && [mode isEqualToString:@"kingcard"] && ![effectiveMode isEqualToString:@"direct"]) {
         NSDictionary *kingStatus = [[LCProxyKing shared] status];
         if (![kingStatus[@"running"] boolValue]) {
             [[LCProxyKing shared] applyConfig:settings];
@@ -138,10 +144,16 @@ static const NSUInteger LCProxyDefaultPort = 19092;
     if (url.query.length) path = [path stringByAppendingFormat:@"?%@", url.query];
 
     char body[2048] = {0};
-    int rc = kp_http_get_via_proxy(upstreamHost.UTF8String, (int)upstreamPort,
+    int rc;
+    if (direct) {
+        rc = kp_http_get_direct(host.UTF8String, (int)port, path.UTF8String,
+                                6000, body, sizeof(body));
+    } else {
+        rc = kp_http_get_via_proxy(upstreamHost.UTF8String, (int)upstreamPort,
                                    host.UTF8String, (int)port, path.UTF8String,
                                    "", "", 6000,
                                    body, sizeof(body));
+    }
     NSString *text = rc == 0 ? [NSString stringWithUTF8String:body] : nil;
     NSString *ip = [self extractIPFromString:text];
     NSMutableDictionary *item = [NSMutableDictionary dictionary];
@@ -150,6 +162,7 @@ static const NSUInteger LCProxyDefaultPort = 19092;
     item[@"ip"] = ip ?: @"";
     item[@"body"] = text ? [text substringToIndex:MIN(text.length, 120)] : @"";
     item[@"ok"] = @(ip.length > 0);
+    item[@"effectiveMode"] = effectiveMode;
     return item;
 }
 
@@ -157,23 +170,27 @@ static const NSUInteger LCProxyDefaultPort = 19092;
     NSDictionary *settings = [[LCProxyConfig shared] load];
     BOOL enabled = [settings[@"proxyEnabled"] boolValue];
     NSString *mode = [settings[@"proxyMode"] isKindOfClass:[NSString class]] ? settings[@"proxyMode"] : @"custom";
+    NSString *effectiveMode = [[LCProxyConfig shared] effectiveProxyModeForSettings:settings];
 
     NSString *upstreamHost = nil;
     NSInteger upstreamPort = 0;
-    if (enabled && [mode isEqualToString:@"kingcard"]) {
+    BOOL direct = NO;
+    if (enabled && [effectiveMode isEqualToString:@"direct"]) {
+        direct = YES;
+    } else if (enabled && [effectiveMode isEqualToString:@"kingcard"]) {
         upstreamHost = @"127.0.0.1";
         upstreamPort = 18080;
     } else if (enabled) {
         upstreamHost = [settings[@"proxyHost"] isKindOfClass:[NSString class]] && [settings[@"proxyHost"] length] ? settings[@"proxyHost"] : nil;
         upstreamPort = [settings[@"proxyPort"] respondsToSelector:@selector(integerValue)] ? [settings[@"proxyPort"] integerValue] : 0;
     }
-    if (!upstreamHost.length || upstreamPort <= 0) {
+    if (!direct && (!upstreamHost.length || upstreamPort <= 0)) {
         return @{@"ok": @NO, @"error": @"代理未启用或代理地址无效", @"results": @[]};
     }
 
     // 王卡模式：先确保转发器在运行，再确保本地有 GUID/TOKEN。
     // 如果转发器没起来，单纯 refreshCredentials 不会创建转发器。
-    if (enabled && [mode isEqualToString:@"kingcard"]) {
+    if (enabled && [mode isEqualToString:@"kingcard"] && ![effectiveMode isEqualToString:@"direct"]) {
         NSDictionary *kingStatus = [[LCProxyKing shared] status];
         if (![kingStatus[@"running"] boolValue]) {
             [[LCProxyKing shared] applyConfig:settings];
@@ -206,10 +223,16 @@ static const NSUInteger LCProxyDefaultPort = 19092;
         if (url.query.length) path = [path stringByAppendingFormat:@"?%@", url.query];
 
         char body[2048] = {0};
-        int rc = kp_http_get_via_proxy(upstreamHost.UTF8String, (int)upstreamPort,
+        int rc;
+        if (direct) {
+            rc = kp_http_get_direct(host.UTF8String, (int)port, path.UTF8String,
+                                    8000, body, sizeof(body));
+        } else {
+            rc = kp_http_get_via_proxy(upstreamHost.UTF8String, (int)upstreamPort,
                                        host.UTF8String, (int)port, path.UTF8String,
                                        "", "", 8000,
                                        body, sizeof(body));
+        }
         NSString *text = rc == 0 ? [NSString stringWithUTF8String:body] : nil;
         NSString *ip = [self extractIPFromString:text];
         if (ip.length && !firstIP) {
@@ -227,6 +250,7 @@ static const NSUInteger LCProxyDefaultPort = 19092;
     NSMutableDictionary *resp = [NSMutableDictionary dictionary];
     resp[@"results"] = results;
     resp[@"mode"] = mode;
+    resp[@"effectiveMode"] = effectiveMode;
     if (firstIP.length) {
         resp[@"ok"] = @YES;
         resp[@"ip"] = firstIP;
@@ -268,7 +292,7 @@ static const NSUInteger LCProxyDefaultPort = 19092;
         NSDictionary *body = [self jsonBody:request];
         NSMutableDictionary *merged = [NSMutableDictionary dictionaryWithDictionary:[[LCProxyConfig shared] load]];
         for (NSString *key in @[@"proxyEnabled", @"blockNonTcp", @"debugLogging", @"proxyMode", @"proxyType", @"proxyHost", @"proxyPort",
-                                 @"kingUpstreamHost", @"kingUpstreamPort", @"kingRefreshURL",
+                                 @"kingUpstreamHost", @"kingUpstreamPort", @"kingRefreshURL", @"kingAutoDirectOnNonCellular",
                                  @"kingGuidOverride", @"kingTokenOverride"]) {
             if (body[key] != nil) merged[key] = body[key];
         }

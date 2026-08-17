@@ -56,8 +56,10 @@ th:first-child,td:first-child { text-align:left; }
       <label class="k">上游模式</label>
       <select id="proxyMode">
         <option value="custom">自定义代理</option>
+        <option value="direct">直连（无代理）</option>
         <option value="kingcard">王卡代理</option>
       </select>
+      <div class="row"><span class="k">当前生效</span><span class="v" id="effectiveMode">…</span></div>
       <div id="customFields" style="margin-top:10px">
         <label class="k">代理类型</label>
         <input type="text" id="proxyType" value="http">
@@ -73,6 +75,9 @@ th:first-child,td:first-child { text-align:left; }
         <input type="number" id="kingUpstreamPort" placeholder="8091">
         <label class="k">取号接口</label>
         <input type="text" id="kingRefreshURL" placeholder="http://kc.iikira.com/kingcard">
+        <div class="row"><span class="k">非蜂窝网络自动直连</span>
+          <label class="switch"><input type="checkbox" id="kingAutoDirectOnNonCellular"><span class="slider"></span></label>
+        </div>
         <div class="row"><span class="k">转发器</span><span class="v" id="kingRunning">…</span></div>
         <div class="row"><span class="k">最近取号</span><span class="v" id="kingRefresh">…</span></div>
         <div class="row"><span class="k">来源</span><span class="v" id="kingSource">…</span></div>
@@ -138,8 +143,10 @@ const fmtTime = ts => {
 };
 function syncModeUI() {
   const mode = $('proxyMode').value;
-  $('customFields').style.display = mode === 'kingcard' ? 'none' : 'block';
+  $('customFields').style.display = mode === 'custom' ? 'block' : 'none';
   $('kingFields').style.display = mode === 'kingcard' ? 'block' : 'none';
+  const labels = {custom:'自定义代理', direct:'直连（无代理）', kingcard:'王卡代理'};
+  $('effectiveMode').textContent = labels[mode] || mode || '—';
 }
 async function loadStatus() {
   const s = await api('/api/status');
@@ -167,7 +174,11 @@ async function loadStatus() {
   $('kingUpstreamHost').value = s.kingUpstreamHost || '157.148.54.212';
   $('kingUpstreamPort').value = s.kingUpstreamPort || 8091;
   $('kingRefreshURL').value = s.kingRefreshURL || 'http://kc.iikira.com/kingcard';
+  $('kingAutoDirectOnNonCellular').checked = !!s.kingAutoDirectOnNonCellular;
   syncModeUI();
+  const effective = s.effectiveMode || s.proxyMode || 'custom';
+  const labels = {custom:'自定义代理', direct:'直连（无代理）', kingcard:'王卡代理'};
+  $('effectiveMode').textContent = labels[effective] || effective;
 }
 async function loadStats() {
   const s = await api('/api/stats');
@@ -183,7 +194,7 @@ async function loadStats() {
   $('buckets').innerHTML = rows || '<tr><td colspan=3 style="text-align:center;color:#8b949e">暂无数据</td></tr>';
 }
 $('proxyMode').onchange = () => { markDirty(); syncModeUI(); };
-['proxyEnabled','blockNonTcp','debugLogging'].forEach(id => { $(id).addEventListener('change', markDirty); });
+['proxyEnabled','blockNonTcp','debugLogging','kingAutoDirectOnNonCellular'].forEach(id => { $(id).addEventListener('change', markDirty); });
 ['proxyType','proxyHost','proxyPort','kingUpstreamHost','kingUpstreamPort','kingRefreshURL'].forEach(id => { $(id).addEventListener('input', markDirty); });
 $('kingRefreshBtn').onclick = async () => {
   $('kingError').textContent = '刷新中…';
@@ -202,7 +213,8 @@ $('saveConfig').onclick = async () => {
     proxyPort: parseInt($('proxyPort').value || '0', 10),
     kingUpstreamHost: $('kingUpstreamHost').value.trim() || '157.148.54.212',
     kingUpstreamPort: parseInt($('kingUpstreamPort').value || '0', 10),
-    kingRefreshURL: $('kingRefreshURL').value.trim() || 'http://kc.iikira.com/kingcard'
+    kingRefreshURL: $('kingRefreshURL').value.trim() || 'http://kc.iikira.com/kingcard',
+    kingAutoDirectOnNonCellular: $('kingAutoDirectOnNonCellular').checked
   };
   const r = await api('/api/config', {method:'POST', body:JSON.stringify(body)});
   if (!r.error) dirty = false;

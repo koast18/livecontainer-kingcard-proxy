@@ -2,6 +2,9 @@
 #import "KPKIngCore.h"
 #import "LCProxyPaths.h"
 
+static const NSTimeInterval LCProxyKingRefreshInterval = 10 * 60;
+static const NSTimeInterval LCProxyKingRefreshLeeway = 30;
+
 static int LCProxyKingRefreshHook(void *ctx) {
     LCProxyKing *king = (__bridge LCProxyKing *)ctx;
     return [king refreshCredentials] ? 0 : -1;
@@ -19,6 +22,10 @@ static void LCProxyKingLog(const char *line) {
 @property (nonatomic, copy) NSString *lastError;
 @property (nonatomic, copy) NSString *lastDiagnostics;
 @property (nonatomic, assign) BOOL lastRefreshSuccess;
+@property (nonatomic, strong) dispatch_source_t refreshTimer;
+@property (nonatomic, assign) BOOL refreshing;
+- (void)startRefreshTimer;
+- (void)stopRefreshTimer;
 @end
 
 @implementation LCProxyKing
@@ -59,6 +66,7 @@ static void LCProxyKingLog(const char *line) {
     BOOL shouldRun = [mode isEqualToString:@"kingcard"];
     [self.lock lock];
     if (!shouldRun) {
+        [self stopRefreshTimer];
         if (self.forwarder) {
             kp_forwarder_stop(self.forwarder);
             kp_forwarder_free(self.forwarder);
@@ -72,6 +80,7 @@ static void LCProxyKingLog(const char *line) {
         kp_forwarder_free(self.forwarder);
         self.forwarder = NULL;
     }
+    [self stopRefreshTimer];
     NSString *host = [settings[@"kingUpstreamHost"] isKindOfClass:[NSString class]] && [settings[@"kingUpstreamHost"] length] ? settings[@"kingUpstreamHost"] : @"157.148.54.212";
     NSInteger port = [settings[@"kingUpstreamPort"] respondsToSelector:@selector(integerValue)] ? [settings[@"kingUpstreamPort"] integerValue] : 8091;
     if (port <= 0 || port > 65535) port = 8091;
@@ -81,6 +90,7 @@ static void LCProxyKingLog(const char *line) {
         if (kp_forwarder_start(fw) == 0) {
             self.forwarder = fw;
             [self.lock unlock];
+            [self startRefreshTimer];
             dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
                 [self refreshCredentials];
             });
@@ -91,6 +101,30 @@ static void LCProxyKingLog(const char *line) {
     self.lastError = @"转发器启动失败";
     self.lastRefreshSuccess = NO;
     [self.lock unlock];
+}
+
+
+- (void)startRefreshTimer {
+    [self stopRefreshTimer];
+    dispatch_queue_t q = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
+    dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
+    dispatch_source_set_timer(timer,
+                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)(LCProxyKingRefreshInterval * NSEC_PER_SEC)),
+                              (uint64_t)(LCProxyKingRefreshInterval * NSEC_PER_SEC),
+                              (uint64_t)(LCProxyKingRefreshLeeway * NSEC_PER_SEC));
+    __weak LCProxyKing *weakSelf = self;
+    dispatch_source_set_event_handler(timer, ^{
+        [weakSelf refreshCredentials];
+    });
+    dispatch_resume(timer);
+    self.refreshTimer = timer;
+}
+
+- (void)stopRefreshTimer {
+    if (self.refreshTimer) {
+        dispatch_source_cancel(self.refreshTimer);
+        self.refreshTimer = nil;
+    }
 }
 
 - (NSString *)guidOverrideFrom:(NSDictionary *)settings {
@@ -104,6 +138,14 @@ static void LCProxyKingLog(const char *line) {
 }
 
 - (BOOL)refreshCredentials {
+    [self.lock lock];
+    if (self.refreshing) {
+        [self.lock unlock];
+        return NO;
+    }
+    self.refreshing = YES;
+    [self.lock unlock];
+
     NSDictionary *settings = [self settingsSnapshot];
     NSString *refreshURL = [settings[@"kingRefreshURL"] isKindOfClass:[NSString class]] && [settings[@"kingRefreshURL"] length] ? settings[@"kingRefreshURL"] : @"http://kc.iikira.com/kingcard";
     NSString *host = [settings[@"kingUpstreamHost"] isKindOfClass:[NSString class]] && [settings[@"kingUpstreamHost"] length] ? settings[@"kingUpstreamHost"] : @"157.148.54.212";
@@ -130,6 +172,7 @@ static void LCProxyKingLog(const char *line) {
     self.lastDiagnostics = [NSString stringWithUTF8String:dbgbuf] ?: @"";
     if (rc != 0) {
         [self.lock lock];
+        self.refreshing = NO;
         self.lastRefreshSuccess = NO;
         self.lastSource = @"";
         self.lastRefresh = [self nowString];
@@ -146,6 +189,7 @@ static void LCProxyKingLog(const char *line) {
     }
 
     [self.lock lock];
+    self.refreshing = NO;
     if (self.forwarder) {
         kp_forwarder_set_creds(self.forwarder, guid, token);
     }

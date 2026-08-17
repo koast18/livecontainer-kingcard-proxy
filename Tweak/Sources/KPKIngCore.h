@@ -87,7 +87,12 @@ int kp_http_get_via_proxy(const char *upstream_host, int upstream_port,
                           const char *guid, const char *token,
                           int timeout_ms, char *out, size_t out_cap);
 
-/// 构造发往上游代理的 CONNECT 请求（含 Q-GUID/Q-Token 头，CRLF 结尾）。成功返回 0。
+/// 直连 GET http 目标（无代理），取响应体（供出口 IP 检测等）。
+/// 成功返回 0，out 回填响应体（NUL 结尾）。
+int kp_http_get_direct(const char *target_host, int target_port, const char *path,
+                       int timeout_ms, char *out, size_t out_cap);
+
+/// 构造发往上游代理的 CONNECT 请求（含 Q-GUID/Q-Token/User-Agent 头，CRLF 结尾）。成功返回 0。
 int kp_build_connect_request(const char *target_host, int target_port,
                              const char *guid, const char *token,
                              char *out, size_t out_cap);

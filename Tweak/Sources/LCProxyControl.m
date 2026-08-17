@@ -12,6 +12,7 @@ static void LCProxyControlConstructor(void) {
         // Apply persisted settings immediately. The proxychains C core is already
         // initialized by its own constructor; these calls update runtime flags.
         [[LCProxyConfig shared] applyToRuntime];
+        [[LCProxyConfig shared] startNetworkMonitor];
 
         // Persist this process's cellular traffic in 10-minute buckets.
         [[LCProxyStats shared] start];

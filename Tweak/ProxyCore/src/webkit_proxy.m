@@ -126,6 +126,22 @@ static int lc_create_proxy_config(void) {
     return 1;
 }
 
+static void lc_clear_proxy_from_store(id store) {
+    if (!store) {
+        proxychains_write_log("[proxychains] webkit proxy: clear store is nil, skip\n");
+        return;
+    }
+    if (![store respondsToSelector:@selector(setProxyConfigurations:)]) {
+        proxychains_write_log("[proxychains] webkit proxy: store %s does not support setProxyConfigurations:\n", object_getClassName(store));
+        return;
+    }
+    if (@available(iOS 17.0, *)) {
+        proxychains_write_log("[proxychains] webkit proxy: clearing proxy configs for store %s\n", object_getClassName(store));
+        [store setProxyConfigurations:@[]];
+        proxychains_write_log("[proxychains] webkit proxy: clear setProxyConfigurations sent to store %s\n", object_getClassName(store));
+    }
+}
+
 static void lc_apply_proxy_to_store(id store) {
     NSArray *configs;
 
@@ -137,8 +153,12 @@ static void lc_apply_proxy_to_store(id store) {
         proxychains_write_log("[proxychains] webkit proxy: store %s does not support setProxyConfigurations:\n", object_getClassName(store));
         return;
     }
-    if (!lc_create_proxy_config())
+    if (!lc_create_proxy_config()) {
+        // No proxy configured (direct mode): make sure any previously applied
+        // WKWebView proxy configuration is cleared so traffic really goes direct.
+        lc_clear_proxy_from_store(store);
         return;
+    }
 
     if (@available(iOS 17.0, *)) {
         configs = [NSArray arrayWithObjects:(id)g_lc_proxy_config, nil];
@@ -147,7 +167,6 @@ static void lc_apply_proxy_to_store(id store) {
         proxychains_write_log("[proxychains] webkit proxy: setProxyConfigurations sent to store %s\n", object_getClassName(store));
     }
 }
-
 static IMP orig_setWebsiteDataStore;
 static void lc_setWebsiteDataStore(id self, SEL _cmd, id store) {
     ((void (*)(id, SEL, id))orig_setWebsiteDataStore)(self, _cmd, store);
@@ -170,8 +189,7 @@ void livecontainer_install_webkit_proxy(void) {
     proxychains_write_log("[proxychains] webkit proxy: install begin\n");
 
     if (!lc_create_proxy_config()) {
-        proxychains_write_log("[proxychains] webkit proxy: no usable HTTP proxy found, WKWebView proxy disabled\n");
-        return;
+        proxychains_write_log("[proxychains] webkit proxy: no usable HTTP proxy found at install, WKWebView proxy will be cleared\n");
     }
 
     wds = NSClassFromString(@"WKWebsiteDataStore");
@@ -218,6 +236,15 @@ void livecontainer_reload_webkit_proxy(void) {
     }
     if (!lc_create_proxy_config()) {
         proxychains_write_log("[proxychains] webkit proxy reload: no usable HTTP proxy found\n");
+        Class wds = NSClassFromString(@"WKWebsiteDataStore");
+        if (wds) {
+            id (*msg)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+            id defaultStore = msg(wds, sel_registerName("defaultDataStore"));
+            proxychains_write_log("[proxychains] webkit proxy reload: defaultDataStore=%s\n", object_getClassName(defaultStore));
+            lc_clear_proxy_from_store(defaultStore);
+        } else {
+            proxychains_write_log("[proxychains] webkit proxy reload: WKWebsiteDataStore unavailable\n");
+        }
         return;
     }
     Class wds = NSClassFromString(@"WKWebsiteDataStore");

@@ -8,6 +8,8 @@ NS_ASSUME_NONNULL_BEGIN
 - (NSDictionary *)load;
 - (BOOL)saveSettings:(NSDictionary *)settings;
 - (void)applyToRuntime;
+- (NSString *)effectiveProxyModeForSettings:(NSDictionary *)settings;
+- (void)startNetworkMonitor;
 - (NSString *)proxychainsConfPath;
 - (NSString *)settingsPath;
 

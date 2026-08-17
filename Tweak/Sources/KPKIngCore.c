@@ -16,6 +16,9 @@
 #include <string.h>
 #include <strings.h>
 
+// 王卡网关/代理期望的 UA（参考 https://ss.y4cc.cc/txwk 的 wanka 配置）
+#define KP_KING_UA "okhttp/3.11.0 Dalvik/2.1.0 (Linux; U; Android 13; Redmi K50 5G Build/RKQ1.200826.002)"
+
 // ---------- 调试日志（宿主注册回调，真机可逐行定位） ----------
 static void (*g_kp_dbg_log)(const char *line) = NULL;
 static char g_kp_dbg_recent[8][512];   // 近期诊断环形缓冲（API 失败时回传）
@@ -276,12 +279,13 @@ int kp_build_connect_request(const char *target_host, int target_port,
                              const char *guid, const char *token,
                              char *out, size_t out_cap) {
     if (!target_host || !out) return -1;
-    // 标准 CONNECT + Q-GUID/Q-Token 头（代理校验）
+    // 标准 CONNECT + Q-GUID/Q-Token/User-Agent 头（代理校验/免流识别）
     return kp_snprintf_checked(out, out_cap,
         "CONNECT %s:%d HTTP/1.1\r\n"
         "Host: %s:%d\r\n"
         "Q-GUID: %s\r\n"
         "Q-Token: %s\r\n"
+        "User-Agent: " KP_KING_UA "\r\n"
         "\r\n",
         target_host, target_port, target_host, target_port, guid, token);
 }
@@ -544,7 +548,7 @@ static int kp_do_fetch(int fd, const char *host, const char *path,
     snprintf(req, sizeof(req),
              "GET %s HTTP/1.0\r\n"
              "Host: %s\r\n"
-             "User-Agent: " KPTWEAK_UA "\r\n"
+             "User-Agent: " KP_KING_UA "\r\n"
              "Accept-Encoding: identity\r\n"
              "Connection: close\r\n\r\n",
              path, host);
@@ -731,6 +735,41 @@ int kp_http_get_via_proxy(const char *upstream_host, int upstream_port,
     return rc;
 }
 
+int kp_http_get_direct(const char *target_host, int target_port, const char *path,
+                       int timeout_ms, char *out, size_t out_cap) {
+    kp_dbg("[ipcheck/direct] 入口: 目标=%s:%d%s", target_host ? target_host : "(null)", target_port, path ? path : "");
+    if (!target_host) { kp_dbg("[ipcheck/direct] 参数缺失"); return -1; }
+    if (out && out_cap > 0) out[0] = '\0';
+    int fd = kp_connect_host(target_host, target_port, timeout_ms);
+    if (fd < 0) return -1;
+    char req[512];
+    snprintf(req, sizeof(req),
+             "GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: " KPTWEAK_UA "\r\nAccept: text/plain\r\nConnection: close\r\n\r\n",
+             path ? path : "/", target_host);
+    int rc = -1;
+    if (kp_send_all(fd, req, strlen(req)) == 0) {
+        char buf[4096];
+        size_t got = 0;
+        if (kp_recv_response(fd, buf, sizeof(buf), &got) == 0) {
+            char body[2048];
+            size_t blen = 0;
+            kp_fetch_diag d;
+            kp_fetch_diag_init(&d);
+            if (kp_parse_http_response(buf, got, body, sizeof(body), &blen, &d) == 0) {
+                if (out && out_cap > 0) {
+                    size_t cp = blen < out_cap - 1 ? blen : out_cap - 1;
+                    memcpy(out, body, cp);
+                    out[cp] = '\0';
+                }
+                rc = 0;
+            }
+        }
+    }
+    KP_CLOSESOCK(fd);
+    kp_dbg("[ipcheck/direct] 完成: rc=%d out=%.40s", rc, out && out[0] ? out : "(空)");
+    return rc;
+}
+
 int kp_fetch_guid_token_best(const char *refresh_url,
                              const char *upstream_host, int upstream_port,
                              const char *guid_hint, const char *token_hint,
@@ -821,7 +860,7 @@ static int kp_login_via_absuri(const char *upstream_host, int upstream_port,
     snprintf(get, sizeof(get),
              "GET http://%s/ HTTP/1.0\r\n"
              "Host: %s\r\n"
-             "User-Agent: " KPTWEAK_UA "\r\n"
+             "User-Agent: " KP_KING_UA "\r\n"
              "Connection: close\r\n\r\n",
              login_host, login_host);
     if (kp_send_all(fd, get, strlen(get)) == 0) {
