@@ -1,6 +1,6 @@
 diff -ruN '--exclude=.git' ../proxychains-ng/src/common.c vendor/proxychains-ng/src/common.c
 --- a/src/common.c	2026-08-16 20:47:12.798400000 +0800
-+++ b/src/common.c	2026-08-16 22:18:33.761298600 +0800
++++ b/src/common.c	2026-08-17 03:25:02.389328700 +0800
 @@ -2,6 +2,8 @@
  #include <stdlib.h>
  #include <unistd.h>
@@ -10,29 +10,28 @@ diff -ruN '--exclude=.git' ../proxychains-ng/src/common.c vendor/proxychains-ng/
  
  const char *proxy_type_strmap[] = {
      "http",
-@@ -82,6 +84,7 @@
+@@ -81,52 +83,36 @@
+ }
  
  char *get_config_path(char* default_path, char* pbuf, size_t bufsize) {
- 	char buf[512];
-+	const char *home;
- 	// top priority: user defined path
- 	char *path = default_path;
- 	if(check_path(path))
-@@ -94,24 +97,82 @@
- 
- 	// priority 2; proxychains conf in actual dir
- 	path = getcwd(buf, sizeof(buf));
+-	char buf[512];
+-	// top priority: user defined path
+-	char *path = default_path;
+-	if(check_path(path))
+-		goto have;
+-
+-	// priority 1: env var PROXYCHAINS_CONF_FILE
+-	path = getenv(PROXYCHAINS_CONF_FILE_ENV_VAR);
+-	if(check_path(path))
+-		goto have;
+-
+-	// priority 2; proxychains conf in actual dir
+-	path = getcwd(buf, sizeof(buf));
 -	snprintf(pbuf, bufsize, "%s/%s", path, PROXYCHAINS_CONF_FILE);
 -	path = pbuf;
 -	if(check_path(path))
 -		goto have;
-+	if(path) {
-+		snprintf(pbuf, bufsize, "%s/%s", path, PROXYCHAINS_CONF_FILE);
-+		path = pbuf;
-+		if(check_path(path))
-+			goto have;
-+	}
- 
+-
 -	// priority 3; $HOME/.proxychains/proxychains.conf
 -	path = getenv("HOME");
 -	snprintf(pbuf, bufsize, "%s/.proxychains/%s", path, PROXYCHAINS_CONF_FILE);
@@ -46,88 +45,54 @@ diff -ruN '--exclude=.git' ../proxychains-ng/src/common.c vendor/proxychains-ng/
 -	path = pbuf;
 -	if(check_path(path))
 -		goto have;
-+	home = getenv("HOME");
-+	if(home) {
-+		// priority 3; $HOME/.proxychains/proxychains.conf
-+		snprintf(pbuf, bufsize, "%s/.proxychains/%s", home, PROXYCHAINS_CONF_FILE);
-+		path = pbuf;
-+		if(check_path(path))
-+			goto have;
+-
+-	// priority 4: $SYSCONFDIR/proxychains.conf
+-	path = SYSCONFDIR "/" PROXYCHAINS_CONF_FILE;
+-	if(check_path(path))
+-		goto have;
+-
+-	// priority 5: /etc/proxychains.conf
+-	path = "/etc/" PROXYCHAINS_CONF_FILE;
+-	if(check_path(path))
+-		goto have;
+-
+-	perror("couldnt find configuration file");
+-	exit(1);
++	(void)default_path;
++	Dl_info dli;
++	if(!dladdr((void*)&get_config_path, &dli) || !dli.dli_fname || !dli.dli_fname[0])
++		return NULL;
 +
-+		// priority 3b: ~/config/settings/proxychains.conf (for haiku)
-+		snprintf(pbuf, bufsize, "%s/config/settings/%s", home, PROXYCHAINS_CONF_FILE);
-+		path = pbuf;
-+		if(check_path(path))
-+			goto have;
++	snprintf(pbuf, bufsize, "%s", dli.dli_fname);
++	char *slash = strrchr(pbuf, '/');
++	if(!slash)
++		return NULL;
++	*slash = '\0';
 +
-+		// priority 3c: LiveContainer / sandbox Documents
-+		snprintf(pbuf, bufsize, "%s/Documents/%s", home, PROXYCHAINS_CONF_FILE);
-+		path = pbuf;
-+		if(check_path(path))
-+			goto have;
-+
-+		// priority 3d: LiveContainer / sandbox Library/Preferences
-+		snprintf(pbuf, bufsize, "%s/Library/Preferences/%s", home, PROXYCHAINS_CONF_FILE);
-+		path = pbuf;
-+		if(check_path(path))
-+			goto have;
-+
-+		// priority 3e: LiveContainer Documents/config/proxychanins
-+		snprintf(pbuf, bufsize, "%s/Documents/config/proxychanins/%s", home, PROXYCHAINS_CONF_FILE);
-+		path = pbuf;
-+		if(check_path(path))
-+			goto have;
-+
-+		// priority 3f: LiveContainer Documents/config/proxychains
-+		snprintf(pbuf, bufsize, "%s/Documents/config/proxychains/%s", home, PROXYCHAINS_CONF_FILE);
-+		path = pbuf;
-+		if(check_path(path))
-+			goto have;
-+	}
-+
-+	// priority 3e: next to this dylib, plus relative Documents/config paths
-+	{
-+		Dl_info dli;
-+		if(dladdr((void*)&get_config_path, &dli) && dli.dli_fname && dli.dli_fname[0]) {
-+			snprintf(pbuf, bufsize, "%s", dli.dli_fname);
-+			char *slash = strrchr(pbuf, '/');
-+			if(slash) {
-+				size_t dir_len = (size_t)(slash - pbuf);
-+				*slash = 0;
-+				if(dir_len + sizeof("/" PROXYCHAINS_CONF_FILE) <= bufsize) {
-+					snprintf(pbuf + dir_len, bufsize - dir_len, "/%s", PROXYCHAINS_CONF_FILE);
-+					path = pbuf;
-+					if(check_path(path))
-+						goto have;
-+				}
-+				if(dir_len + sizeof("/../config/proxychanins/" PROXYCHAINS_CONF_FILE) <= bufsize) {
-+					snprintf(pbuf + dir_len, bufsize - dir_len, "/../config/proxychanins/%s", PROXYCHAINS_CONF_FILE);
-+					path = pbuf;
-+					if(check_path(path))
-+						goto have;
-+				}
-+				if(dir_len + sizeof("/../config/proxychains/" PROXYCHAINS_CONF_FILE) <= bufsize) {
-+					snprintf(pbuf + dir_len, bufsize - dir_len, "/../config/proxychains/%s", PROXYCHAINS_CONF_FILE);
-+					path = pbuf;
-+					if(check_path(path))
-+						goto have;
-+				}
-+			}
++	// Only read the config file managed by LCProxyControl.
++	// This avoids interference from other proxychains.conf files on the system.
++	const char *base = strrchr(pbuf, '/');
++	base = base ? base + 1 : pbuf;
++	if(strcmp(base, "LCProxy") == 0) {
++		if(strlen(pbuf) + sizeof("/" PROXYCHAINS_CONF_FILE) <= bufsize) {
++			strncat(pbuf, "/" PROXYCHAINS_CONF_FILE, bufsize - strlen(pbuf) - 1);
++		} else {
++			return NULL;
++		}
++	} else {
++		if(strlen(pbuf) + sizeof("/../LCProxy/" PROXYCHAINS_CONF_FILE) <= bufsize) {
++			strncat(pbuf, "/../LCProxy/" PROXYCHAINS_CONF_FILE, bufsize - strlen(pbuf) - 1);
++		} else {
++			return NULL;
 +		}
 +	}
  
- 	// priority 4: $SYSCONFDIR/proxychains.conf
- 	path = SYSCONFDIR "/" PROXYCHAINS_CONF_FILE;
-@@ -123,9 +184,6 @@
- 	if(check_path(path))
- 		goto have;
- 
--	perror("couldnt find configuration file");
--	exit(1);
--
++	if(check_path(pbuf))
++		return pbuf;
  	return NULL;
- 	have:
- 	return path;
+-	have:
+-	return path;
+ }
 diff -ruN '--exclude=.git' ../proxychains-ng/src/core.c vendor/proxychains-ng/src/core.c
 --- a/src/core.c	2026-08-16 20:48:08.250024500 +0800
 +++ b/src/core.c	2026-08-16 22:04:57.257752500 +0800
@@ -233,8 +198,17 @@ diff -ruN '--exclude=.git' ../proxychains-ng/src/debug.h vendor/proxychains-ng/s
  # define DUMP_PROXY_CHAIN(A, B) dump_proxy_chain(A, B)
 diff -ruN '--exclude=.git' ../proxychains-ng/src/libproxychains.c vendor/proxychains-ng/src/libproxychains.c
 --- a/src/libproxychains.c	2026-08-16 20:48:08.254024800 +0800
-+++ b/src/libproxychains.c	2026-08-16 23:28:21.256808000 +0800
-@@ -40,6 +40,7 @@
++++ b/src/libproxychains.c	2026-08-17 04:47:38.246941700 +0800
+@@ -35,11 +35,16 @@
+ #include <fcntl.h>
+ #include <dlfcn.h>
+ #include <pthread.h>
++#include <ifaddrs.h>
++#include <net/if.h>
++#include <stdint.h>
++#include <time.h>
+ 
+ 
  #include "core.h"
  #include "common.h"
  #include "rdns.h"
@@ -242,7 +216,7 @@ diff -ruN '--exclude=.git' ../proxychains-ng/src/libproxychains.c vendor/proxych
  
  #undef 		satosin
  #define     satosin(x)      ((struct sockaddr_in *) &(x))
-@@ -58,12 +59,14 @@
+@@ -58,12 +63,26 @@
  close_t true_close;
  close_range_t true_close_range;
  connect_t true_connect;
@@ -254,10 +228,22 @@ diff -ruN '--exclude=.git' ../proxychains-ng/src/libproxychains.c vendor/proxych
  gethostbyaddr_t true_gethostbyaddr;
  sendto_t true_sendto;
 +sendmsg_t true_sendmsg;
++typedef ssize_t (*send_t)(int, const void *, size_t, int);
++typedef ssize_t (*recv_t)(int, void *, size_t, int);
++typedef ssize_t (*recvfrom_t)(int, void *, size_t, int, struct sockaddr *, socklen_t *);
++typedef ssize_t (*recvmsg_t)(int, struct msghdr *, int);
++typedef ssize_t (*read_t)(int, void *, size_t);
++typedef ssize_t (*write_t)(int, const void *, size_t);
++send_t true_send;
++recv_t true_recv;
++recvfrom_t true_recvfrom;
++recvmsg_t true_recvmsg;
++read_t true_read;
++write_t true_write;
  
  int tcp_read_time_out;
  int tcp_connect_time_out;
-@@ -74,6 +77,7 @@
+@@ -74,6 +93,7 @@
  int proxychains_got_chain_data = 0;
  unsigned int proxychains_max_chain = 1;
  int proxychains_quiet_mode = 0;
@@ -265,7 +251,211 @@ diff -ruN '--exclude=.git' ../proxychains-ng/src/libproxychains.c vendor/proxych
  enum dns_lookup_flavor proxychains_resolver = DNSLF_LIBC;
  localaddr_arg localnet_addr[MAX_LOCALNET];
  size_t num_localnet_addr = 0;
-@@ -110,6 +114,8 @@
+@@ -85,6 +105,203 @@
+ 
+ static int init_l = 0;
+ 
++/* ---- LCProxy control & traffic stats (added on top of proxychains) ---- */
++#define LC_STATS_BUCKET_SECONDS 600
++#define LC_STATS_MAX_BUCKETS 2016
++
++typedef struct {
++    int64_t start;
++    uint64_t upload;
++    uint64_t download;
++} lc_traffic_bucket;
++
++static int lc_proxy_disabled = 0;
++static pthread_mutex_t lc_stats_lock = PTHREAD_MUTEX_INITIALIZER;
++static lc_traffic_bucket lc_buckets[LC_STATS_MAX_BUCKETS];
++static int lc_bucket_count = 0;
++static int64_t lc_current_start = 0;
++static uint64_t lc_current_upload = 0;
++static uint64_t lc_current_download = 0;
++static int lc_cellular_cache = -1;
++static time_t lc_cellular_checked = 0;
++
++static pthread_key_t lc_bypass_key;
++static pthread_once_t lc_bypass_once = PTHREAD_ONCE_INIT;
++
++static void lc_bypass_destroy(void *v) { (void)v; }
++static void lc_bypass_init(void) {
++    pthread_key_create(&lc_bypass_key, lc_bypass_destroy);
++}
++static void lc_bypass_set(int v) {
++    pthread_once(&lc_bypass_once, lc_bypass_init);
++    pthread_setspecific(lc_bypass_key, (void *)(intptr_t)v);
++}
++static int lc_bypass_get(void) {
++    pthread_once(&lc_bypass_once, lc_bypass_init);
++    return (int)(intptr_t)pthread_getspecific(lc_bypass_key);
++}
++
++void lcproxy_socket_set_bypass(int on) {
++    lc_bypass_set(on);
++}
++
++static int64_t lc_now_bucket_start(void) {
++    struct timespec ts;
++    clock_gettime(CLOCK_REALTIME, &ts);
++    int64_t sec = (int64_t)ts.tv_sec;
++    return sec - (sec % LC_STATS_BUCKET_SECONDS);
++}
++
++static void lc_stats_rotate_locked(int64_t now_bucket) {
++    if (lc_current_start == 0) {
++        lc_current_start = now_bucket;
++        return;
++    }
++    if (lc_current_start == now_bucket)
++        return;
++    if (lc_bucket_count < LC_STATS_MAX_BUCKETS) {
++        lc_buckets[lc_bucket_count].start = lc_current_start;
++        lc_buckets[lc_bucket_count].upload = lc_current_upload;
++        lc_buckets[lc_bucket_count].download = lc_current_download;
++        lc_bucket_count++;
++    } else {
++        memmove(&lc_buckets[0], &lc_buckets[1], sizeof(lc_buckets[0]) * (LC_STATS_MAX_BUCKETS - 1));
++        lc_buckets[LC_STATS_MAX_BUCKETS - 1].start = lc_current_start;
++        lc_buckets[LC_STATS_MAX_BUCKETS - 1].upload = lc_current_upload;
++        lc_buckets[LC_STATS_MAX_BUCKETS - 1].download = lc_current_download;
++    }
++    lc_current_start = now_bucket;
++    lc_current_upload = 0;
++    lc_current_download = 0;
++}
++
++void lcproxy_control_set_enabled(int enabled) {
++    lc_proxy_disabled = enabled ? 0 : 1;
++}
++int lcproxy_control_get_enabled(void) {
++    return lc_proxy_disabled ? 0 : 1;
++}
++void lcproxy_control_set_block_non_tcp(int enabled) {
++    proxychains_block_non_tcp = enabled ? 1 : 0;
++}
++int lcproxy_control_get_block_non_tcp(void) {
++    return proxychains_block_non_tcp;
++}
++int lcproxy_control_get_proxy_count(void) {
++    return (int)proxychains_proxy_count;
++}
++
++int lcproxy_stats_is_cellular(void) {
++    time_t now = time(NULL);
++    if (now - lc_cellular_checked < 2 && lc_cellular_cache >= 0)
++        return lc_cellular_cache;
++    struct ifaddrs *ifa = NULL;
++    int cellular = 0;
++    int has_wifi = 0;
++    if (getifaddrs(&ifa) == 0) {
++        struct ifaddrs *p;
++        for (p = ifa; p; p = p->ifa_next) {
++            if (!p->ifa_addr || p->ifa_addr->sa_family != AF_INET)
++                continue;
++            if (!(p->ifa_flags & IFF_UP) || !(p->ifa_flags & IFF_RUNNING))
++                continue;
++            if (strncmp(p->ifa_name, "en", 2) == 0)
++                has_wifi = 1;
++            else if (strncmp(p->ifa_name, "pdp_ip", 6) == 0)
++                cellular = 1;
++        }
++        freeifaddrs(ifa);
++    }
++    if (has_wifi)
++        cellular = 0;
++    lc_cellular_cache = cellular;
++    lc_cellular_checked = now;
++    return cellular;
++}
++
++void lcproxy_stats_add_upload(uint64_t n) {
++    if (!n) return;
++    pthread_mutex_lock(&lc_stats_lock);
++    lc_stats_rotate_locked(lc_now_bucket_start());
++    lc_current_upload += n;
++    pthread_mutex_unlock(&lc_stats_lock);
++}
++void lcproxy_stats_add_download(uint64_t n) {
++    if (!n) return;
++    pthread_mutex_lock(&lc_stats_lock);
++    lc_stats_rotate_locked(lc_now_bucket_start());
++    lc_current_download += n;
++    pthread_mutex_unlock(&lc_stats_lock);
++}
++
++int lcproxy_stats_bucket_count(void) {
++    pthread_mutex_lock(&lc_stats_lock);
++    int n = lc_bucket_count;
++    pthread_mutex_unlock(&lc_stats_lock);
++    return n;
++}
++int lcproxy_stats_get_bucket(int i, int64_t *start, uint64_t *up, uint64_t *down) {
++    pthread_mutex_lock(&lc_stats_lock);
++    int ok = (i >= 0 && i < lc_bucket_count);
++    if (ok) {
++        *start = lc_buckets[i].start;
++        *up = lc_buckets[i].upload;
++        *down = lc_buckets[i].download;
++    }
++    pthread_mutex_unlock(&lc_stats_lock);
++    return ok;
++}
++void lcproxy_stats_get_current(int64_t *start, uint64_t *up, uint64_t *down) {
++    pthread_mutex_lock(&lc_stats_lock);
++    lc_stats_rotate_locked(lc_now_bucket_start());
++    *start = lc_current_start;
++    *up = lc_current_upload;
++    *down = lc_current_download;
++    pthread_mutex_unlock(&lc_stats_lock);
++}
++uint64_t lcproxy_stats_total_upload(void) {
++    pthread_mutex_lock(&lc_stats_lock);
++    uint64_t total = lc_current_upload;
++    for (int i = 0; i < lc_bucket_count; i++) total += lc_buckets[i].upload;
++    pthread_mutex_unlock(&lc_stats_lock);
++    return total;
++}
++uint64_t lcproxy_stats_total_download(void) {
++    pthread_mutex_lock(&lc_stats_lock);
++    uint64_t total = lc_current_download;
++    for (int i = 0; i < lc_bucket_count; i++) total += lc_buckets[i].download;
++    pthread_mutex_unlock(&lc_stats_lock);
++    return total;
++}
++
++static int lc_should_count_fd(int fd) {
++    if (!lcproxy_stats_is_cellular())
++        return 0;
++    if (lc_bypass_get())
++        return 0;
++    struct sockaddr_storage ss;
++    socklen_t len = sizeof(ss);
++    if (getsockname(fd, (struct sockaddr *)&ss, &len) != 0)
++        return 0;
++    if (ss.ss_family == AF_INET) {
++        struct sockaddr_in *sin = (struct sockaddr_in *)&ss;
++        unsigned long a = ntohl(sin->sin_addr.s_addr);
++        if ((a >> 24) == 127)
++            return 0;
++    } else if (ss.ss_family == AF_INET6) {
++        struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&ss;
++        if (IN6_IS_ADDR_LOOPBACK(&sin6->sin6_addr))
++            return 0;
++    } else {
++        return 0;
++    }
++    int type = 0;
++    socklen_t tl = sizeof(type);
++    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &tl) != 0)
++        return 0;
++    return 1;
++}
++
+ static void get_chain_data(proxy_data * pd, unsigned int *proxy_count, chain_type * ct);
+ 
+ static void* load_sym(char* symname, void* proxyfunc, int is_mandatory) {
+@@ -110,6 +327,8 @@
  const char *proxychains_get_version(void);
  
  static void setup_hooks(void);
@@ -274,7 +464,7 @@ diff -ruN '--exclude=.git' ../proxychains-ng/src/libproxychains.c vendor/proxych
  
  typedef struct {
  	unsigned int first, last, flags;
-@@ -143,8 +149,15 @@
+@@ -143,8 +362,15 @@
  		proxychains_quiet_mode = 1;
  
  	proxychains_write_log(LOG_PREFIX "DLL init: proxychains-ng %s\n", proxychains_get_version());
@@ -290,7 +480,7 @@ diff -ruN '--exclude=.git' ../proxychains-ng/src/libproxychains.c vendor/proxych
  
  	/* read the config file */
  	get_chain_data(proxychains_pd, &proxychains_proxy_count, &proxychains_ct);
-@@ -307,12 +320,12 @@
+@@ -307,12 +533,12 @@
  	*ct = DYNAMIC_TYPE;
  
  	env = get_config_path(getenv(PROXYCHAINS_CONF_FILE_ENV_VAR), buf, sizeof(buf));
@@ -307,7 +497,7 @@ diff -ruN '--exclude=.git' ../proxychains-ng/src/libproxychains.c vendor/proxych
  	while(fgets(buf, sizeof(buf), file)) {
  		buff = buf;
  		/* remove leading whitespace */
-@@ -339,7 +352,7 @@
+@@ -339,7 +565,7 @@
  					if(!proxy_from_string(buff, type, host, &port_n, pd[count].user, pd[count].pass)) {
  						inv:
  						fprintf(stderr, "error: invalid item in proxylist section: %s", buff);
@@ -316,7 +506,7 @@ diff -ruN '--exclude=.git' ../proxychains-ng/src/libproxychains.c vendor/proxych
  					}
  				}
  
-@@ -361,7 +374,7 @@
+@@ -361,7 +587,7 @@
  						fprintf(stderr, "proxy %s has invalid value or is not numeric\n", host);
  						fprintf(stderr, "non-numeric ips are only allowed under the following circumstances:\n");
  						fprintf(stderr, "chaintype == strict (%s), proxy is not first in list (%s), proxy_dns active (%s)\n\n", bool_str(*ct == STRICT_TYPE), bool_str(count > 0), rdns_resolver_string(proxychains_resolver));
@@ -325,7 +515,7 @@ diff -ruN '--exclude=.git' ../proxychains-ng/src/libproxychains.c vendor/proxych
  					}
  				}
  
-@@ -389,6 +402,9 @@
+@@ -389,6 +615,9 @@
  					*ct = DYNAMIC_TYPE;
  				} else if(!strcmp(buff, "round_robin_chain")) {
  					*ct = ROUND_ROBIN_TYPE;
@@ -335,7 +525,7 @@ diff -ruN '--exclude=.git' ../proxychains-ng/src/libproxychains.c vendor/proxych
  				} else if(STR_STARTSWITH(buff, "tcp_read_time_out")) {
  					sscanf(buff, "%s %d", user, &tcp_read_time_out);
  				} else if(STR_STARTSWITH(buff, "tcp_connect_time_out")) {
-@@ -398,7 +414,7 @@
+@@ -398,7 +627,7 @@
  					if(remote_dns_subnet >= 256) {
  						fprintf(stderr,
  							"remote_dns_subnet: invalid value. requires a number between 0 and 255.\n");
@@ -344,7 +534,7 @@ diff -ruN '--exclude=.git' ../proxychains-ng/src/libproxychains.c vendor/proxych
  					}
  				} else if(STR_STARTSWITH(buff, "localnet")) {
  					char colon, extra, right_bracket[2];
-@@ -406,7 +422,7 @@
+@@ -406,7 +635,7 @@
  					int local_family, n, valid;
  					if(sscanf(buff, "%s %53[^/]/%15s%c", user, local_addr_port, local_netmask, &extra) != 3) {
  						fprintf(stderr, "localnet format error");
@@ -353,7 +543,7 @@ diff -ruN '--exclude=.git' ../proxychains-ng/src/libproxychains.c vendor/proxych
  					}
  					p = strchr(local_addr_port, ':');
  					if(!p || p == strrchr(local_addr_port, ':')) {
-@@ -423,7 +439,7 @@
+@@ -423,7 +652,7 @@
  					}
  					if(!valid) {
  						fprintf(stderr, "localnet address or port error\n");
@@ -362,7 +552,7 @@ diff -ruN '--exclude=.git' ../proxychains-ng/src/libproxychains.c vendor/proxych
  					}
  					if(local_port) {
  						PDEBUG("added localnet: netaddr=%s, port=%u, netmask=%s\n",
-@@ -447,7 +463,7 @@
+@@ -447,7 +676,7 @@
  						}
  						if(!valid) {
  							fprintf(stderr, "localnet address error\n");
@@ -371,7 +561,7 @@ diff -ruN '--exclude=.git' ../proxychains-ng/src/libproxychains.c vendor/proxych
  						}
  						if(local_family == AF_INET && strchr(local_netmask, '.')) {
  							valid =
-@@ -469,7 +485,7 @@
+@@ -469,7 +698,7 @@
  						}
  						if(!valid) {
  							fprintf(stderr, "localnet netmask error\n");
@@ -380,7 +570,7 @@ diff -ruN '--exclude=.git' ../proxychains-ng/src/libproxychains.c vendor/proxych
  						}
  						++num_localnet_addr;
  					} else {
-@@ -481,7 +497,7 @@
+@@ -481,7 +710,7 @@
  					pc = strchr(buff, '=');
  					if(!pc) {
  						fprintf(stderr, "error: missing equals sign '=' in chain_len directive.\n");
@@ -389,7 +579,7 @@ diff -ruN '--exclude=.git' ../proxychains-ng/src/libproxychains.c vendor/proxych
  					}
  					len = atoi(++pc);
  					proxychains_max_chain = (len ? len : 1);
-@@ -496,13 +512,13 @@
+@@ -496,13 +725,13 @@
  
  					if(sscanf(buff, "%s %15[^:]:%5s", user, rdnsd_addr, rdnsd_port) < 3) {
  						fprintf(stderr, "proxy_dns_daemon format error\n");
@@ -405,7 +595,7 @@ diff -ruN '--exclude=.git' ../proxychains-ng/src/libproxychains.c vendor/proxych
  					}
  					rdns_server_buffer.sin_port = htons(atoi(rdnsd_port));
  					proxychains_resolver = DNSLF_RDNS_DAEMON;
-@@ -510,7 +526,7 @@
+@@ -510,7 +739,7 @@
  				} else if(STR_STARTSWITH(buff, "dnat")) {
  					if(sscanf(buff, "%s %21[^ ] %21s\n", user, dnat_orig_addr_port, dnat_new_addr_port) < 3) {
  						fprintf(stderr, "dnat format error");
@@ -414,7 +604,7 @@ diff -ruN '--exclude=.git' ../proxychains-ng/src/libproxychains.c vendor/proxych
  					}
  					/* clean previously used buffer */
  					memset(dnat_orig_port, 0, sizeof(dnat_orig_port) / sizeof(dnat_orig_port[0]));
-@@ -526,7 +542,7 @@
+@@ -526,7 +755,7 @@
  							      &dnats[num_dnats].orig_dst);
  						if(error <= 0) {
  							fprintf(stderr, "dnat original destination address error\n");
@@ -423,7 +613,7 @@ diff -ruN '--exclude=.git' ../proxychains-ng/src/libproxychains.c vendor/proxych
  						}
  
  						error =
-@@ -534,7 +550,7 @@
+@@ -534,7 +763,7 @@
  							      &dnats[num_dnats].new_dst);
  						if(error <= 0) {
  							fprintf(stderr, "dnat effective destination address error\n");
@@ -432,7 +622,7 @@ diff -ruN '--exclude=.git' ../proxychains-ng/src/libproxychains.c vendor/proxych
  						}
  
  						if(dnat_orig_port[0]) {
-@@ -562,14 +578,24 @@
+@@ -562,14 +791,31 @@
  	}
  #ifndef BROKEN_FCLOSE
  	fclose(file);
@@ -455,10 +645,17 @@ diff -ruN '--exclude=.git' ../proxychains-ng/src/libproxychains.c vendor/proxych
 +	proxychains_got_chain_data = 1;
 +	proxychains_resolver = DNSLF_LIBC;
 +	proxychains_write_log(LOG_PREFIX "no usable proxy config, proxychains disabled\n");
++}
++
++void lcproxy_control_reload_config(void) {
++	proxychains_got_chain_data = 0;
++	proxychains_proxy_count = 0;
++	get_chain_data(proxychains_pd, &proxychains_proxy_count, &proxychains_ct);
++	proxychains_write_log(LOG_PREFIX "config reloaded, proxy_count=%u\n", proxychains_proxy_count);
  }
  
  /*******  HOOK FUNCTIONS  *******/
-@@ -581,6 +607,20 @@
+@@ -581,6 +827,20 @@
  #define HOOKFUNC(R, N, args...) R N ( EXPAND(args) )
  #endif
  
@@ -479,18 +676,20 @@ diff -ruN '--exclude=.git' ../proxychains-ng/src/libproxychains.c vendor/proxych
  HOOKFUNC(int, close, int fd) {
  	if(!init_l) {
  		if(close_fds_cnt>=(sizeof close_fds/sizeof close_fds[0])) goto err;
-@@ -669,7 +709,10 @@
+@@ -669,7 +929,12 @@
  HOOKFUNC(int, connect, int sock, const struct sockaddr *addr, unsigned int len) {
  	INIT();
  	PFUNC();
 +	PDEBUG("connect called: sock=%d family=%u\n", sock, addr ? (unsigned)addr->sa_family : 0u);
  
-+	if(!proxychains_proxy_count)
++	if(lc_bypass_get())
++		return true_connect(sock, addr, len);
++	if(!proxychains_proxy_count || lc_proxy_disabled)
 +		return true_connect(sock, addr, len);
  	int socktype = 0, flags = 0, ret = 0;
  	socklen_t optlen = 0;
  	ip_type dest_ip;
-@@ -684,6 +727,8 @@
+@@ -684,6 +949,8 @@
  	optlen = sizeof(socktype);
  	sa_family_t fam = SOCKFAMILY(*addr);
  	getsockopt(sock, SOL_SOCKET, SO_TYPE, &socktype, &optlen);
@@ -499,7 +698,20 @@ diff -ruN '--exclude=.git' ../proxychains-ng/src/libproxychains.c vendor/proxych
  	if(!((fam  == AF_INET || fam == AF_INET6) && socktype == SOCK_STREAM))
  		return true_connect(sock, addr, len);
  
-@@ -766,6 +811,40 @@
+@@ -755,10 +1022,12 @@
+ 
+ 	memcpy(dest_ip.addr.v6, v6 ? (void*)p_addr_in6 : (void*)p_addr_in, v6?16:4);
+ 
++	lc_bypass_set(1);
+ 	ret = connect_proxy_chain(sock,
+ 				  dest_ip,
+ 				  htons(port),
+ 				  proxychains_pd, proxychains_proxy_count, proxychains_ct, proxychains_max_chain);
++	lc_bypass_set(0);
+ 
+ 	fcntl(sock, F_SETFL, flags);
+ 	if(ret != SUCCESS)
+@@ -766,6 +1035,42 @@
  	return ret;
  }
  
@@ -523,6 +735,8 @@ diff -ruN '--exclude=.git' ../proxychains-ng/src/libproxychains.c vendor/proxych
 +	(void)extlen;
 +	(void)pcid;
 +	(void)connid;
++	if(lc_bypass_get())
++		return true_connectx(sock, endpoints, associd, flags, ext, extlen, pcid, connid);
 +	if(!proxychains_proxy_count || !endpoints || !endpoints->sae_dstaddr ||
 +	   endpoints->sae_dstaddrlen < sizeof(struct sockaddr) || flags != 0 ||
 +	   ext != NULL || extlen != 0 || pcid != NULL || connid != NULL) {
@@ -540,7 +754,59 @@ diff -ruN '--exclude=.git' ../proxychains-ng/src/libproxychains.c vendor/proxych
  #ifdef IS_SOLARIS
  HOOKFUNC(int, __xnet_connect, int sock, const struct sockaddr *addr, unsigned int len)
  	return connect(sock, addr, len);
-@@ -891,6 +970,8 @@
+@@ -777,6 +1082,9 @@
+ 	INIT();
+ 	PDEBUG("gethostbyname: %s\n", name);
+ 
++	if(lc_bypass_get())
++		return true_gethostbyname(name);
++
+ 	if(proxychains_resolver == DNSLF_FORKEXEC)
+ 		return proxy_gethostbyname_old(name);
+ 	else if(proxychains_resolver == DNSLF_LIBC)
+@@ -791,6 +1099,9 @@
+ 	INIT();
+ 	PDEBUG("getaddrinfo: %s %s\n", node ? node : "null", service ? service : "null");
+ 
++	if(lc_bypass_get())
++		return true_getaddrinfo(node, service, hints, res);
++
+ 	if(proxychains_resolver != DNSLF_LIBC)
+ 		return proxy_getaddrinfo(node, service, hints, res);
+ 	else
+@@ -801,6 +1112,11 @@
+ 	INIT();
+ 	PDEBUG("freeaddrinfo %p \n", (void *) res);
+ 
++	if(lc_bypass_get()) {
++		true_freeaddrinfo(res);
++		return;
++	}
++
+ 	if(proxychains_resolver == DNSLF_LIBC)
+ 		true_freeaddrinfo(res);
+ 	else
+@@ -814,6 +1130,9 @@
+ 	INIT();
+ 	PFUNC();
+ 
++	if(lc_bypass_get())
++		return true_getnameinfo(sa, salen, host, hostlen, serv, servlen, flags);
++
+ 	if(proxychains_resolver == DNSLF_LIBC) {
+ 		return true_getnameinfo(sa, salen, host, hostlen, serv, servlen, flags);
+ 	} else {
+@@ -861,6 +1180,9 @@
+ 	static char *aliases[1];
+ 	static struct hostent he;
+ 
++	if(lc_bypass_get())
++		return true_gethostbyaddr(addr, len, type);
++
+ 	if(proxychains_resolver == DNSLF_LIBC)
+ 		return true_gethostbyaddr(addr, len, type);
+ 	else {
+@@ -891,6 +1213,8 @@
  	       const struct sockaddr *dest_addr, socklen_t addrlen) {
  	INIT();
  	PFUNC();
@@ -549,22 +815,104 @@ diff -ruN '--exclude=.git' ../proxychains-ng/src/libproxychains.c vendor/proxych
  	if (flags & MSG_FASTOPEN) {
  		if (!connect(sockfd, dest_addr, addrlen) && errno != EINPROGRESS) {
  			return -1;
-@@ -902,6 +983,14 @@
- 	return true_sendto(sockfd, buf, len, flags, dest_addr, addrlen);
- }
- 
+@@ -899,7 +1223,95 @@
+ 		addrlen = 0;
+ 		flags &= ~MSG_FASTOPEN;
+ 	}
+-	return true_sendto(sockfd, buf, len, flags, dest_addr, addrlen);
++	ssize_t lc_ret = true_sendto(sockfd, buf, len, flags, dest_addr, addrlen);
++	if(lc_ret > 0 && lc_should_count_fd(sockfd))
++		lcproxy_stats_add_upload((uint64_t)lc_ret);
++	return lc_ret;
++}
++
 +HOOKFUNC(ssize_t, sendmsg, int sockfd, const struct msghdr *msg, int flags) {
 +	INIT();
 +	PFUNC();
 +	if(lc_drop_non_tcp_if_enabled(sockfd))
 +		return -1;
-+	return true_sendmsg(sockfd, msg, flags);
++	ssize_t lc_ret = true_sendmsg(sockfd, msg, flags);
++	if(lc_ret > 0 && lc_should_count_fd(sockfd))
++		lcproxy_stats_add_upload((uint64_t)lc_ret);
++	return lc_ret;
 +}
 +
++static ssize_t lc_real_write(int fd, const void *buf, size_t len) {
++    if (true_write) return true_write(fd, buf, len);
++    static write_t sym;
++    if (!sym) sym = (write_t)dlsym(RTLD_NEXT, "write");
++    return sym ? sym(fd, buf, len) : -1;
++}
++static ssize_t lc_real_read(int fd, void *buf, size_t len) {
++    if (true_read) return true_read(fd, buf, len);
++    static read_t sym;
++    if (!sym) sym = (read_t)dlsym(RTLD_NEXT, "read");
++    return sym ? sym(fd, buf, len) : -1;
++}
++
++HOOKFUNC(ssize_t, send, int sockfd, const void *buf, size_t len, int flags) {
++	INIT();
++	PFUNC();
++	if(lc_drop_non_tcp_if_enabled(sockfd))
++		return -1;
++	ssize_t lc_ret = true_send(sockfd, buf, len, flags);
++	if(lc_ret > 0 && lc_should_count_fd(sockfd))
++		lcproxy_stats_add_upload((uint64_t)lc_ret);
++	return lc_ret;
++}
++
++HOOKFUNC(ssize_t, write, int fd, const void *buf, size_t len) {
++	if(!init_l)
++		return lc_real_write(fd, buf, len);
++	INIT();
++	PFUNC();
++	ssize_t lc_ret = lc_real_write(fd, buf, len);
++	if(lc_ret > 0 && lc_should_count_fd(fd))
++		lcproxy_stats_add_upload((uint64_t)lc_ret);
++	return lc_ret;
++}
++
++HOOKFUNC(ssize_t, recv, int sockfd, void *buf, size_t len, int flags) {
++	INIT();
++	PFUNC();
++	ssize_t lc_ret = true_recv(sockfd, buf, len, flags);
++	if(lc_ret > 0 && lc_should_count_fd(sockfd))
++		lcproxy_stats_add_download((uint64_t)lc_ret);
++	return lc_ret;
++}
++
++HOOKFUNC(ssize_t, recvfrom, int sockfd, void *buf, size_t len, int flags,
++	       struct sockaddr *src_addr, socklen_t *addrlen) {
++	INIT();
++	PFUNC();
++	ssize_t lc_ret = true_recvfrom(sockfd, buf, len, flags, src_addr, addrlen);
++	if(lc_ret > 0 && lc_should_count_fd(sockfd))
++		lcproxy_stats_add_download((uint64_t)lc_ret);
++	return lc_ret;
++}
++
++HOOKFUNC(ssize_t, recvmsg, int sockfd, struct msghdr *msg, int flags) {
++	INIT();
++	PFUNC();
++	ssize_t lc_ret = true_recvmsg(sockfd, msg, flags);
++	if(lc_ret > 0 && lc_should_count_fd(sockfd))
++		lcproxy_stats_add_download((uint64_t)lc_ret);
++	return lc_ret;
++}
++
++HOOKFUNC(ssize_t, read, int fd, void *buf, size_t len) {
++	if(!init_l)
++		return lc_real_read(fd, buf, len);
++	INIT();
++	PFUNC();
++	ssize_t lc_ret = lc_real_read(fd, buf, len);
++	if(lc_ret > 0 && lc_should_count_fd(fd))
++		lcproxy_stats_add_download((uint64_t)lc_ret);
++	return lc_ret;
+ }
+ 
  #ifdef MONTEREY_HOOKING
- #define SETUP_SYM(X) do { if (! true_ ## X ) true_ ## X = &X; } while(0)
- #define SETUP_SYM_OPTIONAL(X)
-@@ -913,7 +1002,11 @@
+@@ -913,7 +1325,17 @@
  
  static void setup_hooks(void) {
  	SETUP_SYM(connect);
@@ -573,10 +921,16 @@ diff -ruN '--exclude=.git' ../proxychains-ng/src/libproxychains.c vendor/proxych
 +#endif
  	SETUP_SYM(sendto);
 +	SETUP_SYM(sendmsg);
++	SETUP_SYM(send);
++	SETUP_SYM(write);
++	SETUP_SYM(recv);
++	SETUP_SYM(recvfrom);
++	SETUP_SYM(recvmsg);
++	SETUP_SYM(read);
  	SETUP_SYM(gethostbyname);
  	SETUP_SYM(getaddrinfo);
  	SETUP_SYM(freeaddrinfo);
-@@ -927,6 +1020,28 @@
+@@ -927,6 +1349,34 @@
  }
  
  #ifdef MONTEREY_HOOKING
@@ -586,6 +940,12 @@ diff -ruN '--exclude=.git' ../proxychains-ng/src/libproxychains.c vendor/proxych
 +		{"connectx", (void*)pxcng_connectx, (void**)&true_connectx},
 +		{"sendto", (void*)pxcng_sendto, (void**)&true_sendto},
 +		{"sendmsg", (void*)pxcng_sendmsg, (void**)&true_sendmsg},
++		{"send", (void*)pxcng_send, (void**)&true_send},
++		{"write", (void*)pxcng_write, (void**)&true_write},
++		{"recv", (void*)pxcng_recv, (void**)&true_recv},
++		{"recvfrom", (void*)pxcng_recvfrom, (void**)&true_recvfrom},
++		{"recvmsg", (void*)pxcng_recvmsg, (void**)&true_recvmsg},
++		{"read", (void*)pxcng_read, (void**)&true_read},
 +		{"gethostbyname", (void*)pxcng_gethostbyname, (void**)&true_gethostbyname},
 +		{"getaddrinfo", (void*)pxcng_getaddrinfo, (void**)&true_getaddrinfo},
 +		{"freeaddrinfo", (void*)pxcng_freeaddrinfo, (void**)&true_freeaddrinfo},
@@ -605,7 +965,7 @@ diff -ruN '--exclude=.git' ../proxychains-ng/src/libproxychains.c vendor/proxych
  
  #define DYLD_INTERPOSE(_replacement,_replacee) \
     __attribute__((used)) static struct{ const void* replacement; const void* replacee; } _interpose_##_replacee \
-@@ -934,7 +1049,11 @@
+@@ -934,7 +1384,17 @@
  #define DYLD_HOOK(F) DYLD_INTERPOSE(pxcng_ ## F, F)
  
  DYLD_HOOK(connect);
@@ -614,6 +974,12 @@ diff -ruN '--exclude=.git' ../proxychains-ng/src/libproxychains.c vendor/proxych
 +#endif
  DYLD_HOOK(sendto);
 +DYLD_HOOK(sendmsg);
++DYLD_HOOK(send);
++DYLD_HOOK(write);
++DYLD_HOOK(recv);
++DYLD_HOOK(recvfrom);
++DYLD_HOOK(recvmsg);
++DYLD_HOOK(read);
  DYLD_HOOK(gethostbyname);
  DYLD_HOOK(getaddrinfo);
  DYLD_HOOK(freeaddrinfo);

@@ -403,9 +403,14 @@ static int kp_connect_host(const char *host, int port, int timeout_ms) {
     hints.ai_socktype = SOCK_STREAM;
     char portstr[16];
     snprintf(portstr, sizeof(portstr), "%d", port);
-    if (getaddrinfo(host, portstr, &hints, &res) != 0) return -1;
-    // 自身连接绕过 socket 层代理劫持（保持直连/上游豁免语义）
+    // 自身连接绕过 socket 层代理劫持（保持直连/上游豁免语义）。
+    // 必须在 getaddrinfo 之前开启：否则 proxy_dns 会先返回内部假 IP，
+    // 随后 bypass 的 connect 会去连 224.x.x.x 而失败。
     kp_socket_set_bypass(1);
+    if (getaddrinfo(host, portstr, &hints, &res) != 0) {
+        kp_socket_set_bypass(0);
+        return -1;
+    }
     int fd = -1;
     for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
         fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);

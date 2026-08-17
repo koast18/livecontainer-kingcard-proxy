@@ -1082,6 +1082,9 @@ HOOKFUNC(struct hostent*, gethostbyname, const char *name) {
 	INIT();
 	PDEBUG("gethostbyname: %s\n", name);
 
+	if(lc_bypass_get())
+		return true_gethostbyname(name);
+
 	if(proxychains_resolver == DNSLF_FORKEXEC)
 		return proxy_gethostbyname_old(name);
 	else if(proxychains_resolver == DNSLF_LIBC)
@@ -1096,6 +1099,9 @@ HOOKFUNC(int, getaddrinfo, const char *node, const char *service, const struct a
 	INIT();
 	PDEBUG("getaddrinfo: %s %s\n", node ? node : "null", service ? service : "null");
 
+	if(lc_bypass_get())
+		return true_getaddrinfo(node, service, hints, res);
+
 	if(proxychains_resolver != DNSLF_LIBC)
 		return proxy_getaddrinfo(node, service, hints, res);
 	else
@@ -1105,6 +1111,11 @@ HOOKFUNC(int, getaddrinfo, const char *node, const char *service, const struct a
 HOOKFUNC(void, freeaddrinfo, struct addrinfo *res) {
 	INIT();
 	PDEBUG("freeaddrinfo %p \n", (void *) res);
+
+	if(lc_bypass_get()) {
+		true_freeaddrinfo(res);
+		return;
+	}
 
 	if(proxychains_resolver == DNSLF_LIBC)
 		true_freeaddrinfo(res);
@@ -1118,6 +1129,9 @@ HOOKFUNC(int, getnameinfo, const struct sockaddr *sa, socklen_t salen,
 {
 	INIT();
 	PFUNC();
+
+	if(lc_bypass_get())
+		return true_getnameinfo(sa, salen, host, hostlen, serv, servlen, flags);
 
 	if(proxychains_resolver == DNSLF_LIBC) {
 		return true_getnameinfo(sa, salen, host, hostlen, serv, servlen, flags);
@@ -1165,6 +1179,9 @@ HOOKFUNC(struct hostent*, gethostbyaddr, const void *addr, socklen_t len, int ty
 	static char *list[2];
 	static char *aliases[1];
 	static struct hostent he;
+
+	if(lc_bypass_get())
+		return true_gethostbyaddr(addr, len, type);
 
 	if(proxychains_resolver == DNSLF_LIBC)
 		return true_gethostbyaddr(addr, len, type);
