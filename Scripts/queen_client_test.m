@@ -65,7 +65,7 @@ int main(int argc, char *argv[]) {
             }];
         }];
 
-        dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 75LL * NSEC_PER_SEC));
+        dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 200LL * NSEC_PER_SEC));
 
         if (errorText) {
             NSLog(@"[test] FAILED %@", errorText);

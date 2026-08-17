@@ -778,12 +778,14 @@ static NSDictionary *KPKSendWupAndParse(NSString *guid, NSString *qua2, NSData *
             NSData *respData = [NSData dataWithBytes:rbuf length:rlen];
             free(rbuf);
 
+            NSLog(@"[king] wup POST %@ status=%d resp_len=%zu", server, status, rlen);
             if (status != 200) continue;
 
             NSString *encFlag = KPKResponseHeader(respData, rlen, @"QQ-S-Encrypt");
             NSString *zipFlag = KPKResponseHeader(respData, rlen, @"QQ-S-ZIP");
             NSData *bodyData = KPKResponseBody(respData, rlen);
             if (!bodyData) continue;
+            NSLog(@"[king] wup enc=%@ zip=%@ body_len=%lu", encFlag ?: @"", zipFlag ?: @"", (unsigned long)bodyData.length);
 
             NSData *plain = nil;
             BOOL enc = encFlag.length > 0 || (status == 200 && bodyData.length > 16);
@@ -812,10 +814,15 @@ static NSDictionary *KPKSendWupAndParse(NSString *guid, NSString *qua2, NSData *
             }
             if (!plain) continue;
 
+            NSLog(@"[king] wup plain_len=%lu", (unsigned long)plain.length);
             NSDictionary *fields = KPKParseWupResponse(plain, rspType);
-            if (!fields) continue;
+            if (!fields) {
+                NSLog(@"[king] wup parse failed, plain_head=%@", KPKHexUpper([plain subdataWithRange:NSMakeRange(0, MIN(plain.length, 80))]));
+                continue;
+            }
 
             NSNumber *rspCode = fields[@0];
+            NSLog(@"[king] wup rspCode=%@ fields=%@", rspCode, fields);
             if (![rspCode isKindOfClass:[NSNumber class]] || rspCode.integerValue != 0) continue;
 
             return @{
