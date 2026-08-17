@@ -2,6 +2,7 @@
 #import "LCProxyPaths.h"
 #import "lcproxy_bridge.h"
 #import "LCProxyKing.h"
+#import "KPKIngCore.h"
 #include "webkit_proxy.h"
 
 static NSString *const LCProxySettingsFile = @"settings.json";
@@ -34,6 +35,7 @@ static NSString *const LCProxyConfFile = @"proxychains.conf";
     return @{
         @"proxyEnabled": @YES,
         @"blockNonTcp": @NO,
+        @"debugLogging": @NO,
         @"proxyMode": @"custom",
         @"proxyType": @"http",
         @"proxyHost": @"127.0.0.1",
@@ -119,6 +121,8 @@ static NSString *const LCProxyConfFile = @"proxychains.conf";
     NSDictionary *s = [self load];
     BOOL enabled = [s[@"proxyEnabled"] boolValue];
     BOOL block = [s[@"blockNonTcp"] boolValue];
+    BOOL debugLogging = [s[@"debugLogging"] boolValue];
+    kp_set_debug_enabled(debugLogging ? 1 : 0);
     // Re-read our dedicated proxychains.conf so changes made through the
     // console take effect without restarting the whole process.
     lcproxy_control_reload_config();

@@ -13,7 +13,7 @@
 #import "GCDWebServerDataResponse.h"
 #import "GCDWebServerRequest.h"
 
-static NSString *const LCProxyVersion = @"0.3.14";
+static NSString *const LCProxyVersion = @"0.3.15";
 static const NSUInteger LCProxyDefaultPort = 19092;
 
 @interface LCProxyServer ()
@@ -96,6 +96,61 @@ static const NSUInteger LCProxyDefaultPort = 19092;
         if (inet_pton(AF_INET6, t.UTF8String, &addr6) == 1) return t;
     }
     return nil;
+}
+
+- (NSDictionary *)proxyTestOne:(NSString *)urlString {
+    NSDictionary *settings = [[LCProxyConfig shared] load];
+    BOOL enabled = [settings[@"proxyEnabled"] boolValue];
+    NSString *mode = [settings[@"proxyMode"] isKindOfClass:[NSString class]] ? settings[@"proxyMode"] : @"custom";
+
+    NSString *upstreamHost = nil;
+    NSInteger upstreamPort = 0;
+    if (enabled && [mode isEqualToString:@"kingcard"]) {
+        upstreamHost = @"127.0.0.1";
+        upstreamPort = 18080;
+    } else if (enabled) {
+        upstreamHost = [settings[@"proxyHost"] isKindOfClass:[NSString class]] && [settings[@"proxyHost"] length] ? settings[@"proxyHost"] : nil;
+        upstreamPort = [settings[@"proxyPort"] respondsToSelector:@selector(integerValue)] ? [settings[@"proxyPort"] integerValue] : 0;
+    }
+    if (!upstreamHost.length || upstreamPort <= 0) {
+        return @{@"url": urlString ?: @"", @"rc": @(-1), @"ip": @"", @"body": @"代理未启用或代理地址无效", @"ok": @NO};
+    }
+
+    // 王卡模式：先确保转发器在运行，再确保本地有 GUID/TOKEN。
+    if (enabled && [mode isEqualToString:@"kingcard"]) {
+        NSDictionary *kingStatus = [[LCProxyKing shared] status];
+        if (![kingStatus[@"running"] boolValue]) {
+            [[LCProxyKing shared] applyConfig:settings];
+        }
+        kingStatus = [[LCProxyKing shared] status];
+        if (![kingStatus[@"lastRefreshSuccess"] boolValue]) {
+            [[LCProxyKing shared] refreshCredentials];
+        }
+    }
+
+    NSURL *url = [NSURL URLWithString:urlString];
+    if (!url.host.length) {
+        return @{@"url": urlString ?: @"", @"rc": @(-1), @"ip": @"", @"body": @"无效 URL", @"ok": @NO};
+    }
+    NSString *host = url.host;
+    NSInteger port = url.port ? url.port.integerValue : 80;
+    NSString *path = url.path.length ? url.path : @"/";
+    if (url.query.length) path = [path stringByAppendingFormat:@"?%@", url.query];
+
+    char body[2048] = {0};
+    int rc = kp_http_get_via_proxy(upstreamHost.UTF8String, (int)upstreamPort,
+                                   host.UTF8String, (int)port, path.UTF8String,
+                                   "", "", 6000,
+                                   body, sizeof(body));
+    NSString *text = rc == 0 ? [NSString stringWithUTF8String:body] : nil;
+    NSString *ip = [self extractIPFromString:text];
+    NSMutableDictionary *item = [NSMutableDictionary dictionary];
+    item[@"url"] = urlString ?: @"";
+    item[@"rc"] = @(rc);
+    item[@"ip"] = ip ?: @"";
+    item[@"body"] = text ? [text substringToIndex:MIN(text.length, 120)] : @"";
+    item[@"ok"] = @(ip.length > 0);
+    return item;
 }
 
 - (NSDictionary *)proxyTestResult {
@@ -212,7 +267,7 @@ static const NSUInteger LCProxyDefaultPort = 19092;
                    processBlock:^GCDWebServerResponse *(GCDWebServerRequest *request) {
         NSDictionary *body = [self jsonBody:request];
         NSMutableDictionary *merged = [NSMutableDictionary dictionaryWithDictionary:[[LCProxyConfig shared] load]];
-        for (NSString *key in @[@"proxyEnabled", @"blockNonTcp", @"proxyMode", @"proxyType", @"proxyHost", @"proxyPort",
+        for (NSString *key in @[@"proxyEnabled", @"blockNonTcp", @"debugLogging", @"proxyMode", @"proxyType", @"proxyHost", @"proxyPort",
                                  @"kingUpstreamHost", @"kingUpstreamPort", @"kingRefreshURL",
                                  @"kingGuidOverride", @"kingTokenOverride"]) {
             if (body[key] != nil) merged[key] = body[key];
@@ -231,6 +286,13 @@ static const NSUInteger LCProxyDefaultPort = 19092;
         NSMutableDictionary *resp = [NSMutableDictionary dictionaryWithDictionary:[[LCProxyKing shared] status]];
         resp[@"ok"] = @(ok);
         return [self json:resp];
+    }];
+
+    [server addHandlerForMethod:@"POST" path:@"/api/proxy-test-one" requestClass:[GCDWebServerDataRequest class]
+                   processBlock:^GCDWebServerResponse *(GCDWebServerRequest *request) {
+        NSDictionary *body = [self jsonBody:request];
+        NSString *url = [body[@"url"] isKindOfClass:[NSString class]] ? body[@"url"] : @"";
+        return [self json:[self proxyTestOne:url]];
     }];
 
     [server addHandlerForMethod:@"POST" path:@"/api/proxy-test" requestClass:[GCDWebServerDataRequest class]

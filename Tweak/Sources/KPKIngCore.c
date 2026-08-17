@@ -20,12 +20,27 @@
 static void (*g_kp_dbg_log)(const char *line) = NULL;
 static char g_kp_dbg_recent[8][512];   // 近期诊断环形缓冲（API 失败时回传）
 static int g_kp_dbg_recent_n = 0;
+static int g_kp_dbg_enabled = 0;       // 默认关闭，避免频繁写日志
 static pthread_mutex_t g_kp_dbg_lock = PTHREAD_MUTEX_INITIALIZER;  // 多线程安全
 
 void kp_set_debug_logger(void (*fn)(const char *line)) {
     pthread_mutex_lock(&g_kp_dbg_lock);
     g_kp_dbg_log = fn;
     pthread_mutex_unlock(&g_kp_dbg_lock);
+}
+
+void kp_set_debug_enabled(int enabled) {
+    pthread_mutex_lock(&g_kp_dbg_lock);
+    g_kp_dbg_enabled = enabled ? 1 : 0;
+    pthread_mutex_unlock(&g_kp_dbg_lock);
+}
+
+int kp_debug_enabled(void) {
+    int enabled;
+    pthread_mutex_lock(&g_kp_dbg_lock);
+    enabled = g_kp_dbg_enabled;
+    pthread_mutex_unlock(&g_kp_dbg_lock);
+    return enabled;
 }
 
 void kp_debug_recent(char *out, size_t cap) {
@@ -46,6 +61,7 @@ void kp_debug_recent(char *out, size_t cap) {
 }
 
 void kp_dbg(const char *fmt, ...) {
+    if (!kp_debug_enabled()) return;
     char line[512];
     va_list ap;
     va_start(ap, fmt);

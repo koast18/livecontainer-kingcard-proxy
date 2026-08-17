@@ -49,6 +49,9 @@ th:first-child,td:first-child { text-align:left; }
     <div class="row"><span class="k">丢弃非 TCP（UDP/QUIC）</span>
       <label class="switch"><input type="checkbox" id="blockNonTcp"><span class="slider"></span></label>
     </div>
+    <div class="row"><span class="k">调试日志</span>
+      <label class="switch"><input type="checkbox" id="debugLogging"><span class="slider"></span></label>
+    </div>
     <div class="row" style="display:block">
       <label class="k">上游模式</label>
       <select id="proxyMode">
@@ -156,6 +159,7 @@ async function loadStatus() {
   if (dirty) return;
   $('proxyEnabled').checked = !!s.proxyEnabled;
   $('blockNonTcp').checked = !!s.blockNonTcp;
+  $('debugLogging').checked = !!s.debugLogging;
   $('proxyMode').value = s.proxyMode || 'custom';
   $('proxyType').value = s.proxyType || 'http';
   $('proxyHost').value = s.proxyHost || '';
@@ -179,7 +183,7 @@ async function loadStats() {
   $('buckets').innerHTML = rows || '<tr><td colspan=3 style="text-align:center;color:#8b949e">暂无数据</td></tr>';
 }
 $('proxyMode').onchange = () => { markDirty(); syncModeUI(); };
-['proxyEnabled','blockNonTcp'].forEach(id => { $(id).addEventListener('change', markDirty); });
+['proxyEnabled','blockNonTcp','debugLogging'].forEach(id => { $(id).addEventListener('change', markDirty); });
 ['proxyType','proxyHost','proxyPort','kingUpstreamHost','kingUpstreamPort','kingRefreshURL'].forEach(id => { $(id).addEventListener('input', markDirty); });
 $('kingRefreshBtn').onclick = async () => {
   $('kingError').textContent = '刷新中…';
@@ -191,6 +195,7 @@ $('saveConfig').onclick = async () => {
   const body = {
     proxyEnabled: $('proxyEnabled').checked,
     blockNonTcp: $('blockNonTcp').checked,
+    debugLogging: $('debugLogging').checked,
     proxyMode: $('proxyMode').value,
     proxyType: $('proxyType').value.trim() || 'http',
     proxyHost: $('proxyHost').value.trim(),
@@ -205,21 +210,29 @@ $('saveConfig').onclick = async () => {
   loadStatus();
 };
 $('testProxyBtn').onclick = async () => {
-  $('proxyTestMsg').textContent = '测试中…';
+  const sources = [
+    'http://ip.3322.net',
+    'http://ifconfig.me/ip',
+    'http://icanhazip.com',
+    'http://ip.sb',
+    'http://members.3322.org/dyndns/getip',
+    'http://ip-api.com/line/?fields=query',
+    'http://myip.ipip.net'
+  ];
+  $('proxyTestMsg').textContent = '开始测试…';
   $('proxyTestDetail').textContent = '';
-  const r = await api('/api/proxy-test', {method:'POST', body:'{}'});
-  if (r.error) {
-    $('proxyTestMsg').textContent = '测试失败: '+r.error;
-  } else if (r.ok) {
-    $('proxyTestMsg').textContent = '出口 IP: '+r.ip+'（'+r.source+'，共测试 '+(r.results||[]).length+' 个源）';
-  } else {
-    $('proxyTestMsg').textContent = '测试失败: '+(r.error||'未知错误');
+  let found = null;
+  for (const url of sources) {
+    const r = await api('/api/proxy-test-one', {method:'POST', body: JSON.stringify({url})});
+    const info = r.ip ? ('IP '+r.ip) : ('rc='+(r.rc!=null?r.rc:'?')+(r.body?' '+r.body:''));
+    $('proxyTestDetail').textContent += url + ' -> ' + info + '\n';
+    if (!found && r.ok && r.ip) found = {ip:r.ip, source:url};
   }
-  const lines = (r.results||[]).map(x => {
-    const info = x.ip ? ('IP '+x.ip) : ('rc='+x.rc+(x.body?' '+x.body:''));
-    return x.url+' -> '+info;
-  }).join('\n');
-  $('proxyTestDetail').textContent = lines;
+  if (found) {
+    $('proxyTestMsg').textContent = '出口 IP: '+found.ip+'（'+found.source+'，共测试 '+sources.length+' 个源）';
+  } else {
+    $('proxyTestMsg').textContent = '所有 IP 源均失败，请检查代理/转发器';
+  }
 };
 $('resetStats').onclick = async () => {
   const r = await api('/api/reset-stats', {method:'POST', body:'{}'});
