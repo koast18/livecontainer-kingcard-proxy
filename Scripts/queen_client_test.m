@@ -23,6 +23,7 @@ int main(int argc, char *argv[]) {
         [LCProxyKingClient fetchGuidFromServerWithQua2:qua2 timeout:20 completion:^(NSString * _Nullable g, NSError * _Nullable e) {
             if (!g) {
                 errorText = [NSString stringWithFormat:@"guid failed: %@", e.localizedDescription ?: @"unknown"];
+                NSLog(@"[test] guid error: %@", errorText);
                 dispatch_semaphore_signal(sem);
                 return;
             }
@@ -32,12 +33,14 @@ int main(int argc, char *argv[]) {
             [LCProxyKingClient fetchTokenWithGuid:g qua2:qua2 phone:phone timeout:20 completion:^(NSDictionary * _Nullable info, NSError * _Nullable e2) {
                 if (!info) {
                     errorText = [NSString stringWithFormat:@"token failed: %@", e2.localizedDescription ?: @"unknown"];
+                    NSLog(@"[test] token error: %@", errorText);
                     dispatch_semaphore_signal(sem);
                     return;
                 }
                 token = info[@"token"];
                 qkey = info[@"qkey"];
                 NSLog(@"[test] token_len=%lu qkey=%@", (unsigned long)token.length, qkey);
+                NSLog(@"[test] token_full=%@", token);
 
                 NSDictionary *params = @{
                     @"apn": @"UNKNOW",
@@ -50,6 +53,7 @@ int main(int argc, char *argv[]) {
                 [LCProxyKingClient fetchQueenProxiesWithGuid:g qua2:qua2 params:params timeout:20 completion:^(NSDictionary * _Nullable pinfo, NSError * _Nullable e3) {
                     if (!pinfo) {
                         errorText = [NSString stringWithFormat:@"proxy failed: %@", e3.localizedDescription ?: @"unknown"];
+                        NSLog(@"[test] proxy error: %@", errorText);
                     } else {
                         http = pinfo[@"queen_http"];
                         https = pinfo[@"queen_https"];

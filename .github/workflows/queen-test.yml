@@ -17,6 +17,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Check WUP endpoint reachability
+        run: |
+          curl -sv --max-time 10 http://qbwup.qq.com:8080/ -o /dev/null || true
+
       - name: Compile and run native Queen client
         run: |
           set -euo pipefail
