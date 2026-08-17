@@ -19,6 +19,13 @@ jobs:
         run: |
           curl -sv --max-time 10 http://qbwup.qq.com:8080/ -o /dev/null || true
 
+      - name: Prepare Python venv
+        run: |
+          set -euo pipefail
+          python3 -m venv .venv
+          . .venv/bin/activate
+          pip install -q -r Tools/queen_proxy_kit/requirements.txt
+
       - name: Compile and run C crypto self-test
         run: |
           set -euo pipefail
@@ -27,6 +34,7 @@ jobs:
       - name: Compare native JCE/WUP bytes with Python reference
         run: |
           set -euo pipefail
+          . .venv/bin/activate
           bash Scripts/test_queen_wup_compare.sh
 
       - name: Run reference Python fetch_q_token
@@ -34,9 +42,7 @@ jobs:
           set -euo pipefail
           PHONE="${{ github.event.inputs.phone }}"
           PHONE="${PHONE:-18812341234}"
-          python3 -m venv .venv
           . .venv/bin/activate
-          pip install -q -r Tools/queen_proxy_kit/requirements.txt
           python3 Tools/queen_proxy_kit/fetch_q_token.py --phone "$PHONE" --timeout 10 --max-attempts 1
 
       - name: Compile and run native Queen client
