@@ -1,6 +1,8 @@
 name: Queen Native Smoke Test
 
 on:
+  push:
+    branches: ['feature/queen-proxy-v2']
   workflow_dispatch:
     inputs:
       phone:
