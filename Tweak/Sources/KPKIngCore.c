@@ -276,23 +276,35 @@ int kp_parse_connect_line(const char *line, size_t len, char *host, size_t host_
     char tmp[512];
     memcpy(tmp, line, n);
     tmp[n] = '\0';
+    // 只解析第一行，避免把 Host:/Q-GUID:/Q-Token: 等 header 里的冒号算进去。
+    char *eol = strchr(tmp, '\r');
+    if (eol) *eol = '\0';
+    eol = strchr(tmp, '\n');
+    if (eol) *eol = '\0';
     kp_trim(tmp);
     if (strncmp(tmp, "CONNECT ", 8) != 0) return -1;
+
     const char *rest = tmp + 8;
-    const char *colon = strrchr(rest, ':');
+    const char *space = strchr(rest, ' ');
+    size_t alen = space ? (size_t)(space - rest) : strlen(rest);
+    if (alen == 0 || alen >= 256 || alen >= host_cap) return -1;
+
+    char authority[256];
+    memcpy(authority, rest, alen);
+    authority[alen] = '\0';
+
+    const char *colon = strrchr(authority, ':');
     if (!colon) return -1;
-    char hostpart[256];
-    size_t hl = (size_t)(colon - rest);
-    if (hl >= sizeof(hostpart) || hl >= host_cap) return -1;
-    memcpy(hostpart, rest, hl);
-    hostpart[hl] = '\0';
-    if (hl > 2 && hostpart[0] == '[' && hostpart[hl - 1] == ']') {
-        hostpart[hl - 1] = '\0';
-        memmove(hostpart, hostpart + 1, hl - 1);
+    size_t hl = (size_t)(colon - authority);
+    if (hl >= host_cap) return -1;
+    memcpy(host, authority, hl);
+    host[hl] = '\0';
+    if (hl > 2 && host[0] == '[' && host[hl - 1] == ']') {
+        host[hl - 1] = '\0';
+        memmove(host, host + 1, hl - 1);
     }
     int p = atoi(colon + 1);
     if (p <= 0 || p > 65535) return -1;
-    strcpy(host, hostpart);
     *port = p;
     return 0;
 }
