@@ -211,7 +211,7 @@ $('testProxyBtn').onclick = async () => {
   if (r.error) {
     $('proxyTestMsg').textContent = '测试失败: '+r.error;
   } else if (r.ok) {
-    $('proxyTestMsg').textContent = '出口 IP: '+r.ip+'（'+r.source+'）';
+    $('proxyTestMsg').textContent = '出口 IP: '+r.ip+'（'+r.source+'，共测试 '+(r.results||[]).length+' 个源）';
   } else {
     $('proxyTestMsg').textContent = '测试失败: '+(r.error||'未知错误');
   }

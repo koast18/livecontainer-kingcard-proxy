@@ -13,7 +13,7 @@
 #import "GCDWebServerDataResponse.h"
 #import "GCDWebServerRequest.h"
 
-static NSString *const LCProxyVersion = @"0.3.10";
+static NSString *const LCProxyVersion = @"0.3.11";
 static const NSUInteger LCProxyDefaultPort = 19092;
 
 @interface LCProxyServer ()
@@ -127,6 +127,8 @@ static const NSUInteger LCProxyDefaultPort = 19092;
     ];
 
     NSMutableArray *results = [NSMutableArray array];
+    NSString *firstIP = nil;
+    NSString *firstSource = nil;
     for (NSString *urlString in sources) {
         NSURL *url = [NSURL URLWithString:urlString];
         if (!url.host.length) continue;
@@ -142,17 +144,33 @@ static const NSUInteger LCProxyDefaultPort = 19092;
                                        body, sizeof(body));
         NSString *text = rc == 0 ? [NSString stringWithUTF8String:body] : nil;
         NSString *ip = [self extractIPFromString:text];
+        if (ip.length && !firstIP) {
+            firstIP = ip;
+            firstSource = urlString;
+        }
         NSMutableDictionary *item = [NSMutableDictionary dictionary];
         item[@"url"] = urlString;
         item[@"rc"] = @(rc);
         item[@"ip"] = ip ?: @"";
         item[@"body"] = text ? [text substringToIndex:MIN(text.length, 120)] : @"";
         [results addObject:item];
-        if (ip.length) {
-            return @{@"ok": @YES, @"ip": ip, @"source": urlString, @"results": results};
+    }
+
+    NSMutableDictionary *resp = [NSMutableDictionary dictionary];
+    resp[@"results"] = results;
+    resp[@"mode"] = mode;
+    if (firstIP.length) {
+        resp[@"ok"] = @YES;
+        resp[@"ip"] = firstIP;
+        resp[@"source"] = firstSource ?: @"";
+    } else {
+        resp[@"ok"] = @NO;
+        resp[@"error"] = @"所有 IP 源均失败，请检查代理/转发器";
+        if ([mode isEqualToString:@"kingcard"]) {
+            resp[@"king"] = [[LCProxyKing shared] status];
         }
     }
-    return @{@"ok": @NO, @"error": @"所有 IP 源均失败，请检查代理/转发器", @"results": results};
+    return resp;
 }
 
 #pragma mark - Start
