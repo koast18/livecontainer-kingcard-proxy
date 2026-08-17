@@ -7,20 +7,20 @@
       "name": "LiveProxy 控制台",
       "bundleIdentifier": "com.liveproxy.console",
       "developerName": "koast18",
-      "version": "0.4.0",
-      "versionDate": "2026-08-17T09:11:40Z",
-      "versionDescription": "LiveProxy 控制台：支持直连/自定义/王卡上游，王卡凭证周期刷新，非蜂窝自动直连开关，非 TCP 丢弃，10 分钟粒度蜂窝流量统计。",
-      "downloadURL": "https://gh-proxy.com/https://github.com/koast18/livecontainer-kingcard-proxy/releases/download/v0.4.0/LiveProxyConsole-0.4.0.ipa",
-      "localizedDescription": "LiveContainer 内任意 App 走 HTTP 代理的控制台 IPA。依赖 LCProxyControl dylib（自动下载到 LiveContainer Tweaks 目录），支持直连/自定义/王卡上游、王卡凭证周期刷新、非蜂窝自动直连、代理开关、丢弃非 TCP、蜂窝流量统计。",
+      "version": "0.5.0",
+      "versionDate": "2026-08-17T17:53:45Z",
+      "versionDescription": "LiveProxy 控制台：支持直连/自定义/王卡代理，新版 Queen/King 协议（Q-GUID/Q-Token/Q-Key/queen_http/queen_https/Proxy-Authorization），非蜂窝自动直连，非 TCP 丢弃，10 分钟粒度蜂窝流量统计。",
+      "downloadURL": "https://gh-proxy.com/https://github.com/koast18/livecontainer-kingcard-proxy/releases/download/v0.5.0/LiveProxyConsole-0.5.0.ipa",
+      "localizedDescription": "LiveContainer 内任意 App 走 HTTP 代理的控制台 IPA。依赖 LCProxyControl dylib（自动下载到 LiveContainer Tweaks 目录），支持直连/自定义/王卡代理、新版 Queen/King 王卡协议、非蜂窝自动直连、代理开关、丢弃非 TCP、蜂窝流量统计。",
       "iconURL": "https://raw.githubusercontent.com/koast18/livecontainer-kingcard-proxy/master/AltStore/icon.png",
       "tintColor": "2E7D32",
       "size": 17758,
       "versions": [
         {
-          "version": "0.4.0",
-          "date": "2026-08-17T09:11:40Z",
-          "downloadURL": "https://gh-proxy.com/https://github.com/koast18/livecontainer-kingcard-proxy/releases/download/v0.4.0/LiveProxyConsole-0.4.0.ipa",
-          "localizedDescription": "新增直连模式、王卡周期取号、非蜂窝自动直连开关，并补充王卡 User-Agent"
+          "version": "0.5.0",
+          "date": "2026-08-17T17:53:45Z",
+          "downloadURL": "https://gh-proxy.com/https://github.com/koast18/livecontainer-kingcard-proxy/releases/download/v0.5.0/LiveProxyConsole-0.5.0.ipa",
+          "localizedDescription": "新版 Queen/King 王卡协议：Q-GUID/Q-Token/Q-Key 自动获取、queen_http/queen_https 代理池拉取、HTTP 分头与 CONNECT Proxy-Authorization。"
         }
       ]
     }
