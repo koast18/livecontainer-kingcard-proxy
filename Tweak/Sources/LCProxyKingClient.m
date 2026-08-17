@@ -826,7 +826,7 @@ static NSDictionary *KPKSendWupAndParse(NSString *guid, NSString *qua2, NSData *
 
             NSNumber *rspCode = fields[@0];
             NSLog(@"[king] wup rspCode=%@ fields=%@", rspCode, fields);
-            if (![rspCode isKindOfClass:[NSNumber class]] || rspCode.integerValue != 0) continue;
+            if ([rspCode isKindOfClass:[NSNumber class]] && rspCode.integerValue != 0) continue;
 
             return @{
                 @"fields": fields,
