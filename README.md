@@ -65,7 +65,7 @@ https://raw.githubusercontent.com/koast18/livecontainer-kingcard-proxy/master/Al
 
 该地址固定不变；更新版本时只需更新仓库中的 `AltStore/altstore-source.json` 并打新 tag，Actions 会自动构建并发布 Release 资产。
 
-> 配置读取：dylib 默认使用自己管理的 `<LC Documents>/LCProxy/proxychains.conf`，同时兼容 v0.1.8 的常见路径（`$HOME/Documents`、dylib 同目录等），方便 WKWebView/Alook 等场景找到代理配置。
+> 配置读取：dylib 只会读取自己管理的 `<LC Documents>/LCProxy/proxychains.conf`，不会扫描系统其他 `proxychains.conf`，避免配置互相干扰。
 
 ## 流量统计说明
 

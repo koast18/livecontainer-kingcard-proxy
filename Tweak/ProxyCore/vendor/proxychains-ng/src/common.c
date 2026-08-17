@@ -83,133 +83,36 @@ static int check_path(char *path) {
 }
 
 char *get_config_path(char* default_path, char* pbuf, size_t bufsize) {
-	char buf[512];
-	const char *home;
-	// top priority: user defined path
-	char *path = default_path;
-	if(check_path(path))
-		goto have;
+	(void)default_path;
+	Dl_info dli;
+	if(!dladdr((void*)&get_config_path, &dli) || !dli.dli_fname || !dli.dli_fname[0])
+		return NULL;
 
-	// priority 1: env var PROXYCHAINS_CONF_FILE
-	path = getenv(PROXYCHAINS_CONF_FILE_ENV_VAR);
-	if(check_path(path))
-		goto have;
+	snprintf(pbuf, bufsize, "%s", dli.dli_fname);
+	char *slash = strrchr(pbuf, '/');
+	if(!slash)
+		return NULL;
+	*slash = '\0';
 
-	// priority 2; proxychains conf in actual dir
-	path = getcwd(buf, sizeof(buf));
-	if(path) {
-		snprintf(pbuf, bufsize, "%s/%s", path, PROXYCHAINS_CONF_FILE);
-		path = pbuf;
-		if(check_path(path))
-			goto have;
-	}
-
-	// priority 3: LCProxy-managed config next to this dylib (LiveProxy console)
-	{
-		Dl_info dli;
-		if(dladdr((void*)&get_config_path, &dli) && dli.dli_fname && dli.dli_fname[0]) {
-			snprintf(pbuf, bufsize, "%s", dli.dli_fname);
-			char *slash = strrchr(pbuf, '/');
-			if(slash) {
-				size_t dir_len = (size_t)(slash - pbuf);
-				*slash = 0;
-				const char *base = strrchr(pbuf, '/');
-				base = base ? base + 1 : pbuf;
-				if(strcmp(base, "LCProxy") == 0) {
-					if(dir_len + sizeof("/" PROXYCHAINS_CONF_FILE) <= bufsize) {
-						snprintf(pbuf + dir_len, bufsize - dir_len, "/%s", PROXYCHAINS_CONF_FILE);
-						path = pbuf;
-						if(check_path(path))
-							goto have;
-					}
-				} else {
-					if(dir_len + sizeof("/../LCProxy/" PROXYCHAINS_CONF_FILE) <= bufsize) {
-						snprintf(pbuf + dir_len, bufsize - dir_len, "/../LCProxy/%s", PROXYCHAINS_CONF_FILE);
-						path = pbuf;
-						if(check_path(path))
-							goto have;
-					}
-				}
-			}
+	// Only read the config file managed by LCProxyControl.
+	// This avoids interference from other proxychains.conf files on the system.
+	const char *base = strrchr(pbuf, '/');
+	base = base ? base + 1 : pbuf;
+	if(strcmp(base, "LCProxy") == 0) {
+		if(strlen(pbuf) + sizeof("/" PROXYCHAINS_CONF_FILE) <= bufsize) {
+			strncat(pbuf, "/" PROXYCHAINS_CONF_FILE, bufsize - strlen(pbuf) - 1);
+		} else {
+			return NULL;
+		}
+	} else {
+		if(strlen(pbuf) + sizeof("/../LCProxy/" PROXYCHAINS_CONF_FILE) <= bufsize) {
+			strncat(pbuf, "/../LCProxy/" PROXYCHAINS_CONF_FILE, bufsize - strlen(pbuf) - 1);
+		} else {
+			return NULL;
 		}
 	}
 
-	// priority 4: $HOME/.proxychains/proxychains.conf and LiveContainer sandbox paths
-	home = getenv("HOME");
-	if(home) {
-		snprintf(pbuf, bufsize, "%s/.proxychains/%s", home, PROXYCHAINS_CONF_FILE);
-		path = pbuf;
-		if(check_path(path))
-			goto have;
-
-		snprintf(pbuf, bufsize, "%s/config/settings/%s", home, PROXYCHAINS_CONF_FILE);
-		path = pbuf;
-		if(check_path(path))
-			goto have;
-
-		snprintf(pbuf, bufsize, "%s/Documents/%s", home, PROXYCHAINS_CONF_FILE);
-		path = pbuf;
-		if(check_path(path))
-			goto have;
-
-		snprintf(pbuf, bufsize, "%s/Library/Preferences/%s", home, PROXYCHAINS_CONF_FILE);
-		path = pbuf;
-		if(check_path(path))
-			goto have;
-
-		snprintf(pbuf, bufsize, "%s/Documents/config/proxychanins/%s", home, PROXYCHAINS_CONF_FILE);
-		path = pbuf;
-		if(check_path(path))
-			goto have;
-
-		snprintf(pbuf, bufsize, "%s/Documents/config/proxychains/%s", home, PROXYCHAINS_CONF_FILE);
-		path = pbuf;
-		if(check_path(path))
-			goto have;
-	}
-
-	// priority 5: next to this dylib, plus relative Documents/config paths
-	{
-		Dl_info dli;
-		if(dladdr((void*)&get_config_path, &dli) && dli.dli_fname && dli.dli_fname[0]) {
-			snprintf(pbuf, bufsize, "%s", dli.dli_fname);
-			char *slash = strrchr(pbuf, '/');
-			if(slash) {
-				size_t dir_len = (size_t)(slash - pbuf);
-				*slash = 0;
-				if(dir_len + sizeof("/" PROXYCHAINS_CONF_FILE) <= bufsize) {
-					snprintf(pbuf + dir_len, bufsize - dir_len, "/%s", PROXYCHAINS_CONF_FILE);
-					path = pbuf;
-					if(check_path(path))
-						goto have;
-				}
-				if(dir_len + sizeof("/../config/proxychanins/" PROXYCHAINS_CONF_FILE) <= bufsize) {
-					snprintf(pbuf + dir_len, bufsize - dir_len, "/../config/proxychanins/%s", PROXYCHAINS_CONF_FILE);
-					path = pbuf;
-					if(check_path(path))
-						goto have;
-				}
-				if(dir_len + sizeof("/../config/proxychains/" PROXYCHAINS_CONF_FILE) <= bufsize) {
-					snprintf(pbuf + dir_len, bufsize - dir_len, "/../config/proxychains/%s", PROXYCHAINS_CONF_FILE);
-					path = pbuf;
-					if(check_path(path))
-						goto have;
-				}
-			}
-		}
-	}
-
-	// priority 6: $SYSCONFDIR/proxychains.conf
-	path = SYSCONFDIR "/" PROXYCHAINS_CONF_FILE;
-	if(check_path(path))
-		goto have;
-
-	// priority 7: /etc/proxychains.conf
-	path = "/etc/" PROXYCHAINS_CONF_FILE;
-	if(check_path(path))
-		goto have;
-
+	if(check_path(pbuf))
+		return pbuf;
 	return NULL;
-	have:
-	return path;
 }

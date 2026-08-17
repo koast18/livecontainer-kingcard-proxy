@@ -1,6 +1,6 @@
 diff -ruN '--exclude=.git' ../proxychains-ng/src/common.c vendor/proxychains-ng/src/common.c
 --- a/src/common.c	2026-08-16 20:47:12.798400000 +0800
-+++ b/src/common.c	2026-08-17 09:56:13.385256000 +0800
++++ b/src/common.c	2026-08-17 03:25:02.389328700 +0800
 @@ -2,6 +2,8 @@
  #include <stdlib.h>
  #include <unistd.h>
@@ -10,29 +10,28 @@ diff -ruN '--exclude=.git' ../proxychains-ng/src/common.c vendor/proxychains-ng/
  
  const char *proxy_type_strmap[] = {
      "http",
-@@ -82,6 +84,7 @@
+@@ -81,52 +83,36 @@
+ }
  
  char *get_config_path(char* default_path, char* pbuf, size_t bufsize) {
- 	char buf[512];
-+	const char *home;
- 	// top priority: user defined path
- 	char *path = default_path;
- 	if(check_path(path))
-@@ -94,39 +97,120 @@
- 
- 	// priority 2; proxychains conf in actual dir
- 	path = getcwd(buf, sizeof(buf));
+-	char buf[512];
+-	// top priority: user defined path
+-	char *path = default_path;
+-	if(check_path(path))
+-		goto have;
+-
+-	// priority 1: env var PROXYCHAINS_CONF_FILE
+-	path = getenv(PROXYCHAINS_CONF_FILE_ENV_VAR);
+-	if(check_path(path))
+-		goto have;
+-
+-	// priority 2; proxychains conf in actual dir
+-	path = getcwd(buf, sizeof(buf));
 -	snprintf(pbuf, bufsize, "%s/%s", path, PROXYCHAINS_CONF_FILE);
 -	path = pbuf;
 -	if(check_path(path))
 -		goto have;
-+	if(path) {
-+		snprintf(pbuf, bufsize, "%s/%s", path, PROXYCHAINS_CONF_FILE);
-+		path = pbuf;
-+		if(check_path(path))
-+			goto have;
-+	}
- 
+-
 -	// priority 3; $HOME/.proxychains/proxychains.conf
 -	path = getenv("HOME");
 -	snprintf(pbuf, bufsize, "%s/.proxychains/%s", path, PROXYCHAINS_CONF_FILE);
@@ -46,121 +45,54 @@ diff -ruN '--exclude=.git' ../proxychains-ng/src/common.c vendor/proxychains-ng/
 -	path = pbuf;
 -	if(check_path(path))
 -		goto have;
-+	// priority 3: LCProxy-managed config next to this dylib (LiveProxy console)
-+	{
-+		Dl_info dli;
-+		if(dladdr((void*)&get_config_path, &dli) && dli.dli_fname && dli.dli_fname[0]) {
-+			snprintf(pbuf, bufsize, "%s", dli.dli_fname);
-+			char *slash = strrchr(pbuf, '/');
-+			if(slash) {
-+				size_t dir_len = (size_t)(slash - pbuf);
-+				*slash = 0;
-+				const char *base = strrchr(pbuf, '/');
-+				base = base ? base + 1 : pbuf;
-+				if(strcmp(base, "LCProxy") == 0) {
-+					if(dir_len + sizeof("/" PROXYCHAINS_CONF_FILE) <= bufsize) {
-+						snprintf(pbuf + dir_len, bufsize - dir_len, "/%s", PROXYCHAINS_CONF_FILE);
-+						path = pbuf;
-+						if(check_path(path))
-+							goto have;
-+					}
-+				} else {
-+					if(dir_len + sizeof("/../LCProxy/" PROXYCHAINS_CONF_FILE) <= bufsize) {
-+						snprintf(pbuf + dir_len, bufsize - dir_len, "/../LCProxy/%s", PROXYCHAINS_CONF_FILE);
-+						path = pbuf;
-+						if(check_path(path))
-+							goto have;
-+					}
-+				}
-+			}
-+		}
-+	}
-+
-+	// priority 4: $HOME/.proxychains/proxychains.conf and LiveContainer sandbox paths
-+	home = getenv("HOME");
-+	if(home) {
-+		snprintf(pbuf, bufsize, "%s/.proxychains/%s", home, PROXYCHAINS_CONF_FILE);
-+		path = pbuf;
-+		if(check_path(path))
-+			goto have;
-+
-+		snprintf(pbuf, bufsize, "%s/config/settings/%s", home, PROXYCHAINS_CONF_FILE);
-+		path = pbuf;
-+		if(check_path(path))
-+			goto have;
-+
-+		snprintf(pbuf, bufsize, "%s/Documents/%s", home, PROXYCHAINS_CONF_FILE);
-+		path = pbuf;
-+		if(check_path(path))
-+			goto have;
-+
-+		snprintf(pbuf, bufsize, "%s/Library/Preferences/%s", home, PROXYCHAINS_CONF_FILE);
-+		path = pbuf;
-+		if(check_path(path))
-+			goto have;
-+
-+		snprintf(pbuf, bufsize, "%s/Documents/config/proxychanins/%s", home, PROXYCHAINS_CONF_FILE);
-+		path = pbuf;
-+		if(check_path(path))
-+			goto have;
-+
-+		snprintf(pbuf, bufsize, "%s/Documents/config/proxychains/%s", home, PROXYCHAINS_CONF_FILE);
-+		path = pbuf;
-+		if(check_path(path))
-+			goto have;
-+	}
-+
-+	// priority 5: next to this dylib, plus relative Documents/config paths
-+	{
-+		Dl_info dli;
-+		if(dladdr((void*)&get_config_path, &dli) && dli.dli_fname && dli.dli_fname[0]) {
-+			snprintf(pbuf, bufsize, "%s", dli.dli_fname);
-+			char *slash = strrchr(pbuf, '/');
-+			if(slash) {
-+				size_t dir_len = (size_t)(slash - pbuf);
-+				*slash = 0;
-+				if(dir_len + sizeof("/" PROXYCHAINS_CONF_FILE) <= bufsize) {
-+					snprintf(pbuf + dir_len, bufsize - dir_len, "/%s", PROXYCHAINS_CONF_FILE);
-+					path = pbuf;
-+					if(check_path(path))
-+						goto have;
-+				}
-+				if(dir_len + sizeof("/../config/proxychanins/" PROXYCHAINS_CONF_FILE) <= bufsize) {
-+					snprintf(pbuf + dir_len, bufsize - dir_len, "/../config/proxychanins/%s", PROXYCHAINS_CONF_FILE);
-+					path = pbuf;
-+					if(check_path(path))
-+						goto have;
-+				}
-+				if(dir_len + sizeof("/../config/proxychains/" PROXYCHAINS_CONF_FILE) <= bufsize) {
-+					snprintf(pbuf + dir_len, bufsize - dir_len, "/../config/proxychains/%s", PROXYCHAINS_CONF_FILE);
-+					path = pbuf;
-+					if(check_path(path))
-+						goto have;
-+				}
-+			}
-+		}
-+	}
- 
+-
 -	// priority 4: $SYSCONFDIR/proxychains.conf
-+	// priority 6: $SYSCONFDIR/proxychains.conf
- 	path = SYSCONFDIR "/" PROXYCHAINS_CONF_FILE;
- 	if(check_path(path))
- 		goto have;
- 
+-	path = SYSCONFDIR "/" PROXYCHAINS_CONF_FILE;
+-	if(check_path(path))
+-		goto have;
+-
 -	// priority 5: /etc/proxychains.conf
-+	// priority 7: /etc/proxychains.conf
- 	path = "/etc/" PROXYCHAINS_CONF_FILE;
- 	if(check_path(path))
- 		goto have;
- 
+-	path = "/etc/" PROXYCHAINS_CONF_FILE;
+-	if(check_path(path))
+-		goto have;
+-
 -	perror("couldnt find configuration file");
 -	exit(1);
--
- 	return NULL;
- 	have:
- 	return path;
- }
++	(void)default_path;
++	Dl_info dli;
++	if(!dladdr((void*)&get_config_path, &dli) || !dli.dli_fname || !dli.dli_fname[0])
++		return NULL;
 +
++	snprintf(pbuf, bufsize, "%s", dli.dli_fname);
++	char *slash = strrchr(pbuf, '/');
++	if(!slash)
++		return NULL;
++	*slash = '\0';
++
++	// Only read the config file managed by LCProxyControl.
++	// This avoids interference from other proxychains.conf files on the system.
++	const char *base = strrchr(pbuf, '/');
++	base = base ? base + 1 : pbuf;
++	if(strcmp(base, "LCProxy") == 0) {
++		if(strlen(pbuf) + sizeof("/" PROXYCHAINS_CONF_FILE) <= bufsize) {
++			strncat(pbuf, "/" PROXYCHAINS_CONF_FILE, bufsize - strlen(pbuf) - 1);
++		} else {
++			return NULL;
++		}
++	} else {
++		if(strlen(pbuf) + sizeof("/../LCProxy/" PROXYCHAINS_CONF_FILE) <= bufsize) {
++			strncat(pbuf, "/../LCProxy/" PROXYCHAINS_CONF_FILE, bufsize - strlen(pbuf) - 1);
++		} else {
++			return NULL;
++		}
++	}
+ 
++	if(check_path(pbuf))
++		return pbuf;
+ 	return NULL;
+-	have:
+-	return path;
+ }
 diff -ruN '--exclude=.git' ../proxychains-ng/src/core.c vendor/proxychains-ng/src/core.c
 --- a/src/core.c	2026-08-16 20:48:08.250024500 +0800
 +++ b/src/core.c	2026-08-16 22:04:57.257752500 +0800
@@ -1070,4 +1002,3 @@ diff -ruN '--exclude=.git' ../proxychains-ng/src/version.h vendor/proxychains-ng
 +++ b/src/version.h	2026-08-16 21:01:46.742622900 +0800
 @@ -0,0 +1 @@
 +#define VERSION "4.17-livecontainer"
-
