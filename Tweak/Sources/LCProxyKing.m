@@ -1,6 +1,8 @@
 #import "LCProxyKing.h"
 #import "KPKIngCore.h"
 #import "LCProxyPaths.h"
+#import "LCProxyKingClient.h"
+#import <stdlib.h>
 
 static const NSTimeInterval LCProxyKingRefreshInterval = 10 * 60;
 static const NSTimeInterval LCProxyKingRefreshLeeway = 30;
@@ -12,6 +14,22 @@ static int LCProxyKingRefreshHook(void *ctx) {
 
 static void LCProxyKingLog(const char *line) {
     if (line) NSLog(@"[LCProxyKing] %s", line);
+}
+
+static NSString *LCProxyKingNow(void) {
+    static NSDateFormatter *fmt;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        fmt = [[NSDateFormatter alloc] init];
+        fmt.dateFormat = @"HH:mm:ss";
+    });
+    return [fmt stringFromDate:[NSDate date]];
+}
+
+static BOOL LCProxyKingHexStringValid(NSString *s) {
+    if (s.length != 32) return NO;
+    NSCharacterSet *cs = [[NSCharacterSet characterSetWithCharactersInString:@"0123456789abcdefABCDEF"] invertedSet];
+    return [s rangeOfCharacterFromSet:cs].location == NSNotFound;
 }
 
 @interface LCProxyKing ()
@@ -62,7 +80,6 @@ static void LCProxyKingLog(const char *line) {
 
 - (void)applyConfig:(NSDictionary *)settings {
     NSString *mode = [settings[@"proxyMode"] isKindOfClass:[NSString class]] ? settings[@"proxyMode"] : @"custom";
-    // 只要选择了王卡代理就启动转发器，避免浏览器启动时转发器还没就绪。
     BOOL shouldRun = [mode isEqualToString:@"kingcard"];
     [self.lock lock];
     if (!shouldRun) {
@@ -81,10 +98,7 @@ static void LCProxyKingLog(const char *line) {
         self.forwarder = NULL;
     }
     [self stopRefreshTimer];
-    NSString *host = [settings[@"kingUpstreamHost"] isKindOfClass:[NSString class]] && [settings[@"kingUpstreamHost"] length] ? settings[@"kingUpstreamHost"] : @"157.148.54.212";
-    NSInteger port = [settings[@"kingUpstreamPort"] respondsToSelector:@selector(integerValue)] ? [settings[@"kingUpstreamPort"] integerValue] : 8091;
-    if (port <= 0 || port > 65535) port = 8091;
-    kp_forwarder *fw = kp_forwarder_new("127.0.0.1", 18080, host.UTF8String, (int)port);
+    kp_forwarder *fw = kp_forwarder_new("127.0.0.1", 18080, "", 0);
     if (fw) {
         kp_forwarder_set_refresh_hook(fw, LCProxyKingRefreshHook, (__bridge void *)self);
         if (kp_forwarder_start(fw) == 0) {
@@ -102,7 +116,6 @@ static void LCProxyKingLog(const char *line) {
     self.lastRefreshSuccess = NO;
     [self.lock unlock];
 }
-
 
 - (void)startRefreshTimer {
     [self stopRefreshTimer];
@@ -127,78 +140,25 @@ static void LCProxyKingLog(const char *line) {
     }
 }
 
-- (NSString *)guidOverrideFrom:(NSDictionary *)settings {
-    id v = settings[@"kingGuidOverride"];
-    return [v isKindOfClass:[NSString class]] && [v length] ? v : nil;
+// ---------------------------------------------------------------------------
+// 状态持久化与同步取号辅助
+// ---------------------------------------------------------------------------
+- (NSString *)statePath {
+    return [LCProxyDataDirectory() stringByAppendingPathComponent:@"kingcard-state.json"];
 }
 
-- (NSString *)tokenOverrideFrom:(NSDictionary *)settings {
-    id v = settings[@"kingTokenOverride"];
-    return [v isKindOfClass:[NSString class]] && [v length] ? v : nil;
+- (NSMutableDictionary *)loadState {
+    NSData *data = [NSData dataWithContentsOfFile:self.statePath];
+    if (!data) return [NSMutableDictionary dictionary];
+    id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    return [obj isKindOfClass:[NSDictionary class]] ? [obj mutableCopy] : [NSMutableDictionary dictionary];
 }
 
-- (BOOL)refreshCredentials {
-    [self.lock lock];
-    if (self.refreshing) {
-        [self.lock unlock];
-        return NO;
-    }
-    self.refreshing = YES;
-    [self.lock unlock];
-
-    NSDictionary *settings = [self settingsSnapshot];
-    NSString *refreshURL = [settings[@"kingRefreshURL"] isKindOfClass:[NSString class]] && [settings[@"kingRefreshURL"] length] ? settings[@"kingRefreshURL"] : @"http://kc.iikira.com/kingcard";
-    NSString *host = [settings[@"kingUpstreamHost"] isKindOfClass:[NSString class]] && [settings[@"kingUpstreamHost"] length] ? settings[@"kingUpstreamHost"] : @"157.148.54.212";
-    NSInteger port = [settings[@"kingUpstreamPort"] respondsToSelector:@selector(integerValue)] ? [settings[@"kingUpstreamPort"] integerValue] : 8091;
-    if (port <= 0 || port > 65535) port = 8091;
-
-    NSString *guidHint = [self guidOverrideFrom:settings] ?: @"";
-    NSString *tokenHint = [self tokenOverrideFrom:settings] ?: @"";
-    char guid[128] = {0};
-    char token[128] = {0};
-    kp_fetch_diag diag;
-    kp_fetch_diag_init(&diag);
-    char source[16] = {0};
-
-    int rc = kp_fetch_guid_token_best(refreshURL.UTF8String,
-                                      host.UTF8String, (int)port,
-                                      guidHint.length ? guidHint.UTF8String : "",
-                                      tokenHint.length ? tokenHint.UTF8String : "",
-                                      3, 300, 10000,
-                                      guid, sizeof(guid), token, sizeof(token),
-                                      &diag, source, sizeof(source));
-    char dbgbuf[4096];
-    kp_debug_recent(dbgbuf, sizeof(dbgbuf));
-    self.lastDiagnostics = [NSString stringWithUTF8String:dbgbuf] ?: @"";
-    if (rc != 0) {
-        [self.lock lock];
-        self.refreshing = NO;
-        self.lastRefreshSuccess = NO;
-        self.lastSource = @"";
-        self.lastRefresh = [self nowString];
-        self.lastError = [NSString stringWithFormat:@"取号失败 rc=%d %s", rc, diag.body_head];
-        [self.lock unlock];
-        return NO;
-    }
-
-    // 经上游激活（失败不阻断取号结果；转发器仍会尝试用凭证连接）
-    char login_host[256];
-    if (kp_build_login_host(guid, token, login_host, sizeof(login_host)) == 0) {
-        char diag_status[160] = {0};
-        kp_login_via_proxy(host.UTF8String, (int)port, login_host, guid, token, 8000, diag_status, sizeof(diag_status));
-    }
-
-    [self.lock lock];
-    self.refreshing = NO;
-    if (self.forwarder) {
-        kp_forwarder_set_creds(self.forwarder, guid, token);
-    }
-    self.lastRefreshSuccess = YES;
-    self.lastSource = [NSString stringWithUTF8String:source] ?: @"";
-    self.lastRefresh = [self nowString];
-    self.lastError = @"";
-    [self.lock unlock];
-    return YES;
+- (void)saveState:(NSDictionary *)state {
+    NSString *dir = LCProxyDataDirectory();
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    NSData *data = [NSJSONSerialization dataWithJSONObject:state options:NSJSONWritingPrettyPrinted error:nil];
+    if (data) [data writeToFile:self.statePath atomically:YES];
 }
 
 - (NSDictionary *)settingsSnapshot {
@@ -209,14 +169,216 @@ static void LCProxyKingLog(const char *line) {
     return [obj isKindOfClass:[NSDictionary class]] ? obj : @{};
 }
 
-- (NSString *)nowString {
-    static NSDateFormatter *fmt;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        fmt = [[NSDateFormatter alloc] init];
-        fmt.dateFormat = @"HH:mm:ss";
-    });
-    return [fmt stringFromDate:[NSDate date]];
+- (NSString *)syncFetchGuid:(NSString *)qua2 timeout:(NSTimeInterval)timeout error:(NSError **)outErr {
+    __block NSString *guid = nil;
+    __block NSError *err = nil;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    [LCProxyKingClient fetchGuidFromServerWithQua2:qua2 timeout:timeout completion:^(NSString * _Nullable g, NSError * _Nullable e) {
+        guid = g;
+        err = e;
+        dispatch_semaphore_signal(sem);
+    }];
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)((timeout + 10.0) * NSEC_PER_SEC)));
+    if (outErr) *outErr = err;
+    return guid;
+}
+
+- (NSDictionary *)syncFetchToken:(NSString *)guid qua2:(NSString *)qua2 phone:(NSString *)phone timeout:(NSTimeInterval)timeout error:(NSError **)outErr {
+    __block NSDictionary *info = nil;
+    __block NSError *err = nil;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    [LCProxyKingClient fetchTokenWithGuid:guid qua2:qua2 phone:phone timeout:timeout completion:^(NSDictionary * _Nullable i, NSError * _Nullable e) {
+        info = i;
+        err = e;
+        dispatch_semaphore_signal(sem);
+    }];
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)((timeout + 10.0) * NSEC_PER_SEC)));
+    if (outErr) *outErr = err;
+    return info;
+}
+
+- (NSDictionary *)syncFetchProxies:(NSString *)guid qua2:(NSString *)qua2 params:(NSDictionary *)params timeout:(NSTimeInterval)timeout error:(NSError **)outErr {
+    __block NSDictionary *info = nil;
+    __block NSError *err = nil;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    [LCProxyKingClient fetchQueenProxiesWithGuid:guid qua2:qua2 params:params timeout:timeout completion:^(NSDictionary * _Nullable i, NSError * _Nullable e) {
+        info = i;
+        err = e;
+        dispatch_semaphore_signal(sem);
+    }];
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)((timeout + 10.0) * NSEC_PER_SEC)));
+    if (outErr) *outErr = err;
+    return info;
+}
+
+- (NSString *)localRandomGuid {
+    uint8_t bytes[16];
+    arc4random_buf(bytes, sizeof(bytes));
+    NSMutableString *s = [NSMutableString stringWithCapacity:32];
+    for (int i = 0; i < 16; i++) [s appendFormat:@"%02X", bytes[i]];
+    return s;
+}
+
+// ---------------------------------------------------------------------------
+// 新版 Queen/King 刷新流程：
+//   GUID（PBProxy GetGuid，失败本地生成） -> Q-Token/Q-Key（旧 WUP TokenInfoReq）
+//   -> queen_http / queen_https（旧 WUP proxyip/getIPListByRouter）
+//   -> 写入 kp_forwarder
+// ---------------------------------------------------------------------------
+- (BOOL)refreshCredentials {
+    [self.lock lock];
+    if (self.refreshing) {
+        [self.lock unlock];
+        return NO;
+    }
+    self.refreshing = YES;
+    [self.lock unlock];
+
+    NSDictionary *settings = [self settingsSnapshot];
+    NSMutableDictionary *state = [self loadState];
+    NSString *phone = [settings[@"kingPhone"] isKindOfClass:[NSString class]] && [settings[@"kingPhone"] length] ? settings[@"kingPhone"] : @"18812341234";
+    NSString *qtype = [settings[@"kingQType"] isKindOfClass:[NSString class]] && [settings[@"kingQType"] length] ? settings[@"kingQType"] : @"httpcom";
+    NSTimeInterval timeout = 15.0;
+
+    // QUA2
+    NSString *qua2 = [state[@"qua2"] isKindOfClass:[NSString class]] && [state[@"qua2"] length] ? state[@"qua2"] : nil;
+    if (!qua2) {
+        qua2 = [LCProxyKingClient generateQua2WithModel:@"" width:1080 height:1920 os:@"10" api:33];
+        state[@"qua2"] = qua2;
+    }
+
+    // Q-GUID
+    NSString *guidOverride = [settings[@"kingGuidOverride"] isKindOfClass:[NSString class]] && [settings[@"kingGuidOverride"] length] ? settings[@"kingGuidOverride"] : nil;
+    NSString *guid = nil;
+    if (guidOverride) {
+        guid = guidOverride;
+    } else {
+        NSString *stored = [state[@"guid"] isKindOfClass:[NSString class]] ? state[@"guid"] : nil;
+        if (LCProxyKingHexStringValid(stored)) guid = stored;
+    }
+    if (!guid) {
+        NSError *guidErr = nil;
+        guid = [self syncFetchGuid:qua2 timeout:timeout error:&guidErr];
+        if (!guid) {
+            guid = [self localRandomGuid];
+            self.lastSource = @"guid-local";
+        } else {
+            self.lastSource = @"guid-pbprx";
+        }
+        state[@"guid"] = guid;
+    }
+
+    // Q-Token / Q-Key
+    NSString *tokenOverride = [settings[@"kingTokenOverride"] isKindOfClass:[NSString class]] && [settings[@"kingTokenOverride"] length] ? settings[@"kingTokenOverride"] : nil;
+    NSString *keyOverride = [settings[@"kingKeyOverride"] isKindOfClass:[NSString class]] && [settings[@"kingKeyOverride"] length] ? settings[@"kingKeyOverride"] : nil;
+    NSString *token = nil;
+    NSString *qkey = nil;
+    if (tokenOverride && keyOverride) {
+        token = tokenOverride;
+        qkey = keyOverride;
+        self.lastSource = @"token-override";
+    } else {
+        NSNumber *tokenExpireEpoch = [state[@"tokenExpireEpoch"] isKindOfClass:[NSNumber class]] ? state[@"tokenExpireEpoch"] : nil;
+        NSString *storedToken = [state[@"token"] isKindOfClass:[NSString class]] ? state[@"token"] : nil;
+        NSString *storedKey = [state[@"key"] isKindOfClass:[NSString class]] ? state[@"key"] : nil;
+        double nowEpoch = [[NSDate date] timeIntervalSince1970];
+        if (storedToken.length && storedKey.length && tokenExpireEpoch && tokenExpireEpoch.doubleValue > nowEpoch + 60.0) {
+            token = storedToken;
+            qkey = storedKey;
+        } else {
+            NSError *tokErr = nil;
+            NSDictionary *tokInfo = [self syncFetchToken:guid qua2:qua2 phone:phone timeout:timeout error:&tokErr];
+            if (!tokInfo) {
+                [self finishRefreshWithState:state success:NO error:[NSString stringWithFormat:@"Q-Token 获取失败: %@", tokErr.localizedDescription ?: @"unknown"]];
+                return NO;
+            }
+            token = tokInfo[@"token"];
+            qkey = tokInfo[@"qkey"];
+            state[@"token"] = token;
+            state[@"key"] = qkey;
+            NSNumber *expire = tokInfo[@"expire_seconds"];
+            if ([expire isKindOfClass:[NSNumber class]] && expire.integerValue > 0) {
+                state[@"tokenExpireEpoch"] = @(nowEpoch + expire.doubleValue);
+            } else {
+                state[@"tokenExpireEpoch"] = @(nowEpoch + 7200.0);
+            }
+            self.lastSource = [NSString stringWithFormat:@"token-%@", tokInfo[@"mode"] ?: @"?"];
+        }
+    }
+    if (!token.length || !qkey.length) {
+        [self finishRefreshWithState:state success:NO error:@"Q-Token/Q-Key 为空"];
+        return NO;
+    }
+
+    // queen_http / queen_https
+    NSArray *queenHttp = [state[@"queen_http"] isKindOfClass:[NSArray class]] ? state[@"queen_http"] : nil;
+    NSArray *queenHttps = [state[@"queen_https"] isKindOfClass:[NSArray class]] ? state[@"queen_https"] : nil;
+    NSNumber *proxyExpireEpoch = [state[@"proxyExpireEpoch"] isKindOfClass:[NSNumber class]] ? state[@"proxyExpireEpoch"] : nil;
+    double nowEpoch2 = [[NSDate date] timeIntervalSince1970];
+    if (!queenHttp.count || !queenHttps.count || !proxyExpireEpoch || proxyExpireEpoch.doubleValue <= nowEpoch2 + 30.0) {
+        NSDictionary *params = @{
+            @"apn": [settings[@"kingApn"] isKindOfClass:[NSString class]] ? settings[@"kingApn"] : @"UNKNOW",
+            @"typeName": [settings[@"kingTypeName"] isKindOfClass:[NSString class]] ? settings[@"kingTypeName"] : @"UNKNOW",
+            @"subtype": [settings[@"kingSubtype"] isKindOfClass:[NSNumber class]] ? settings[@"kingSubtype"] : @0,
+            @"extraInfo": [settings[@"kingExtraInfo"] isKindOfClass:[NSString class]] ? settings[@"kingExtraInfo"] : @"UNKNOW",
+            @"mccmnc": [settings[@"kingMccmnc"] isKindOfClass:[NSString class]] ? settings[@"kingMccmnc"] : @"NULLNULL",
+            @"cardType": [settings[@"kingCardType"] isKindOfClass:[NSNumber class]] ? settings[@"kingCardType"] : @1,
+        };
+        NSError *proxyErr = nil;
+        NSDictionary *proxyInfo = [self syncFetchProxies:guid qua2:qua2 params:params timeout:timeout error:&proxyErr];
+        if (!proxyInfo) {
+            [self finishRefreshWithState:state success:NO error:[NSString stringWithFormat:@"Queen 代理池获取失败: %@", proxyErr.localizedDescription ?: @"unknown"]];
+            return NO;
+        }
+        queenHttp = proxyInfo[@"queen_http"];
+        queenHttps = proxyInfo[@"queen_https"];
+        state[@"queen_http"] = queenHttp ?: @[];
+        state[@"queen_https"] = queenHttps ?: @[];
+        state[@"proxyExpireEpoch"] = @(nowEpoch2 + 600.0);
+        self.lastSource = [NSString stringWithFormat:@"proxy-oldwup-%@", proxyInfo[@"mode"] ?: @"?"];
+    }
+
+    if (!queenHttp.count && !queenHttps.count) {
+        [self finishRefreshWithState:state success:NO error:@"Queen 代理池为空"];
+        return NO;
+    }
+
+    // 写入转发器
+    [self.lock lock];
+    if (self.forwarder) {
+        NSInteger nhttp = MIN(queenHttp.count, 32);
+        NSInteger nhttps = MIN(queenHttps.count, 32);
+        const char **httpArr = nhttp > 0 ? (const char **)calloc((size_t)nhttp, sizeof(char *)) : NULL;
+        const char **httpsArr = nhttps > 0 ? (const char **)calloc((size_t)nhttps, sizeof(char *)) : NULL;
+        for (NSInteger i = 0; i < nhttp; i++) httpArr[i] = [queenHttp[(NSUInteger)i] UTF8String];
+        for (NSInteger i = 0; i < nhttps; i++) httpsArr[i] = [queenHttps[(NSUInteger)i] UTF8String];
+        kp_forwarder_set_king_state(self.forwarder,
+                                    guid.UTF8String, qua2.UTF8String,
+                                    token.UTF8String, qkey.UTF8String,
+                                    qtype.UTF8String,
+                                    httpArr, (size_t)nhttp,
+                                    httpsArr, (size_t)nhttps);
+        if (httpArr) free(httpArr);
+        if (httpsArr) free(httpsArr);
+    }
+    self.lastRefreshSuccess = YES;
+    self.lastRefresh = LCProxyKingNow();
+    self.lastError = @"";
+    [self.lock unlock];
+
+    [self saveState:state];
+    self.refreshing = NO;
+    return YES;
+}
+
+- (void)finishRefreshWithState:(NSDictionary *)state success:(BOOL)success error:(NSString *)error {
+    [self saveState:state];
+    [self.lock lock];
+    self.refreshing = NO;
+    self.lastRefreshSuccess = success;
+    self.lastRefresh = LCProxyKingNow();
+    self.lastError = error ?: @"";
+    [self.lock unlock];
 }
 
 - (NSDictionary *)status {
@@ -228,11 +390,15 @@ static void LCProxyKingLog(const char *line) {
     d[@"lastSource"] = self.lastSource ?: @"";
     d[@"lastError"] = self.lastError ?: @"";
     d[@"lastDiagnostics"] = self.lastDiagnostics ?: @"";
-    NSString *guid = @"";
-    if (self.forwarder) {
-        // forwarder doesn't expose getter; keep status without raw creds
+    NSMutableDictionary *state = [self loadState];
+    NSString *guid = [state[@"guid"] isKindOfClass:[NSString class]] ? state[@"guid"] : @"";
+    if (guid.length > 12) {
+        d[@"guidMasked"] = [NSString stringWithFormat:@"%@...%@", [guid substringToIndex:6], [guid substringFromIndex:guid.length - 6]];
+    } else {
+        d[@"guidMasked"] = guid;
     }
-    d[@"guidMasked"] = guid;
+    d[@"queenHttpCount"] = @([state[@"queen_http"] count]);
+    d[@"queenHttpsCount"] = @([state[@"queen_https"] count]);
     [self.lock unlock];
     return d;
 }

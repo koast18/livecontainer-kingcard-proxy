@@ -160,6 +160,16 @@ kp_forwarder *kp_forwarder_new(const char *listen_host, int listen_port,
 /// 更新凭证（线程安全，内部拷贝）。
 void kp_forwarder_set_creds(kp_forwarder *fw, const char *guid, const char *token);
 
+/// 更新 Queen/King 完整状态（凭证 + HTTP/HTTPS 代理池）。所有入参内部拷贝。
+void kp_forwarder_set_king_state(kp_forwarder *fw,
+                                 const char *guid,
+                                 const char *qua2,
+                                 const char *token,
+                                 const char *qkey,
+                                 const char *qtype,
+                                 const char *const http_proxies[], size_t http_count,
+                                 const char *const https_proxies[], size_t https_count);
+
 /// 设置事件驱动刷新回调：上游 CONNECT 非 200/连接失败时调用，成功后重试一次。
 void kp_forwarder_set_refresh_hook(kp_forwarder *fw, kp_refresh_fn fn, void *ctx);
 

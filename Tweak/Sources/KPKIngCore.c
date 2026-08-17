@@ -3,6 +3,7 @@
 //  LCProxyTweak
 //
 #include "KPKIngCore.h"
+#include "KPKCrypto.h"
 #include "Version.h"
 #include "KPSocketHook.h"
 
@@ -15,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/time.h>
 
 // 王卡网关/代理期望的 UA（参考 https://ss.y4cc.cc/txwk 的 wanka 配置）
 #define KP_KING_UA "okhttp/3.11.0 Dalvik/2.1.0 (Linux; U; Android 13; Redmi K50 5G Build/RKQ1.200826.002)"
@@ -924,6 +926,13 @@ int kp_probe_generate204(const char *upstream_host, int upstream_port,
 
 // ---------- 转发器服务器 ----------
 
+#define KP_MAX_PROXY_POOL 32
+typedef struct {
+    char items[KP_MAX_PROXY_POOL][64];
+    int count;
+    int rr;
+} kp_proxy_pool;
+
 struct kp_forwarder {
     char listen_host[64];
     int listen_port;
@@ -932,6 +941,12 @@ struct kp_forwarder {
 
     char guid[128];
     char token[128];
+    char qua2[256];
+    char qkey[128];
+    char qtype[32];
+
+    kp_proxy_pool http_pool;   // queen_http（iptype 15）
+    kp_proxy_pool https_pool;  // queen_https（iptype 16）
     pthread_mutex_t cred_mutex;
 
     kp_refresh_fn refresh_fn;
@@ -948,6 +963,12 @@ struct client_arg {
 };
 
 static void kp_forwarder_creds(kp_forwarder *fw, char *guid, size_t gc, char *token, size_t tc);
+static void kp_forwarder_snapshot(kp_forwarder *fw,
+                                  char *guid, size_t gc,
+                                  char *token, size_t tc,
+                                  char *qua2, size_t q2c,
+                                  char *qkey, size_t qkc,
+                                  char *qtype, size_t qtc);
 static int kp_forwarder_refresh(kp_forwarder *fw);
 
 // 解析 HTTP 代理绝对 URI 请求行："GET http://host[:port]/path HTTP/1.1"。成功返回 0。
@@ -1089,38 +1110,201 @@ static int kp_pipe_up_and_client(int up, int client, pthread_t *t1, pthread_t *t
     return 0;
 }
 
-// 建立上游 CONNECT（带当前凭证），返回上游 fd 或 -1；resp 填上游响应
-static int kp_connect_upstream(kp_forwarder *fw, const char *host, int port,
-                               char *resp, size_t resp_cap, size_t *resp_len) {
-    kp_dbg("[fw] upstream connect %s:%d", fw->upstream_host, fw->upstream_port);
-    int up = kp_connect_host(fw->upstream_host, fw->upstream_port, 10000);
-    if (up < 0) {
-        kp_dbg("[fw] upstream connect failed");
-        return -1;
+// ---------- Queen 代理池与请求构造 ----------
+
+static void kp_proxy_pool_set(kp_proxy_pool *pool, const char *const items[], size_t count) {
+    if (!pool) return;
+    pool->count = 0;
+    pool->rr = 0;
+    if (!items) return;
+    for (size_t i = 0; i < count && i < KP_MAX_PROXY_POOL; i++) {
+        if (!items[i] || items[i][0] == '\0') continue;
+        snprintf(pool->items[pool->count], sizeof(pool->items[pool->count]), "%s", items[i]);
+        pool->count++;
     }
-    char guid[128], token[128];
-    kp_forwarder_creds(fw, guid, sizeof(guid), token, sizeof(token));
-    kp_dbg("[fw] CONNECT %s:%d guid=%c… token=%c…", host, port,
-           guid[0] ? guid[0] : '?', token[0] ? token[0] : '?');
-    char creq[1024];
-    if (kp_build_connect_request(host, port, guid, token, creq, sizeof(creq)) != 0 ||
-        kp_send_all(up, creq, strlen(creq)) != 0) {
-        kp_dbg("[fw] send upstream CONNECT failed");
-        KP_CLOSESOCK(up);
-        return -1;
+}
+
+static int kp_proxy_pool_pick(kp_proxy_pool *pool, char *host, size_t host_cap, int *port) {
+    if (!pool || pool->count <= 0 || !host || !port) return -1;
+    int idx = pool->rr % pool->count;
+    pool->rr++;
+    char tmp[64];
+    snprintf(tmp, sizeof(tmp), "%s", pool->items[idx]);
+    char *colon = strrchr(tmp, ':');
+    if (!colon) return -1;
+    *colon = '\0';
+    int p = atoi(colon + 1);
+    if (p <= 0 || p > 65535) return -1;
+    if (strlen(tmp) >= host_cap) return -1;
+    strcpy(host, tmp);
+    *port = p;
+    return 0;
+}
+
+static void kp_forwarder_snapshot(kp_forwarder *fw,
+                                  char *guid, size_t gc,
+                                  char *token, size_t tc,
+                                  char *qua2, size_t q2c,
+                                  char *qkey, size_t qkc,
+                                  char *qtype, size_t qtc) {
+    pthread_mutex_lock(&fw->cred_mutex);
+    if (guid) snprintf(guid, gc, "%s", fw->guid);
+    if (token) snprintf(token, tc, "%s", fw->token);
+    if (qua2) snprintf(qua2, q2c, "%s", fw->qua2);
+    if (qkey) snprintf(qkey, qkc, "%s", fw->qkey);
+    if (qtype) snprintf(qtype, qtc, "%s", fw->qtype);
+    pthread_mutex_unlock(&fw->cred_mutex);
+}
+
+static int kp_parse_status_code(const char *buf, size_t len) {
+    if (!buf || len < 12 || strncmp(buf, "HTTP/", 5) != 0) return -1;
+    const char *sp = strchr(buf, ' ');
+    if (!sp) return -1;
+    return atoi(sp + 1);
+}
+
+static void kp_millis_string(char *out, size_t out_cap) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    long long ms = (long long)tv.tv_sec * 1000 + (long long)(tv.tv_usec / 1000);
+    snprintf(out, out_cap, "%lld", ms);
+}
+
+static void kp_build_http_url(const char *host, int port, const char *path,
+                              char *url, size_t url_cap) {
+    if (port == 80) snprintf(url, url_cap, "http://%s%s", host, path ? path : "/");
+    else snprintf(url, url_cap, "http://%s:%d%s", host, port, path ? path : "/");
+}
+
+static void kp_build_https_url(const char *host, int port, char *url, size_t url_cap) {
+    if (port == 443) snprintf(url, url_cap, "https://%s/", host);
+    else snprintf(url, url_cap, "https://%s:%d/", host, port);
+}
+
+static size_t kp_append_origin_headers(const char *reqbuf, size_t reqlen,
+                                       char *out, size_t out_cap, size_t off) {
+    const char *eol1 = strstr(reqbuf, "\r\n");
+    if (!eol1) return off;
+    const char *h = eol1 + 2;
+    const char *sep = strstr(reqbuf, "\r\n\r\n");
+    const char *hend = sep ? sep : reqbuf + reqlen;
+    while (h < hend) {
+        const char *le = strstr(h, "\r\n");
+        if (!le || le > hend) break;
+        size_t ll = (size_t)(le - h);
+        int skip = 0;
+        if (ll >= 5 && strncasecmp(h, "Host:", 5) == 0) skip = 1;
+        else if (ll >= 7 && strncasecmp(h, "Q-GUID:", 7) == 0) skip = 1;
+        else if (ll >= 6 && strncasecmp(h, "Q-UA2:", 6) == 0) skip = 1;
+        else if (ll >= 8 && strncasecmp(h, "Q-Token:", 8) == 0) skip = 1;
+        else if (ll >= 7 && strncasecmp(h, "Q-Type:", 7) == 0) skip = 1;
+        else if (ll >= 6 && strncasecmp(h, "Q-Key:", 6) == 0) skip = 1;
+        else if (ll >= 12 && strncasecmp(h, "Q-RequestId:", 12) == 0) skip = 1;
+        else if (ll >= 11 && strncasecmp(h, "User-Agent:", 11) == 0) skip = 1;
+        else if (ll >= 7 && strncasecmp(h, "Accept:", 7) == 0) skip = 1;
+        else if (ll >= 11 && strncasecmp(h, "Connection:", 11) == 0) skip = 1;
+        else if (ll >= 17 && strncasecmp(h, "Proxy-Connection:", 17) == 0) skip = 1;
+        else if (ll >= 19 && strncasecmp(h, "Proxy-Authorization:", 19) == 0) skip = 1;
+        if (!skip) {
+            if (off + ll + 2 >= out_cap) break;
+            memcpy(out + off, h, ll);
+            off += ll;
+            out[off++] = '\r';
+            out[off++] = '\n';
+        }
+        h = le + 2;
     }
-    if (kp_recv_until(up, resp, resp_cap, resp_len, 10000) != 0) {
-        kp_dbg("[fw] upstream CONNECT response timeout/closed");
-        KP_CLOSESOCK(up);
-        return -1;
+    return off;
+}
+
+static int kp_build_queen_http_request(kp_forwarder *fw,
+                                       const char *method,
+                                       const char *host, int port,
+                                       const char *path,
+                                       const char *reqbuf, size_t reqlen,
+                                       char *out, size_t out_cap,
+                                       char *qkey_out, size_t qkey_out_cap) {
+    char guid[128], token[128], qua2[256], qkey[128], qtype[32];
+    kp_forwarder_snapshot(fw, guid, sizeof(guid), token, sizeof(token),
+                          qua2, sizeof(qua2), qkey, sizeof(qkey), qtype, sizeof(qtype));
+    if (token[0] == '\0' || qkey[0] == '\0') return -1;
+
+    char url[1024];
+    kp_build_http_url(host, port, path, url, sizeof(url));
+    char reqid[24];
+    kp_millis_string(reqid, sizeof(reqid));
+    if (kpk_build_qkey_header(guid, host, url, reqid, qkey, qkey_out, qkey_out_cap) != 0) return -1;
+
+    int n = snprintf(out, out_cap,
+                     "%s %s HTTP/1.1\r\n"
+                     "Host: %s:%d\r\n"
+                     "Q-GUID: %s\r\n"
+                     "Q-UA2: %s\r\n"
+                     "Q-Token: %s\r\n"
+                     "Q-Type: %s\r\n"
+                     "Q-Key: %s\r\n"
+                     "Q-RequestId: %s\r\n"
+                     "User-Agent: MQQBrowser\r\n"
+                     "Accept: */*\r\n"
+                     "Connection: close\r\n",
+                     method, url, host, port, guid, qua2, token, qtype,
+                     qkey_out, reqid);
+    if (n <= 0 || (size_t)n >= out_cap) return -1;
+    size_t off = (size_t)n;
+    off = kp_append_origin_headers(reqbuf, reqlen, out, out_cap, off);
+    if (off + 2 >= out_cap) return -1;
+    out[off++] = '\r';
+    out[off++] = '\n';
+
+    const char *sep = strstr(reqbuf, "\r\n\r\n");
+    if (sep) {
+        const char *body = sep + 4;
+        size_t bodylen = reqlen - (size_t)(body - reqbuf);
+        if (bodylen > 0) {
+            if (off + bodylen >= out_cap) return -1;
+            memcpy(out + off, body, bodylen);
+            off += bodylen;
+        }
     }
-    kp_dbg("[fw] upstream CONNECT response: %.80s", resp);
-    // CONNECT 响应已收到，隧道建立后再清掉 connect 阶段的 10s 超时，
-    // 避免长连接因空闲/慢响应被错误掐断。
-    struct timeval zero = {0, 0};
-    setsockopt(up, SOL_SOCKET, SO_RCVTIMEO, &zero, sizeof(zero));
-    setsockopt(up, SOL_SOCKET, SO_SNDTIMEO, &zero, sizeof(zero));
-    return up;
+    out[off] = '\0';
+    return (int)off;
+}
+
+static int kp_build_queen_connect_request(kp_forwarder *fw,
+                                          const char *host, int port,
+                                          char *out, size_t out_cap,
+                                          char *qkey_out, size_t qkey_out_cap) {
+    char guid[128], token[128], qua2[256], qkey[128], qtype[32];
+    kp_forwarder_snapshot(fw, guid, sizeof(guid), token, sizeof(token),
+                          qua2, sizeof(qua2), qkey, sizeof(qkey), qtype, sizeof(qtype));
+    if (token[0] == '\0' || qkey[0] == '\0') return -1;
+
+    char url[1024];
+    kp_build_https_url(host, port, url, sizeof(url));
+    char reqid[24];
+    kp_millis_string(reqid, sizeof(reqid));
+    if (kpk_build_qkey_header(guid, host, url, reqid, qkey, qkey_out, qkey_out_cap) != 0) return -1;
+
+    int n = snprintf(out, out_cap,
+                     "CONNECT %s:%d HTTP/1.1\r\n"
+                     "Host: %s:%d\r\n"
+                     "Proxy-Authorization: Q-GUID|%s,Q-UA2|%s,Q-Token|%s,Q-Key|%s,Q-RequestId|%s,Q-Type|%s\r\n"
+                     "User-Agent: MQQBrowser\r\n"
+                     "\r\n",
+                     host, port, host, port, guid, qua2, token, qkey_out, reqid, qtype);
+    if (n <= 0 || (size_t)n >= out_cap) return -1;
+    return (int)strlen(out);
+}
+
+static void kp_send_simple_response(int client, int code, const char *text) {
+    char buf[512];
+    snprintf(buf, sizeof(buf),
+             "HTTP/1.1 %d %s\r\n"
+             "Content-Length: 0\r\n"
+             "Connection: close\r\n"
+             "\r\n",
+             code, text ? text : "Error");
+    kp_send_all(client, buf, strlen(buf));
 }
 
 static void kp_handle_client(kp_forwarder *fw, int client) {
@@ -1138,7 +1322,6 @@ static void kp_handle_client(kp_forwarder *fw, int client) {
         KP_CLOSESOCK(client);
         return;
     }
-    // HTTP 代理的 POST 等带 body：按 Content-Length 继续读完
     if (off < sizeof(reqbuf) - 1) {
         char *cl = strstr(reqbuf, "Content-Length:");
         if (!cl) cl = strstr(reqbuf, "content-length:");
@@ -1163,80 +1346,139 @@ static void kp_handle_client(kp_forwarder *fw, int client) {
     char host[256];
     int port = 0;
     char path[1024];
-    // 分支 1：HTTP 代理绝对 URI（GET/HEAD/POST http://host/path）
-    if (kp_parse_absolute_uri(reqbuf, strlen(reqbuf), method, sizeof(method),
+
+    if (kp_parse_absolute_uri(reqbuf, off, method, sizeof(method),
                               host, sizeof(host), &port, path, sizeof(path)) == 0) {
         kp_dbg("[fw] HTTP absolute URI: %s http://%s:%d%s", method, host, port, path);
-        char rebuilt[4096];
-        int rn = kp_rebuild_proxy_request(reqbuf, strlen(reqbuf), method, host, port, path,
-                                          rebuilt, sizeof(rebuilt));
-        if (rn <= 0) {
-            const char *err = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
-            kp_send_all(client, err, strlen(err));
-            KP_CLOSESOCK(client);
-            return;
-        }
-        // loopback 目标：本机直连
+
         if (strncmp(host, "127.", 4) == 0 || strcmp(host, "localhost") == 0 ||
             strcmp(host, "::1") == 0) {
+            char rebuilt[4096];
+            int rn = kp_rebuild_proxy_request(reqbuf, off, method, host, port, path,
+                                              rebuilt, sizeof(rebuilt));
+            if (rn <= 0) { kp_send_simple_response(client, 400, "Bad Request"); KP_CLOSESOCK(client); return; }
             int up = kp_connect_host(host, port, 8000);
-            if (up < 0) {
-                const char *err = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
-                kp_send_all(client, err, strlen(err));
-                KP_CLOSESOCK(client);
-                return;
-            }
+            if (up < 0) { kp_send_simple_response(client, 502, "Bad Gateway"); KP_CLOSESOCK(client); return; }
             kp_http_forward(up, client, rebuilt, (size_t)rn);
             KP_CLOSESOCK(up);
             KP_CLOSESOCK(client);
             return;
         }
-        // 经上游：CONNECT 隧道（带凭证）→ path 形式请求 → 泵响应；非 200 时事件驱动刷新重试一次
-        for (int attempt = 0; attempt < 2; attempt++) {
-            char resp[2048];
+
+        for (int attempt = 0; attempt < 3; attempt++) {
+            char proxy_host[128];
+            int proxy_port = 0;
+            pthread_mutex_lock(&fw->cred_mutex);
+            int pick_rc = kp_proxy_pool_pick(&fw->http_pool, proxy_host, sizeof(proxy_host), &proxy_port);
+            pthread_mutex_unlock(&fw->cred_mutex);
+            if (pick_rc != 0) {
+                if (attempt == 0 && kp_forwarder_refresh(fw) == 0) continue;
+                kp_send_simple_response(client, 502, "Bad Gateway");
+                KP_CLOSESOCK(client);
+                return;
+            }
+
+            int up = kp_connect_host(proxy_host, proxy_port, 10000);
+            if (up < 0) {
+                if (attempt == 0 && kp_forwarder_refresh(fw) == 0) continue;
+                kp_send_simple_response(client, 502, "Bad Gateway");
+                KP_CLOSESOCK(client);
+                return;
+            }
+
+            char qreq[8192];
+            char qkey_val[512];
+            int qn = kp_build_queen_http_request(fw, method, host, port, path,
+                                                 reqbuf, off, qreq, sizeof(qreq),
+                                                 qkey_val, sizeof(qkey_val));
+            if (qn <= 0 || kp_send_all(up, qreq, (size_t)qn) != 0) {
+                KP_CLOSESOCK(up);
+                if (attempt == 0 && kp_forwarder_refresh(fw) == 0) continue;
+                kp_send_simple_response(client, 502, "Bad Gateway");
+                KP_CLOSESOCK(client);
+                return;
+            }
+
+            char resp[4096];
             size_t rgot = 0;
-            int up = kp_connect_upstream(fw, host, port, resp, sizeof(resp), &rgot);
-            if (up >= 0 && kp_response_is_2xx(resp, rgot)) {
-                kp_http_forward(up, client, rebuilt, (size_t)rn);
+            if (kp_recv_until(up, resp, sizeof(resp), &rgot, 10000) != 0) {
+                KP_CLOSESOCK(up);
+                if (attempt == 0 && kp_forwarder_refresh(fw) == 0) continue;
+                kp_send_simple_response(client, 502, "Bad Gateway");
+                KP_CLOSESOCK(client);
+                return;
+            }
+            int code = kp_parse_status_code(resp, rgot);
+            kp_dbg("[fw] queen_http %s:%d -> code=%d", proxy_host, proxy_port, code);
+
+            if (code == 820 || code == 821) {
+                KP_CLOSESOCK(up);
+                if (attempt == 0 && kp_forwarder_refresh(fw) == 0) continue;
+                kp_send_simple_response(client, 502, "Bad Gateway");
+                KP_CLOSESOCK(client);
+                return;
+            }
+            if (code == 823) {
+                KP_CLOSESOCK(up);
+                continue;
+            }
+            if (code == 822 || code == 824) {
+                KP_CLOSESOCK(up);
+                char rebuilt[4096];
+                int rn = kp_rebuild_proxy_request(reqbuf, off, method, host, port, path,
+                                                  rebuilt, sizeof(rebuilt));
+                int dup = kp_connect_host(host, port, 8000);
+                if (rn <= 0 || dup < 0) {
+                    if (dup >= 0) KP_CLOSESOCK(dup);
+                    kp_send_simple_response(client, 502, "Bad Gateway");
+                    KP_CLOSESOCK(client);
+                    return;
+                }
+                kp_http_forward(dup, client, rebuilt, (size_t)rn);
+                KP_CLOSESOCK(dup);
+                KP_CLOSESOCK(client);
+                return;
+            }
+            if (code >= 200 && code < 600) {
+                struct timeval zero = {0, 0};
+                setsockopt(up, SOL_SOCKET, SO_RCVTIMEO, &zero, sizeof(zero));
+                setsockopt(up, SOL_SOCKET, SO_SNDTIMEO, &zero, sizeof(zero));
+                if (kp_send_all(client, resp, rgot) == 0) {
+                    char buf[16384];
+                    ssize_t r;
+                    while ((r = recv(up, buf, sizeof(buf), 0)) > 0) {
+                        if (kp_send_all(client, buf, (size_t)r) != 0) break;
+                    }
+                }
                 KP_CLOSESOCK(up);
                 KP_CLOSESOCK(client);
                 return;
             }
-            if (up >= 0) KP_CLOSESOCK(up);
+            KP_CLOSESOCK(up);
             if (attempt == 0 && kp_forwarder_refresh(fw) == 0) continue;
-            const char *err = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
-            kp_send_all(client, err, strlen(err));
+            kp_send_simple_response(client, 502, "Bad Gateway");
             KP_CLOSESOCK(client);
             return;
         }
-        const char *err = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
-        kp_send_all(client, err, strlen(err));
+        kp_send_simple_response(client, 502, "Bad Gateway");
         KP_CLOSESOCK(client);
         return;
     }
 
-    // 分支 2：CONNECT 隧道
     host[0] = '\0';
     port = 0;
-    if (kp_parse_connect_line(reqbuf, strlen(reqbuf), host, sizeof(host), &port) != 0) {
-        const char *err = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
-        kp_send_all(client, err, strlen(err));
+    if (kp_parse_connect_line(reqbuf, off, host, sizeof(host), &port) != 0) {
+        kp_send_simple_response(client, 400, "Bad Request");
         KP_CLOSESOCK(client);
         return;
     }
 
     kp_dbg("[fw] CONNECT target %s:%d", host, port);
 
-    // loopback 目标：本机直连透传（保护控制台 19092 / 本地服务不被劫持送上游）
     if (strncmp(host, "127.", 4) == 0 || strcmp(host, "localhost") == 0 ||
         strcmp(host, "::1") == 0 || strcmp(host, "[::1]") == 0) {
         int up = kp_connect_host(host, port, 8000);
-        if (up < 0) {
-            const char *err = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
-            kp_send_all(client, err, strlen(err));
-            KP_CLOSESOCK(client);
-            return;
-        }
+        if (up < 0) { kp_send_simple_response(client, 502, "Bad Gateway"); KP_CLOSESOCK(client); return; }
         const char *ok = "HTTP/1.1 200 Connection Established\r\n\r\n";
         if (kp_send_all(client, ok, strlen(ok)) == 0) {
             pthread_t t1, t2;
@@ -1250,12 +1492,85 @@ static void kp_handle_client(kp_forwarder *fw, int client) {
         return;
     }
 
-    for (int attempt = 0; attempt < 2; attempt++) {
+    for (int attempt = 0; attempt < 3; attempt++) {
+        char proxy_host[128];
+        int proxy_port = 0;
+        pthread_mutex_lock(&fw->cred_mutex);
+        int pick_rc = kp_proxy_pool_pick(&fw->https_pool, proxy_host, sizeof(proxy_host), &proxy_port);
+        pthread_mutex_unlock(&fw->cred_mutex);
+        if (pick_rc != 0) {
+            if (attempt == 0 && kp_forwarder_refresh(fw) == 0) continue;
+            kp_send_simple_response(client, 502, "Bad Gateway");
+            KP_CLOSESOCK(client);
+            return;
+        }
+
+        int up = kp_connect_host(proxy_host, proxy_port, 10000);
+        if (up < 0) {
+            if (attempt == 0 && kp_forwarder_refresh(fw) == 0) continue;
+            kp_send_simple_response(client, 502, "Bad Gateway");
+            KP_CLOSESOCK(client);
+            return;
+        }
+
+        char creq[2048];
+        char qkey_val[512];
+        int cn = kp_build_queen_connect_request(fw, host, port, creq, sizeof(creq),
+                                                qkey_val, sizeof(qkey_val));
+        if (cn <= 0 || kp_send_all(up, creq, (size_t)cn) != 0) {
+            KP_CLOSESOCK(up);
+            if (attempt == 0 && kp_forwarder_refresh(fw) == 0) continue;
+            kp_send_simple_response(client, 502, "Bad Gateway");
+            KP_CLOSESOCK(client);
+            return;
+        }
+
         char resp[2048];
         size_t rgot = 0;
-        int up = kp_connect_upstream(fw, host, port, resp, sizeof(resp), &rgot);
-        if (up >= 0 && kp_response_is_2xx(resp, rgot)) {
-            // 上游 200 → 回 200 并泵数据
+        if (kp_recv_until(up, resp, sizeof(resp), &rgot, 10000) != 0) {
+            KP_CLOSESOCK(up);
+            if (attempt == 0 && kp_forwarder_refresh(fw) == 0) continue;
+            kp_send_simple_response(client, 502, "Bad Gateway");
+            KP_CLOSESOCK(client);
+            return;
+        }
+        int code = kp_parse_status_code(resp, rgot);
+        kp_dbg("[fw] queen_https %s:%d CONNECT -> code=%d", proxy_host, proxy_port, code);
+
+        if (code == 820 || code == 821) {
+            KP_CLOSESOCK(up);
+            if (attempt == 0 && kp_forwarder_refresh(fw) == 0) continue;
+            kp_send_simple_response(client, 502, "Bad Gateway");
+            KP_CLOSESOCK(client);
+            return;
+        }
+        if (code == 823) {
+            KP_CLOSESOCK(up);
+            continue;
+        }
+        if (code == 822 || code == 824) {
+            KP_CLOSESOCK(up);
+            int dup = kp_connect_host(host, port, 10000);
+            if (dup < 0) { kp_send_simple_response(client, 502, "Bad Gateway"); KP_CLOSESOCK(client); return; }
+            const char *ok = "HTTP/1.1 200 Connection Established\r\n\r\n";
+            if (kp_send_all(client, ok, strlen(ok)) != 0) {
+                KP_CLOSESOCK(dup);
+                KP_CLOSESOCK(client);
+                return;
+            }
+            pthread_t t1, t2;
+            if (kp_pipe_up_and_client(dup, client, &t1, &t2) == 0) {
+                pthread_join(t1, NULL);
+                pthread_join(t2, NULL);
+            }
+            KP_CLOSESOCK(dup);
+            KP_CLOSESOCK(client);
+            return;
+        }
+        if (code == 200) {
+            struct timeval zero = {0, 0};
+            setsockopt(up, SOL_SOCKET, SO_RCVTIMEO, &zero, sizeof(zero));
+            setsockopt(up, SOL_SOCKET, SO_SNDTIMEO, &zero, sizeof(zero));
             const char *ok = "HTTP/1.1 200 Connection Established\r\n\r\n";
             if (kp_send_all(client, ok, strlen(ok)) != 0) {
                 KP_CLOSESOCK(up);
@@ -1276,20 +1591,16 @@ static void kp_handle_client(kp_forwarder *fw, int client) {
             KP_CLOSESOCK(client);
             return;
         }
-        if (up >= 0) KP_CLOSESOCK(up);
-        // 非 200 / 连接失败：事件驱动刷新一次后重试
-        if (attempt == 0 && kp_forwarder_refresh(fw) == 0) {
-            continue; // 凭证已刷新，重试
-        }
-        const char *err = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
-        kp_send_all(client, err, strlen(err));
+        KP_CLOSESOCK(up);
+        if (attempt == 0 && kp_forwarder_refresh(fw) == 0) continue;
+        kp_send_simple_response(client, 502, "Bad Gateway");
         KP_CLOSESOCK(client);
         return;
     }
-    const char *err = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
-    kp_send_all(client, err, strlen(err));
+    kp_send_simple_response(client, 502, "Bad Gateway");
     KP_CLOSESOCK(client);
 }
+
 
 static int kp_forwarder_refresh(kp_forwarder *fw) {
     if (!fw || !fw->refresh_fn) return -1;
@@ -1346,6 +1657,26 @@ void kp_forwarder_set_creds(kp_forwarder *fw, const char *guid, const char *toke
     pthread_mutex_lock(&fw->cred_mutex);
     snprintf(fw->guid, sizeof(fw->guid), "%s", guid ? guid : "");
     snprintf(fw->token, sizeof(fw->token), "%s", token ? token : "");
+    pthread_mutex_unlock(&fw->cred_mutex);
+}
+
+void kp_forwarder_set_king_state(kp_forwarder *fw,
+                                 const char *guid,
+                                 const char *qua2,
+                                 const char *token,
+                                 const char *qkey,
+                                 const char *qtype,
+                                 const char *const http_proxies[], size_t http_count,
+                                 const char *const https_proxies[], size_t https_count) {
+    if (!fw) return;
+    pthread_mutex_lock(&fw->cred_mutex);
+    snprintf(fw->guid, sizeof(fw->guid), "%s", guid ? guid : "");
+    snprintf(fw->qua2, sizeof(fw->qua2), "%s", qua2 ? qua2 : "");
+    snprintf(fw->token, sizeof(fw->token), "%s", token ? token : "");
+    snprintf(fw->qkey, sizeof(fw->qkey), "%s", qkey ? qkey : "");
+    snprintf(fw->qtype, sizeof(fw->qtype), "%s", qtype && qtype[0] ? qtype : "httpcom");
+    kp_proxy_pool_set(&fw->http_pool, http_proxies, http_count);
+    kp_proxy_pool_set(&fw->https_pool, https_proxies, https_count);
     pthread_mutex_unlock(&fw->cred_mutex);
 }
 

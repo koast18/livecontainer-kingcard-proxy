@@ -69,12 +69,22 @@ th:first-child,td:first-child { text-align:left; }
         <input type="number" id="proxyPort" placeholder="8080">
       </div>
       <div id="kingFields" style="display:none;margin-top:10px">
-        <label class="k">王卡上游地址</label>
-        <input type="text" id="kingUpstreamHost" placeholder="157.148.54.212">
-        <label class="k">王卡上游端口</label>
-        <input type="number" id="kingUpstreamPort" placeholder="8091">
-        <label class="k">取号接口</label>
-        <input type="text" id="kingRefreshURL" placeholder="http://kc.iikira.com/kingcard">
+        <label class="k">取号手机号</label>
+        <input type="text" id="kingPhone" placeholder="18812341234">
+        <label class="k">Q-Type</label>
+        <input type="text" id="kingQType" placeholder="httpcom">
+        <label class="k">MCCMNC</label>
+        <input type="text" id="kingMccmnc" placeholder="46001 或 NULLNULL">
+        <label class="k">APN</label>
+        <input type="text" id="kingApn" placeholder="uninet / 3gnet">
+        <label class="k">网络类型</label>
+        <input type="text" id="kingTypeName" placeholder="MOBILE / WIFI / UNKNOW">
+        <label class="k">网络子类型</label>
+        <input type="number" id="kingSubtype" placeholder="0">
+        <label class="k">APN 附加信息</label>
+        <input type="text" id="kingExtraInfo" placeholder="uninet / 3gwap">
+        <label class="k">王卡状态</label>
+        <input type="number" id="kingCardType" placeholder="1">
         <div class="row"><span class="k">非蜂窝网络自动直连</span>
           <label class="switch"><input type="checkbox" id="kingAutoDirectOnNonCellular"><span class="slider"></span></label>
         </div>
@@ -171,9 +181,14 @@ async function loadStatus() {
   $('proxyType').value = s.proxyType || 'http';
   $('proxyHost').value = s.proxyHost || '';
   $('proxyPort').value = s.proxyPort || '';
-  $('kingUpstreamHost').value = s.kingUpstreamHost || '157.148.54.212';
-  $('kingUpstreamPort').value = s.kingUpstreamPort || 8091;
-  $('kingRefreshURL').value = s.kingRefreshURL || 'http://kc.iikira.com/kingcard';
+  $('kingPhone').value = s.kingPhone || '18812341234';
+  $('kingQType').value = s.kingQType || 'httpcom';
+  $('kingMccmnc').value = s.kingMccmnc || 'NULLNULL';
+  $('kingApn').value = s.kingApn || 'UNKNOW';
+  $('kingTypeName').value = s.kingTypeName || 'UNKNOW';
+  $('kingSubtype').value = s.kingSubtype != null ? s.kingSubtype : 0;
+  $('kingExtraInfo').value = s.kingExtraInfo || 'UNKNOW';
+  $('kingCardType').value = s.kingCardType != null ? s.kingCardType : 1;
   $('kingAutoDirectOnNonCellular').checked = !!s.kingAutoDirectOnNonCellular;
   syncModeUI();
   const effective = s.effectiveMode || s.proxyMode || 'custom';
@@ -195,7 +210,7 @@ async function loadStats() {
 }
 $('proxyMode').onchange = () => { markDirty(); syncModeUI(); };
 ['proxyEnabled','blockNonTcp','debugLogging','kingAutoDirectOnNonCellular'].forEach(id => { $(id).addEventListener('change', markDirty); });
-['proxyType','proxyHost','proxyPort','kingUpstreamHost','kingUpstreamPort','kingRefreshURL'].forEach(id => { $(id).addEventListener('input', markDirty); });
+['proxyType','proxyHost','proxyPort','kingPhone','kingQType','kingMccmnc','kingApn','kingTypeName','kingSubtype','kingExtraInfo','kingCardType'].forEach(id => { $(id).addEventListener('input', markDirty); });
 $('kingRefreshBtn').onclick = async () => {
   $('kingError').textContent = '刷新中…';
   const r = await api('/api/king/refresh', {method:'POST', body:'{}'});
@@ -211,9 +226,14 @@ $('saveConfig').onclick = async () => {
     proxyType: $('proxyType').value.trim() || 'http',
     proxyHost: $('proxyHost').value.trim(),
     proxyPort: parseInt($('proxyPort').value || '0', 10),
-    kingUpstreamHost: $('kingUpstreamHost').value.trim() || '157.148.54.212',
-    kingUpstreamPort: parseInt($('kingUpstreamPort').value || '0', 10),
-    kingRefreshURL: $('kingRefreshURL').value.trim() || 'http://kc.iikira.com/kingcard',
+    kingPhone: $('kingPhone').value.trim() || '18812341234',
+    kingQType: $('kingQType').value.trim() || 'httpcom',
+    kingMccmnc: $('kingMccmnc').value.trim() || 'NULLNULL',
+    kingApn: $('kingApn').value.trim() || 'UNKNOW',
+    kingTypeName: $('kingTypeName').value.trim() || 'UNKNOW',
+    kingSubtype: parseInt($('kingSubtype').value || '0', 10),
+    kingExtraInfo: $('kingExtraInfo').value.trim() || 'UNKNOW',
+    kingCardType: parseInt($('kingCardType').value || '1', 10),
     kingAutoDirectOnNonCellular: $('kingAutoDirectOnNonCellular').checked
   };
   const r = await api('/api/config', {method:'POST', body:JSON.stringify(body)});

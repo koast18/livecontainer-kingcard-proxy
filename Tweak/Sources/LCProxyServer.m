@@ -293,7 +293,8 @@ static const NSUInteger LCProxyDefaultPort = 19092;
         NSMutableDictionary *merged = [NSMutableDictionary dictionaryWithDictionary:[[LCProxyConfig shared] load]];
         for (NSString *key in @[@"proxyEnabled", @"blockNonTcp", @"debugLogging", @"proxyMode", @"proxyType", @"proxyHost", @"proxyPort",
                                  @"kingUpstreamHost", @"kingUpstreamPort", @"kingRefreshURL", @"kingAutoDirectOnNonCellular",
-                                 @"kingGuidOverride", @"kingTokenOverride"]) {
+                                 @"kingGuidOverride", @"kingTokenOverride", @"kingKeyOverride", @"kingPhone", @"kingQType",
+                                 @"kingApn", @"kingTypeName", @"kingSubtype", @"kingExtraInfo", @"kingMccmnc", @"kingCardType"]) {
             if (body[key] != nil) merged[key] = body[key];
         }
         if (![[LCProxyConfig shared] saveSettings:merged]) {

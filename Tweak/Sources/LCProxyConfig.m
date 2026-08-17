@@ -53,6 +53,15 @@ static const NSTimeInterval LCProxyNetworkMonitorInterval = 2.0;
         @"kingAutoDirectOnNonCellular": @NO,
         @"kingGuidOverride": [NSNull null],
         @"kingTokenOverride": [NSNull null],
+        @"kingKeyOverride": [NSNull null],
+        @"kingPhone": @"18812341234",
+        @"kingQType": @"httpcom",
+        @"kingApn": @"UNKNOW",
+        @"kingTypeName": @"UNKNOW",
+        @"kingSubtype": @0,
+        @"kingExtraInfo": @"UNKNOW",
+        @"kingMccmnc": @"NULLNULL",
+        @"kingCardType": @1,
     };
 }
 
