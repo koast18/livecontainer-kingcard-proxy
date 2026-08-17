@@ -20,4 +20,4 @@ jobs:
       - name: Compile and run native Queen client
         run: |
           set -euo pipefail
-          ./Scripts/test_queen_client.sh "${{ github.event.inputs.phone }}"
+          bash Scripts/test_queen_client.sh "${{ github.event.inputs.phone }}"

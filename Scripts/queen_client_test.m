@@ -8,7 +8,7 @@ void lcproxy_socket_set_bypass(int on) {
 
 int main(int argc, char *argv[]) {
     @autoreleasepool {
-        NSString *phone = argc > 1 ? [NSString stringWithUTF8String:argv[1]] : @"18812341234";
+        NSString *phone = (argc > 1 && strlen(argv[1]) > 0) ? [NSString stringWithUTF8String:argv[1]] : @"18812341234";
         __block NSString *guid = nil;
         __block NSString *token = nil;
         __block NSString *qkey = nil;

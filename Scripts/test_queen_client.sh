@@ -11,4 +11,4 @@ clang -fobjc-arc -O0 -g \
   Tweak/Sources/KPSocketHookShim.c \
   Scripts/queen_client_test.m \
   -o build/queen-test/queen_client_test
-./build/queen-test/queen_client_test "$@"
+./build/queen-test/queen_client_test "${1:-18812341234}"
