@@ -717,12 +717,15 @@ static NSDictionary *KPKParseWupResponse(NSData *plain, NSString *rspType) {
 
     NSUInteger pos = 4;
     NSDictionary *packet = [KPKJce readFields:plain pos:&pos];
+    NSLog(@"[king] wup packet_pos=%lu packet=%@", (unsigned long)pos, packet);
     NSData *sbuf = packet[@7];
     if (![sbuf isKindOfClass:[NSData class]] || sbuf.length == 0) return nil;
+    NSLog(@"[king] wup sbuf_len=%lu sbuf_head=%@", (unsigned long)sbuf.length, KPKHexUpper([sbuf subdataWithRange:NSMakeRange(0, MIN(sbuf.length, 64))]));
 
     NSUInteger p2 = 0;
     NSInteger outerTag = 0;
     id outer = [KPKJce readAny:sbuf pos:&p2 tag:&outerTag];
+    NSLog(@"[king] wup outer_tag=%ld outer_pos=%lu outer=%@", (long)outerTag, (unsigned long)p2, outer);
     if (![outer isKindOfClass:[NSDictionary class]]) return nil;
     id rspMap = outer[kRspKey];
     if (![rspMap isKindOfClass:[NSDictionary class]]) return nil;
@@ -730,10 +733,12 @@ static NSDictionary *KPKParseWupResponse(NSData *plain, NSString *rspType) {
     if (![typeMap isKindOfClass:[NSDictionary class]]) return nil;
     NSData *rspBytes = typeMap[rspType];
     if (![rspBytes isKindOfClass:[NSData class]]) return nil;
+    NSLog(@"[king] wup rsp_bytes_len=%lu rsp_head=%@", (unsigned long)rspBytes.length, KPKHexUpper([rspBytes subdataWithRange:NSMakeRange(0, MIN(rspBytes.length, 64))]));
 
     NSUInteger p3 = 0;
     NSInteger structTag = 0;
     id structValue = [KPKJce readAny:rspBytes pos:&p3 tag:&structTag];
+    NSLog(@"[king] wup struct_tag=%ld struct_pos=%lu struct=%@", (long)structTag, (unsigned long)p3, structValue);
     if ([structValue isKindOfClass:[NSDictionary class]]) return structValue;
     NSUInteger p4 = 0;
     return [KPKJce readFields:rspBytes pos:&p4];
