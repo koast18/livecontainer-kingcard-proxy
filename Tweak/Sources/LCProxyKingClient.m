@@ -668,7 +668,6 @@ static NSDictionary *KPKBuildWupEnvelope(NSString *guid, NSString *qua2, NSData 
     [headers addObject:@"User-Agent: MQQBrowser"];
     [headers addObject:@"Accept: */*"];
     [headers addObject:@"Accept-Encoding: identity"];
-    [headers addObject:@"Connection: Close"];
     [headers addObject:[NSString stringWithFormat:@"Q-GUID: %@", KPKHexUpper(encGuid)]];
     [headers addObject:[NSString stringWithFormat:@"Q-UA2: %@", qua2]];
     [headers addObject:[NSString stringWithFormat:@"Common-Header: %@", KPKHexUpper(commonHeader)]];
