@@ -729,9 +729,7 @@ static NSDictionary *KPKParseWupResponse(NSData *plain, NSString *rspType) {
     if (![outer isKindOfClass:[NSDictionary class]]) return nil;
     id rspMap = outer[kRspKey];
     if (![rspMap isKindOfClass:[NSDictionary class]]) return nil;
-    id typeMap = rspMap[rspType];
-    if (![typeMap isKindOfClass:[NSDictionary class]]) return nil;
-    NSData *rspBytes = typeMap[rspType];
+    NSData *rspBytes = rspMap[rspType];
     if (![rspBytes isKindOfClass:[NSData class]]) return nil;
     NSLog(@"[king] wup rsp_bytes_len=%lu rsp_head=%@", (unsigned long)rspBytes.length, KPKHexUpper([rspBytes subdataWithRange:NSMakeRange(0, MIN(rspBytes.length, 64))]));
 
