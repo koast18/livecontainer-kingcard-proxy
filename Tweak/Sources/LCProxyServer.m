@@ -13,7 +13,7 @@
 #import "GCDWebServerDataResponse.h"
 #import "GCDWebServerRequest.h"
 
-static NSString *const LCProxyVersion = @"0.3.12";
+static NSString *const LCProxyVersion = @"0.3.13";
 static const NSUInteger LCProxyDefaultPort = 19092;
 
 @interface LCProxyServer ()
@@ -116,11 +116,15 @@ static const NSUInteger LCProxyDefaultPort = 19092;
         return @{@"ok": @NO, @"error": @"代理未启用或代理地址无效", @"results": @[]};
     }
 
-    // 王卡模式：如果转发器没在运行或上次取号失败，先主动刷新一次凭证，
-    // 避免测试时因为本地还没有 GUID/TOKEN 而全部失败。
+    // 王卡模式：先确保转发器在运行，再确保本地有 GUID/TOKEN。
+    // 如果转发器没起来，单纯 refreshCredentials 不会创建转发器。
     if (enabled && [mode isEqualToString:@"kingcard"]) {
         NSDictionary *kingStatus = [[LCProxyKing shared] status];
-        if (![kingStatus[@"running"] boolValue] || ![kingStatus[@"lastRefreshSuccess"] boolValue]) {
+        if (![kingStatus[@"running"] boolValue]) {
+            [[LCProxyKing shared] applyConfig:settings];
+        }
+        kingStatus = [[LCProxyKing shared] status];
+        if (![kingStatus[@"lastRefreshSuccess"] boolValue]) {
             [[LCProxyKing shared] refreshCredentials];
         }
     }
