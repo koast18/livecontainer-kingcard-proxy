@@ -54,9 +54,9 @@ static void LCProxyKingLog(const char *line) {
 }
 
 - (void)applyConfig:(NSDictionary *)settings {
-    BOOL enabled = [settings[@"proxyEnabled"] boolValue];
     NSString *mode = [settings[@"proxyMode"] isKindOfClass:[NSString class]] ? settings[@"proxyMode"] : @"custom";
-    BOOL shouldRun = enabled && [mode isEqualToString:@"kingcard"];
+    // 只要选择了王卡代理就启动转发器，避免浏览器启动时转发器还没就绪。
+    BOOL shouldRun = [mode isEqualToString:@"kingcard"];
     [self.lock lock];
     if (!shouldRun) {
         if (self.forwarder) {
