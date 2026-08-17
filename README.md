@@ -8,11 +8,14 @@
 - **丢弃非 TCP**：开关 `block_non_tcp`，禁止 UDP/QUIC/ICMP/raw socket 绕过代理。
 - **代理地址配置**：在控制台修改 `http host port`，保存后写回共享 `proxychains.conf`。
 - **上游模式**：支持“直连（无代理）”、“自定义代理”、“王卡代理”三种模式。
-- **王卡代理**：王卡模式内置本地转发器：
-  - 自动请求 `GUID,TOKEN`，优先经王卡代理隧道取号，失败后自动回退直连取号。
-  - 转发 CONNECT 时自动附加 `Q-GUID` / `Q-Token` 头，并按参考订阅附带 `User-Agent`（okhttp/3.11.0 风格）提高免流识别成功率。
-  - 取号失败或上游拒绝时自动刷新凭证并重试。
-  - 每 10 分钟自动周期刷新凭证，避免 `Q-GUID` / `Q-Token` 过期。
+- **王卡代理（Queen/King 新版协议）**：王卡模式内置本地转发器：
+  - 自动初始化 `Q-GUID`（PBProxy `GetGuid`，失败本地生成）。
+  - 通过旧 WUP `httpWupToken/getTokenInfo` 获取 `Q-Token` / `Q-Key`（RSA+AES 加密信封，ECB/CBC 双模式）。
+  - 通过旧 WUP `proxyip/getIPListByRouter` 拉取 `queen_http` / `queen_https` 代理池，支持 MCCMNC / APN / subtype / extra-info / card-type 网络匹配参数。
+  - HTTP 走 `queen_http` 分头模式：`Q-GUID` / `Q-UA2` / `Q-Token` / `Q-Type` / `Q-Key` / `Q-RequestId`。
+  - HTTPS 走 `queen_https` CONNECT 合并头：`Proxy-Authorization: Q-GUID|...,Q-UA2|...,Q-Token|...,Q-Key|...,Q-RequestId|...,Q-Type|...`。
+  - 处理代理响应码 820/821（刷新凭证重试）、823（换节点重试）、822/824（自动直连兜底）。
+  - 每 10 分钟自动周期刷新凭证与代理池，避免过期。
   - 可选“非蜂窝网络自动直连”：开启后，当前网络为非蜂窝（Wi-Fi/其他）时自动切到直连，否则走王卡代理；关闭时始终走王卡代理。
 - **蜂窝流量统计**：
   - 按 10 分钟时段（bucket）记录上传/下载字节。
@@ -25,13 +28,14 @@
 
 ```
 ConsoleApp/         控制 IPA（WKWebView → 127.0.0.1:19092，首次自动下载 dylib）
-Tweak/Sources/      控制 dylib 的 ObjC 模块（配置、统计、Web 服务、共享路径）
+Tweak/Sources/      控制 dylib 的 ObjC/C 模块（配置、统计、Web 服务、Queen/King 协议、转发器）
 Tweak/ProxyCore/    基于 ios-proxy-dylib 的 proxychains 核心 + 流量统计 hook
 Tweak/Vendor/       GCDWebServer（Apache-2.0）
 Resources/          控制台单文件 HTML
-Scripts/            构建脚本
+Scripts/            构建脚本 + Queen 原生冒烟测试
+Tools/queen_proxy_kit/  Python 参考实现（抓取/验证 Queen 代理协议）
 AltStore/           AltStore 源
-.github/workflows/  GitHub Actions 构建发布
+.github/workflows/  GitHub Actions 构建发布 + Queen 原生冒烟测试
 ```
 
 ## 构建
