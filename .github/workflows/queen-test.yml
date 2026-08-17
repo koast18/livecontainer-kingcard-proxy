@@ -1,0 +1,21 @@
+name: Queen Native Smoke Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      phone:
+        description: 'TokenInfoReq 手机号'
+        required: false
+        default: '18812341234'
+
+jobs:
+  smoke:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compile and run native Queen client
+        run: |
+          set -euo pipefail
+          ./Scripts/test_queen_client.sh "${{ github.event.inputs.phone }}"
