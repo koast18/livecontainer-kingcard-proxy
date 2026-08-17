@@ -1044,4 +1044,22 @@ static NSData *KPKSyncPost(NSString *urlString, NSDictionary *headers, NSData *b
     });
 }
 
+
+#pragma mark - Debug binary builders
+
++ (NSData *)debugTokenWupRequestWithGuid:(NSString *)guid qua2:(NSString *)qua2 phone:(NSString *)phone {
+    NSData *wup = KPKTokenInfoReq(guid, qua2, phone);
+    return KPKWupRequest(kTokenServant, kTokenFunc, kReqKey, kTokenReqType, wup, 0);
+}
+
++ (NSData *)debugRouteIPListWupRequestWithGuid:(NSString *)guid qua2:(NSString *)qua2 params:(NSDictionary *)params {
+    NSData *route = KPKRouteIPListReq(guid, qua2, params);
+    return KPKWupRequest(kProxyServant, kProxyFunc, kReqKey, kProxyReqType, route, 0);
+}
+
++ (NSString *)debugCommonHeaderHexWithGuid:(NSString *)guid {
+    NSData *header = KPKPbCommonHeader(guid);
+    return KPKHexUpper(header);
+}
+
 @end

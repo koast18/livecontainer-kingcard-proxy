@@ -31,6 +31,11 @@ NS_ASSUME_NONNULL_BEGIN
                           timeout:(NSTimeInterval)timeout
                        completion:(void (^)(NSDictionary * _Nullable info, NSError * _Nullable error))completion;
 
+/// 仅供宿主/测试对比二进制拼装，生产逻辑不使用。
++ (NSData *)debugTokenWupRequestWithGuid:(NSString *)guid qua2:(NSString *)qua2 phone:(NSString *)phone;
++ (NSData *)debugRouteIPListWupRequestWithGuid:(NSString *)guid qua2:(NSString *)qua2 params:(NSDictionary *)params;
++ (NSString *)debugCommonHeaderHexWithGuid:(NSString *)guid;
+
 @end
 
 NS_ASSUME_NONNULL_END

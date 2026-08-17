@@ -24,6 +24,11 @@ jobs:
           set -euo pipefail
           bash Scripts/test_queen_crypto.sh
 
+      - name: Compare native JCE/WUP bytes with Python reference
+        run: |
+          set -euo pipefail
+          bash Scripts/test_queen_wup_compare.sh
+
       - name: Run reference Python fetch_q_token
         run: |
           set -euo pipefail
