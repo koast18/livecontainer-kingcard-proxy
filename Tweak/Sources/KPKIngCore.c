@@ -1031,11 +1031,6 @@ static int kp_connect_upstream(kp_forwarder *fw, const char *host, int port,
         kp_dbg("[fw] upstream connect failed");
         return -1;
     }
-    // 隧道建立后不应再受 connect 阶段的 10s 超时影响，清掉 socket 超时。
-    struct timeval zero = {0, 0};
-    setsockopt(up, SOL_SOCKET, SO_RCVTIMEO, &zero, sizeof(zero));
-    setsockopt(up, SOL_SOCKET, SO_SNDTIMEO, &zero, sizeof(zero));
-
     char guid[128], token[128];
     kp_forwarder_creds(fw, guid, sizeof(guid), token, sizeof(token));
     kp_dbg("[fw] CONNECT %s:%d guid=%c… token=%c…", host, port,
@@ -1053,6 +1048,11 @@ static int kp_connect_upstream(kp_forwarder *fw, const char *host, int port,
         return -1;
     }
     kp_dbg("[fw] upstream CONNECT response: %.80s", resp);
+    // CONNECT 响应已收到，隧道建立后再清掉 connect 阶段的 10s 超时，
+    // 避免长连接因空闲/慢响应被错误掐断。
+    struct timeval zero = {0, 0};
+    setsockopt(up, SOL_SOCKET, SO_RCVTIMEO, &zero, sizeof(zero));
+    setsockopt(up, SOL_SOCKET, SO_SNDTIMEO, &zero, sizeof(zero));
     return up;
 }
 
