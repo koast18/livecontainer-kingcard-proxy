@@ -130,10 +130,11 @@ static const NSUInteger LCProxyDefaultPort = 19092;
         return @{@"url": urlString ?: @"", @"rc": @(-1), @"ip": @"", @"body": @"代理未启用或代理地址无效", @"ok": @NO};
     }
 
-    // 王卡模式：确保转发器运行且凭证已加载（等待正在进行的刷新完成）。
-    // 如果自动直连已生效，则不需要本地转发器参与 IP 测试。
+    // 王卡模式：确保转发器运行且凭证已加载。最多等 8 秒，避免测试接口被网络刷新阻塞。
     if (enabled && [mode isEqualToString:@"kingcard"] && ![effectiveMode isEqualToString:@"direct"]) {
-        [[LCProxyKing shared] ensureCredentialsReady];
+        if (![[LCProxyKing shared] ensureCredentialsReadyWithTimeout:8.0]) {
+            return @{@"url": urlString ?: @"", @"rc": @(-1), @"ip": @"", @"body": @"王卡凭证正在刷新或暂不可用，请稍后重试", @"ok": @NO, @"effectiveMode": effectiveMode};
+        }
     }
 
     NSURL *url = [NSURL URLWithString:urlString];
@@ -191,9 +192,11 @@ static const NSUInteger LCProxyDefaultPort = 19092;
         return @{@"ok": @NO, @"error": @"代理未启用或代理地址无效", @"results": @[]};
     }
 
-    // 王卡模式：确保转发器运行且凭证已加载（等待正在进行的刷新完成）。
+    // 王卡模式：确保转发器运行且凭证已加载。最多等 8 秒，避免测试接口被网络刷新阻塞。
     if (enabled && [mode isEqualToString:@"kingcard"] && ![effectiveMode isEqualToString:@"direct"]) {
-        [[LCProxyKing shared] ensureCredentialsReady];
+        if (![[LCProxyKing shared] ensureCredentialsReadyWithTimeout:8.0]) {
+            return @{@"ok": @NO, @"error": @"王卡凭证正在刷新或暂不可用，请稍后重试", @"results": @[], @"mode": mode, @"effectiveMode": effectiveMode};
+        }
     }
 
     NSArray<NSString *> *sources = @[

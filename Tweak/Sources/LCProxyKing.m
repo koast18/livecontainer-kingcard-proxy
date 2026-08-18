@@ -179,15 +179,25 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
     [self.lock unlock];
 }
 
-- (BOOL)ensureCredentialsReady {
-    for (int i = 0; i < 60; i++) {
+- (BOOL)isReady {
+    [self.lock lock];
+    BOOL running = self.forwarder != NULL && kp_forwarder_is_running(self.forwarder) == 1;
+    BOOL success = self.lastRefreshSuccess;
+    BOOL refreshing = self.refreshing;
+    [self.lock unlock];
+    return running && success && !refreshing;
+}
+
+- (BOOL)ensureCredentialsReadyWithTimeout:(NSTimeInterval)maxWait {
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:maxWait];
+    while ([[NSDate date] timeIntervalSinceDate:deadline] < 0) {
         [self.lock lock];
         BOOL refreshing = self.refreshing;
         BOOL running = self.forwarder != NULL && kp_forwarder_is_running(self.forwarder) == 1;
         BOOL success = self.lastRefreshSuccess;
         [self.lock unlock];
 
-        if (running && success) return YES;
+        if (running && success && !refreshing) return YES;
 
         if (!refreshing) {
             NSDictionary *settings = [self settingsSnapshot];
@@ -195,13 +205,9 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
             BOOL ok = [self refreshCredentials];
             if (ok) return YES;
         }
-        [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.25]];
+        [NSThread sleepForTimeInterval:0.25];
     }
-    [self.lock lock];
-    BOOL running = self.forwarder != NULL && kp_forwarder_is_running(self.forwarder) == 1;
-    BOOL success = self.lastRefreshSuccess;
-    [self.lock unlock];
-    return running && success;
+    return [self isReady];
 }
 
 // ---------------------------------------------------------------------------

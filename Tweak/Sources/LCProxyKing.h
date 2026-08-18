@@ -7,7 +7,8 @@ NS_ASSUME_NONNULL_BEGIN
 + (instancetype)shared;
 - (void)applyConfig:(NSDictionary *)settings;
 - (BOOL)refreshCredentials;
-- (BOOL)ensureCredentialsReady;
+- (BOOL)isReady;
+- (BOOL)ensureCredentialsReadyWithTimeout:(NSTimeInterval)maxWait;
 - (NSDictionary *)status;
 
 @end
