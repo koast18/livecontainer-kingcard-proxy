@@ -7,20 +7,20 @@
       "name": "LiveProxy 控制台",
       "bundleIdentifier": "com.liveproxy.console",
       "developerName": "koast18",
-      "version": "0.5.16",
-      "versionDate": "2026-08-18T07:47:03Z",
-      "versionDescription": "LiveProxy 控制台：支持直连/自定义/王卡代理，新版 Queen/King 协议，调试日志带时间戳与连接流量统计。",
-      "downloadURL": "https://gh-proxy.com/https://github.com/koast18/livecontainer-kingcard-proxy/releases/download/v0.5.16/LiveProxyConsole-0.5.16.ipa",
+      "version": "0.5.17",
+      "versionDate": "2026-08-18T07:59:37Z",
+      "versionDescription": "LiveProxy 控制台：支持直连/自定义/王卡代理，新版 Queen/King 协议，调试日志写入 proxychains.log。",
+      "downloadURL": "https://gh-proxy.com/https://github.com/koast18/livecontainer-kingcard-proxy/releases/download/v0.5.17/LiveProxyConsole-0.5.17.ipa",
       "localizedDescription": "LiveContainer 内任意 App 走 HTTP 代理的控制台 IPA。依赖 LCProxyControl dylib（自动下载到普通与共享 App 的 Tweaks 目录），支持直连/自定义/王卡代理、新版 Queen/King 王卡协议、非蜂窝自动直连、代理开关、丢弃非 TCP、蜂窝流量统计。",
       "iconURL": "https://raw.githubusercontent.com/koast18/livecontainer-kingcard-proxy/master/AltStore/icon.png",
       "tintColor": "2E7D32",
       "size": 19197,
       "versions": [
         {
-          "version": "0.5.16",
-          "date": "2026-08-18T07:47:03Z",
-          "downloadURL": "https://gh-proxy.com/https://github.com/koast18/livecontainer-kingcard-proxy/releases/download/v0.5.16/LiveProxyConsole-0.5.16.ipa",
-          "localizedDescription": "调试日志增加时间戳，并为每个被代理连接记录发送/接收字节数，便于与上网详单比对。"
+          "version": "0.5.17",
+          "date": "2026-08-18T07:59:37Z",
+          "downloadURL": "https://gh-proxy.com/https://github.com/koast18/livecontainer-kingcard-proxy/releases/download/v0.5.17/LiveProxyConsole-0.5.17.ipa",
+          "localizedDescription": "调试日志现在也会写入 proxychains.log，便于和上网详单比对时间与流量。"
         }
       ]
     }
