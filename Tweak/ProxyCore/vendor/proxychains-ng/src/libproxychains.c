@@ -159,20 +159,21 @@ static void lc_stats_rotate_locked(int64_t now_bucket) {
     }
     if (lc_current_start == now_bucket)
         return;
+    // 先原子取走当前计数，再切桶。并发 add 直接原子累加，不经过这里。
+    uint64_t up = __atomic_exchange_n(&lc_current_upload, 0, __ATOMIC_RELAXED);
+    uint64_t down = __atomic_exchange_n(&lc_current_download, 0, __ATOMIC_RELAXED);
     if (lc_bucket_count < LC_STATS_MAX_BUCKETS) {
         lc_buckets[lc_bucket_count].start = lc_current_start;
-        lc_buckets[lc_bucket_count].upload = lc_current_upload;
-        lc_buckets[lc_bucket_count].download = lc_current_download;
+        lc_buckets[lc_bucket_count].upload = up;
+        lc_buckets[lc_bucket_count].download = down;
         lc_bucket_count++;
     } else {
         memmove(&lc_buckets[0], &lc_buckets[1], sizeof(lc_buckets[0]) * (LC_STATS_MAX_BUCKETS - 1));
         lc_buckets[LC_STATS_MAX_BUCKETS - 1].start = lc_current_start;
-        lc_buckets[LC_STATS_MAX_BUCKETS - 1].upload = lc_current_upload;
-        lc_buckets[LC_STATS_MAX_BUCKETS - 1].download = lc_current_download;
+        lc_buckets[LC_STATS_MAX_BUCKETS - 1].upload = up;
+        lc_buckets[LC_STATS_MAX_BUCKETS - 1].download = down;
     }
     lc_current_start = now_bucket;
-    lc_current_upload = 0;
-    lc_current_download = 0;
 }
 
 void lcproxy_control_set_enabled(int enabled) {
@@ -219,19 +220,20 @@ int lcproxy_stats_is_cellular(void) {
     return cellular;
 }
 
+// 热路径专用：只读取缓存，不在每个 read/write 上跑 getifaddrs。
+// 缓存由 lcproxy_stats_is_cellular() 刷新（LCProxyStats 定时 flush 前会调用）。
+static int lcproxy_stats_is_cellular_fast(void) {
+    if (lc_cellular_cache < 0) return lcproxy_stats_is_cellular();
+    return lc_cellular_cache == 1;
+}
+
 void lcproxy_stats_add_upload(uint64_t n) {
     if (!n) return;
-    pthread_mutex_lock(&lc_stats_lock);
-    lc_stats_rotate_locked(lc_now_bucket_start());
-    lc_current_upload += n;
-    pthread_mutex_unlock(&lc_stats_lock);
+    (void)__atomic_add_fetch(&lc_current_upload, n, __ATOMIC_RELAXED);
 }
 void lcproxy_stats_add_download(uint64_t n) {
     if (!n) return;
-    pthread_mutex_lock(&lc_stats_lock);
-    lc_stats_rotate_locked(lc_now_bucket_start());
-    lc_current_download += n;
-    pthread_mutex_unlock(&lc_stats_lock);
+    (void)__atomic_add_fetch(&lc_current_download, n, __ATOMIC_RELAXED);
 }
 
 int lcproxy_stats_bucket_count(void) {
@@ -255,50 +257,88 @@ void lcproxy_stats_get_current(int64_t *start, uint64_t *up, uint64_t *down) {
     pthread_mutex_lock(&lc_stats_lock);
     lc_stats_rotate_locked(lc_now_bucket_start());
     *start = lc_current_start;
-    *up = lc_current_upload;
-    *down = lc_current_download;
+    *up = __atomic_load_n(&lc_current_upload, __ATOMIC_RELAXED);
+    *down = __atomic_load_n(&lc_current_download, __ATOMIC_RELAXED);
     pthread_mutex_unlock(&lc_stats_lock);
 }
 uint64_t lcproxy_stats_total_upload(void) {
     pthread_mutex_lock(&lc_stats_lock);
-    uint64_t total = lc_current_upload;
+    uint64_t total = __atomic_load_n(&lc_current_upload, __ATOMIC_RELAXED);
     for (int i = 0; i < lc_bucket_count; i++) total += lc_buckets[i].upload;
     pthread_mutex_unlock(&lc_stats_lock);
     return total;
 }
 uint64_t lcproxy_stats_total_download(void) {
     pthread_mutex_lock(&lc_stats_lock);
-    uint64_t total = lc_current_download;
+    uint64_t total = __atomic_load_n(&lc_current_download, __ATOMIC_RELAXED);
     for (int i = 0; i < lc_bucket_count; i++) total += lc_buckets[i].download;
     pthread_mutex_unlock(&lc_stats_lock);
     return total;
 }
 
+// fd 分类缓存：避免每个 read/write 都 getsockname+getsockopt。
+// 0=未知，1=需要统计的远端 TCP socket，2=不需统计（普通文件/管道/回环等）。
+#define LC_FD_CLASS_UNKNOWN 0
+#define LC_FD_CLASS_COUNT   1
+#define LC_FD_CLASS_NOCOUNT 2
+#define LC_FD_CLASS_CACHE_SIZE 4096
+static unsigned char lc_fd_class[LC_FD_CLASS_CACHE_SIZE];
+
+static void lc_fd_class_set(int fd, unsigned char v) {
+    if (fd >= 0 && fd < LC_FD_CLASS_CACHE_SIZE)
+        lc_fd_class[fd] = v;
+}
+
+static unsigned char lc_fd_class_get(int fd) {
+    if (fd >= 0 && fd < LC_FD_CLASS_CACHE_SIZE)
+        return lc_fd_class[fd];
+    return LC_FD_CLASS_UNKNOWN;
+}
+
 static int lc_should_count_fd(int fd) {
-    if (!lcproxy_stats_is_cellular())
+    unsigned char cls = lc_fd_class_get(fd);
+    if (cls == LC_FD_CLASS_NOCOUNT)
         return 0;
     if (lc_bypass_get())
         return 0;
+    if (cls == LC_FD_CLASS_COUNT)
+        return lcproxy_stats_is_cellular_fast();
+
+    // 未知 fd：首次分类也走缓存；getifaddrs 只由定时器/配置刷新触发。
+    if (!lcproxy_stats_is_cellular_fast()) {
+        lc_fd_class_set(fd, LC_FD_CLASS_NOCOUNT);
+        return 0;
+    }
     struct sockaddr_storage ss;
     socklen_t len = sizeof(ss);
-    if (getsockname(fd, (struct sockaddr *)&ss, &len) != 0)
+    if (getsockname(fd, (struct sockaddr *)&ss, &len) != 0) {
+        lc_fd_class_set(fd, LC_FD_CLASS_NOCOUNT);
         return 0;
+    }
     if (ss.ss_family == AF_INET) {
         struct sockaddr_in *sin = (struct sockaddr_in *)&ss;
         unsigned long a = ntohl(sin->sin_addr.s_addr);
-        if ((a >> 24) == 127)
+        if ((a >> 24) == 127) {
+            lc_fd_class_set(fd, LC_FD_CLASS_NOCOUNT);
             return 0;
+        }
     } else if (ss.ss_family == AF_INET6) {
         struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&ss;
-        if (IN6_IS_ADDR_LOOPBACK(&sin6->sin6_addr))
+        if (IN6_IS_ADDR_LOOPBACK(&sin6->sin6_addr)) {
+            lc_fd_class_set(fd, LC_FD_CLASS_NOCOUNT);
             return 0;
+        }
     } else {
+        lc_fd_class_set(fd, LC_FD_CLASS_NOCOUNT);
         return 0;
     }
     int type = 0;
     socklen_t tl = sizeof(type);
-    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &tl) != 0)
+    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &tl) != 0) {
+        lc_fd_class_set(fd, LC_FD_CLASS_NOCOUNT);
         return 0;
+    }
+    lc_fd_class_set(fd, LC_FD_CLASS_COUNT);
     return 1;
 }
 
@@ -842,6 +882,7 @@ static int lc_drop_non_tcp_if_enabled(int fd) {
 }
 
 HOOKFUNC(int, close, int fd) {
+	lc_fd_class_set(fd, LC_FD_CLASS_UNKNOWN);
 	if(!init_l) {
 		if(close_fds_cnt>=(sizeof close_fds/sizeof close_fds[0])) goto err;
 		close_fds[close_fds_cnt++] = fd;
@@ -876,6 +917,8 @@ static void intsort(int *a, int n) {
 
 /* Warning: Linux manual says the third arg is `unsigned int`, but unistd.h says `int`. */
 HOOKFUNC(int, close_range, unsigned first, unsigned last, int flags) {
+	// close_range 可能批量关闭 fd；为避免 fd 复用时命中陈旧分类，整体清空缓存。
+	memset(lc_fd_class, 0, sizeof(lc_fd_class));
 	if(true_close_range == NULL) {
 		fprintf(stderr, "Calling close_range, but this platform does not provide this system call. ");
 		return -1;
@@ -954,6 +997,9 @@ HOOKFUNC(int, connect, int sock, const struct sockaddr *addr, unsigned int len) 
 	if(!((fam  == AF_INET || fam == AF_INET6) && socktype == SOCK_STREAM))
 		return true_connect(sock, addr, len);
 
+	// 默认按不统计处理；只有通过 localnet 检查的远端 TCP 连接才标记为可统计。
+	lc_fd_class_set(sock, LC_FD_CLASS_NOCOUNT);
+
 	int v6 = dest_ip.is_v6 = fam == AF_INET6;
 
 	p_addr_in = &((struct sockaddr_in *) addr)->sin_addr;
@@ -1015,6 +1061,9 @@ HOOKFUNC(int, connect, int sock, const struct sockaddr *addr, unsigned int len) 
 		PDEBUG("accessing localnet using true_connect\n");
 		return true_connect(sock, addr, len);
 	}
+
+	if (!remote_dns_connect)
+		lc_fd_class_set(sock, LC_FD_CLASS_COUNT);
 
 	flags = fcntl(sock, F_GETFL, 0);
 	if(flags & O_NONBLOCK)

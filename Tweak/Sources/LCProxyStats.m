@@ -49,6 +49,8 @@
 }
 
 - (void)flushNow {
+    // 刷新 read/write 热路径使用的蜂窝网络缓存（10 秒一次，避免每个包都 getifaddrs）。
+    lcproxy_stats_is_cellular();
     NSDictionary *snapshot = [self snapshotForCurrentProcess];
     if (!snapshot) return;
     NSError *err = nil;
