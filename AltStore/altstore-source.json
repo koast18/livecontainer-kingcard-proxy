@@ -14,7 +14,7 @@
       "localizedDescription": "LiveContainer 内任意 App 走 HTTP 代理的控制台 IPA。依赖 LCProxyControl dylib（自动下载到普通与共享 App 的 Tweaks 目录），支持直连/自定义/王卡代理、新版 Queen/King 王卡协议、非蜂窝自动直连、代理开关、丢弃非 TCP、蜂窝流量统计。",
       "iconURL": "https://raw.githubusercontent.com/koast18/livecontainer-kingcard-proxy/master/AltStore/icon.png",
       "tintColor": "2E7D32",
-      "size": 17785,
+      "size": 18811,
       "versions": [
         {
           "version": "0.5.8",
