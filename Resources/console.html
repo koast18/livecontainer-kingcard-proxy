@@ -98,6 +98,7 @@ th:first-child,td:first-child { text-align:left; }
         <div class="row"><span class="k">HTTPS CONNECT</span><span class="v" id="statHttpsConnects">0</span></div>
         <div class="row"><span class="k">直连兜底次数</span><span class="v" id="statDirectFallbacks">0</span></div>
         <div class="row"><span class="k">凭证刷新次数</span><span class="v" id="statRefreshCalls">0</span></div>
+        <div class="msg" id="recentDirectHosts" style="white-space:pre-wrap;font-size:12px;color:#d29922"></div>
         <div class="msg" id="kingError"></div>
         <div class="msg" id="kingDiag" style="white-space:pre-wrap;font-size:12px;color:#8b949e"></div>
         <div style="margin-top:8px"><button class="secondary" id="kingRefreshBtn">立即刷新凭证</button></div>
@@ -176,6 +177,8 @@ async function loadStatus() {
   $('statHttpsConnects').textContent = king.statHttpsConnects != null ? king.statHttpsConnects : '0';
   $('statDirectFallbacks').textContent = king.statDirectFallbacks != null ? king.statDirectFallbacks : '0';
   $('statRefreshCalls').textContent = king.statRefreshCalls != null ? king.statRefreshCalls : '0';
+  const directHosts = (king.recentDirectHosts || []);
+  $('recentDirectHosts').textContent = directHosts.length ? ('最近直连兜底域名: ' + directHosts.join(', ')) : '';
   $('kingError').textContent = king.lastError || '';
   $('kingDiag').textContent = king.lastDiagnostics || '';
   $('version').textContent = s.version || '—';

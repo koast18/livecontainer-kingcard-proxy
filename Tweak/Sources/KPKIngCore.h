@@ -200,6 +200,11 @@ typedef struct {
 
 void kp_forwarder_get_stats(kp_forwarder *fw, kp_forwarder_stats *stats);
 
+/// 最近触发直连兜底的目标域名（环形缓冲，最多 16 条）。
+int kp_forwarder_direct_host_count(kp_forwarder *fw);
+int kp_forwarder_get_direct_host(kp_forwarder *fw, int index,
+                                 char *out, size_t out_cap);
+
 // ---------- 调试日志 ----------
 /// 宿主注册日志回调（每步网络操作都会输出，真机调试用）
 void kp_set_debug_logger(void (*fn)(const char *line));

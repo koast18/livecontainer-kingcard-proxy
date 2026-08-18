@@ -993,6 +993,8 @@ typedef struct {
     int rr;
 } kp_proxy_pool;
 
+#define KP_DIRECT_HOST_LOG_MAX 16
+
 struct kp_forwarder {
     char listen_host[64];
     int listen_port;
@@ -1015,6 +1017,10 @@ struct kp_forwarder {
     uint64_t stat_refresh_calls;
     uint64_t stat_proxy_errors;
 
+    char direct_host_log[KP_DIRECT_HOST_LOG_MAX][128];
+    int direct_host_log_count;
+    int direct_host_log_rr;
+
     kp_refresh_fn refresh_fn;
     void *refresh_ctx;
 
@@ -1029,6 +1035,14 @@ struct client_arg {
 };
 
 static void kp_forwarder_creds(kp_forwarder *fw, char *guid, size_t gc, char *token, size_t tc);
+static void kp_forwarder_record_direct_host(kp_forwarder *fw, const char *host) {
+    if (!fw || !host || host[0] == '\0') return;
+    int idx = fw->direct_host_log_rr % KP_DIRECT_HOST_LOG_MAX;
+    fw->direct_host_log_rr++;
+    snprintf(fw->direct_host_log[idx], sizeof(fw->direct_host_log[idx]), "%s", host);
+    if (fw->direct_host_log_count < KP_DIRECT_HOST_LOG_MAX) fw->direct_host_log_count++;
+}
+
 static void kp_forwarder_snapshot(kp_forwarder *fw,
                                   char *guid, size_t gc,
                                   char *token, size_t tc,
@@ -1205,6 +1219,14 @@ static int kp_proxy_pool_pick_index(kp_proxy_pool *pool, int index,
     strcpy(host, tmp);
     *port = p;
     return 0;
+}
+
+static void kp_forwarder_record_direct_host(kp_forwarder *fw, const char *host) {
+    if (!fw || !host || host[0] == '\0') return;
+    int idx = fw->direct_host_log_rr % KP_DIRECT_HOST_LOG_MAX;
+    fw->direct_host_log_rr++;
+    snprintf(fw->direct_host_log[idx], sizeof(fw->direct_host_log[idx]), "%s", host);
+    if (fw->direct_host_log_count < KP_DIRECT_HOST_LOG_MAX) fw->direct_host_log_count++;
 }
 
 static void kp_forwarder_snapshot(kp_forwarder *fw,
@@ -1485,6 +1507,7 @@ static void kp_handle_client(kp_forwarder *fw, int client) {
             if (code == 822 || code == 824) {
                 KP_CLOSESOCK(up);
                 fw->stat_direct_fallbacks++;
+                kp_forwarder_record_direct_host(fw, host);
                 char rebuilt[4096];
                 int rn = kp_rebuild_proxy_request(reqbuf, off, method, host, port, path,
                                                   rebuilt, sizeof(rebuilt));
@@ -1609,6 +1632,7 @@ https_retry:
         if (code == 822 || code == 824) {
             KP_CLOSESOCK(up);
             fw->stat_direct_fallbacks++;
+            kp_forwarder_record_direct_host(fw, host);
             int dup = kp_connect_host(host, port, 10000);
             if (dup < 0) { kp_send_simple_response(client, 502, "Bad Gateway"); KP_CLOSESOCK(client); return; }
             const char *ok = "HTTP/1.1 200 Connection Established\r\n\r\n";
@@ -1819,4 +1843,18 @@ void kp_forwarder_get_stats(kp_forwarder *fw, kp_forwarder_stats *stats) {
     stats->direct_fallbacks = fw->stat_direct_fallbacks;
     stats->refresh_calls = fw->stat_refresh_calls;
     stats->proxy_errors = fw->stat_proxy_errors;
+}
+
+int kp_forwarder_direct_host_count(kp_forwarder *fw) {
+    return fw ? fw->direct_host_log_count : 0;
+}
+
+int kp_forwarder_get_direct_host(kp_forwarder *fw, int index,
+                                 char *out, size_t out_cap) {
+    if (!fw || !out || out_cap == 0) return -1;
+    if (index < 0 || index >= fw->direct_host_log_count) return -1;
+    int start = (fw->direct_host_log_rr - fw->direct_host_log_count + index) % KP_DIRECT_HOST_LOG_MAX;
+    if (start < 0) start += KP_DIRECT_HOST_LOG_MAX;
+    snprintf(out, out_cap, "%s", fw->direct_host_log[start]);
+    return 0;
 }
