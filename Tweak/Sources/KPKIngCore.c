@@ -1184,12 +1184,12 @@ static void kp_proxy_pool_set(kp_proxy_pool *pool, const char *const items[], si
     }
 }
 
-static int kp_proxy_pool_pick(kp_proxy_pool *pool, char *host, size_t host_cap, int *port) {
+static int kp_proxy_pool_pick_index(kp_proxy_pool *pool, int index,
+                                    char *host, size_t host_cap, int *port) {
     if (!pool || pool->count <= 0 || !host || !port) return -1;
-    int idx = pool->rr % pool->count;
-    pool->rr++;
+    if (index < 0 || index >= pool->count) return -1;
     char tmp[64];
-    snprintf(tmp, sizeof(tmp), "%s", pool->items[idx]);
+    snprintf(tmp, sizeof(tmp), "%s", pool->items[index]);
     char *colon = strrchr(tmp, ':');
     if (!colon) return -1;
     *colon = '\0';
@@ -1425,25 +1425,27 @@ static void kp_handle_client(kp_forwarder *fw, int client) {
             return;
         }
 
-        for (int attempt = 0; attempt < 3; attempt++) {
+        int http_pool_count = 0;
+        int http_refreshed = 0;
+        pthread_mutex_lock(&fw->cred_mutex);
+        http_pool_count = fw->http_pool.count;
+        pthread_mutex_unlock(&fw->cred_mutex);
+
+    http_retry:
+        for (int attempt = 0; attempt < http_pool_count; attempt++) {
             char proxy_host[128];
             int proxy_port = 0;
             pthread_mutex_lock(&fw->cred_mutex);
-            int pick_rc = kp_proxy_pool_pick(&fw->http_pool, proxy_host, sizeof(proxy_host), &proxy_port);
+            int pick_rc = kp_proxy_pool_pick_index(&fw->http_pool, attempt,
+                                                   proxy_host, sizeof(proxy_host), &proxy_port);
             pthread_mutex_unlock(&fw->cred_mutex);
             if (pick_rc != 0) {
-                if (attempt == 0 && kp_forwarder_refresh(fw) == 0) continue;
-                kp_send_simple_response(client, 502, "Bad Gateway");
-                KP_CLOSESOCK(client);
-                return;
+                continue;
             }
 
             int up = kp_connect_host(proxy_host, proxy_port, 10000);
             if (up < 0) {
-                if (attempt == 0 && kp_forwarder_refresh(fw) == 0) continue;
-                kp_send_simple_response(client, 502, "Bad Gateway");
-                KP_CLOSESOCK(client);
-                return;
+                continue;
             }
 
             char qreq[8192];
@@ -1453,30 +1455,21 @@ static void kp_handle_client(kp_forwarder *fw, int client) {
                                                  qkey_val, sizeof(qkey_val));
             if (qn <= 0 || kp_send_all(up, qreq, (size_t)qn) != 0) {
                 KP_CLOSESOCK(up);
-                if (attempt == 0 && kp_forwarder_refresh(fw) == 0) continue;
-                kp_send_simple_response(client, 502, "Bad Gateway");
-                KP_CLOSESOCK(client);
-                return;
+                continue;
             }
 
             char resp[4096];
             size_t rgot = 0;
             if (kp_recv_until(up, resp, sizeof(resp), &rgot, 10000) != 0) {
                 KP_CLOSESOCK(up);
-                if (attempt == 0 && kp_forwarder_refresh(fw) == 0) continue;
-                kp_send_simple_response(client, 502, "Bad Gateway");
-                KP_CLOSESOCK(client);
-                return;
+                continue;
             }
             int code = kp_parse_status_code(resp, rgot);
             kp_dbg("[fw] queen_http %s:%d -> code=%d", proxy_host, proxy_port, code);
 
             if (code == 820 || code == 821) {
                 KP_CLOSESOCK(up);
-                if (attempt == 0 && kp_forwarder_refresh(fw) == 0) continue;
-                kp_send_simple_response(client, 502, "Bad Gateway");
-                KP_CLOSESOCK(client);
-                return;
+                continue;
             }
             if (code == 823) {
                 KP_CLOSESOCK(up);
@@ -1515,10 +1508,14 @@ static void kp_handle_client(kp_forwarder *fw, int client) {
                 return;
             }
             KP_CLOSESOCK(up);
-            if (attempt == 0 && kp_forwarder_refresh(fw) == 0) continue;
-            kp_send_simple_response(client, 502, "Bad Gateway");
-            KP_CLOSESOCK(client);
-            return;
+            continue;
+        }
+        if (!http_refreshed && kp_forwarder_refresh(fw) == 0) {
+            http_refreshed = 1;
+            pthread_mutex_lock(&fw->cred_mutex);
+            http_pool_count = fw->http_pool.count;
+            pthread_mutex_unlock(&fw->cred_mutex);
+            goto http_retry;
         }
         kp_send_simple_response(client, 502, "Bad Gateway");
         KP_CLOSESOCK(client);
@@ -1552,25 +1549,27 @@ static void kp_handle_client(kp_forwarder *fw, int client) {
         return;
     }
 
-    for (int attempt = 0; attempt < 3; attempt++) {
+    int https_pool_count = 0;
+    int https_refreshed = 0;
+    pthread_mutex_lock(&fw->cred_mutex);
+    https_pool_count = fw->https_pool.count;
+    pthread_mutex_unlock(&fw->cred_mutex);
+
+https_retry:
+    for (int attempt = 0; attempt < https_pool_count; attempt++) {
         char proxy_host[128];
         int proxy_port = 0;
         pthread_mutex_lock(&fw->cred_mutex);
-        int pick_rc = kp_proxy_pool_pick(&fw->https_pool, proxy_host, sizeof(proxy_host), &proxy_port);
+        int pick_rc = kp_proxy_pool_pick_index(&fw->https_pool, attempt,
+                                               proxy_host, sizeof(proxy_host), &proxy_port);
         pthread_mutex_unlock(&fw->cred_mutex);
         if (pick_rc != 0) {
-            if (attempt == 0 && kp_forwarder_refresh(fw) == 0) continue;
-            kp_send_simple_response(client, 502, "Bad Gateway");
-            KP_CLOSESOCK(client);
-            return;
+            continue;
         }
 
         int up = kp_connect_host(proxy_host, proxy_port, 10000);
         if (up < 0) {
-            if (attempt == 0 && kp_forwarder_refresh(fw) == 0) continue;
-            kp_send_simple_response(client, 502, "Bad Gateway");
-            KP_CLOSESOCK(client);
-            return;
+            continue;
         }
 
         char creq[2048];
@@ -1579,30 +1578,21 @@ static void kp_handle_client(kp_forwarder *fw, int client) {
                                                 qkey_val, sizeof(qkey_val));
         if (cn <= 0 || kp_send_all(up, creq, (size_t)cn) != 0) {
             KP_CLOSESOCK(up);
-            if (attempt == 0 && kp_forwarder_refresh(fw) == 0) continue;
-            kp_send_simple_response(client, 502, "Bad Gateway");
-            KP_CLOSESOCK(client);
-            return;
+            continue;
         }
 
         char resp[2048];
         size_t rgot = 0;
         if (kp_recv_until(up, resp, sizeof(resp), &rgot, 10000) != 0) {
             KP_CLOSESOCK(up);
-            if (attempt == 0 && kp_forwarder_refresh(fw) == 0) continue;
-            kp_send_simple_response(client, 502, "Bad Gateway");
-            KP_CLOSESOCK(client);
-            return;
+            continue;
         }
         int code = kp_parse_status_code(resp, rgot);
         kp_dbg("[fw] queen_https %s:%d CONNECT -> code=%d", proxy_host, proxy_port, code);
 
         if (code == 820 || code == 821) {
             KP_CLOSESOCK(up);
-            if (attempt == 0 && kp_forwarder_refresh(fw) == 0) continue;
-            kp_send_simple_response(client, 502, "Bad Gateway");
-            KP_CLOSESOCK(client);
-            return;
+            continue;
         }
         if (code == 823) {
             KP_CLOSESOCK(up);
@@ -1652,10 +1642,14 @@ static void kp_handle_client(kp_forwarder *fw, int client) {
             return;
         }
         KP_CLOSESOCK(up);
-        if (attempt == 0 && kp_forwarder_refresh(fw) == 0) continue;
-        kp_send_simple_response(client, 502, "Bad Gateway");
-        KP_CLOSESOCK(client);
-        return;
+        continue;
+    }
+    if (!https_refreshed && kp_forwarder_refresh(fw) == 0) {
+        https_refreshed = 1;
+        pthread_mutex_lock(&fw->cred_mutex);
+        https_pool_count = fw->https_pool.count;
+        pthread_mutex_unlock(&fw->cred_mutex);
+        goto https_retry;
     }
     kp_send_simple_response(client, 502, "Bad Gateway");
     KP_CLOSESOCK(client);
