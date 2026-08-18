@@ -48,7 +48,7 @@ jobs:
           TAG: ${{ github.event.inputs.tag }}
         run: |
           set -euo pipefail
-          ./Scripts/update_beta_altstore_source.sh "${{ github.repository }}" "$TAG" "${{ github.ref_name }}"
+          bash ./Scripts/update_beta_altstore_source.sh "${{ github.repository }}" "$TAG" "${{ github.ref_name }}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add AltStore/beta-source.json
