@@ -19,6 +19,7 @@ extern void proxychains_write_log(char *str, ...);
 #include <string.h>
 #include <strings.h>
 #include <sys/time.h>
+#include <poll.h>
 #include <time.h>
 
 // 王卡网关/代理期望的 UA（参考 https://ss.y4cc.cc/txwk 的 wanka 配置）
@@ -28,7 +29,7 @@ extern void proxychains_write_log(char *str, ...);
 static void (*g_kp_dbg_log)(const char *line) = NULL;
 static char g_kp_dbg_recent[8][512];   // 近期诊断环形缓冲（API 失败时回传）
 static int g_kp_dbg_recent_n = 0;
-static int g_kp_dbg_enabled = 0;       // 默认关闭，避免频繁写日志
+static volatile int g_kp_dbg_enabled = 0; // 默认关闭，避免频繁写日志；热路径读取不加锁
 static pthread_mutex_t g_kp_dbg_lock = PTHREAD_MUTEX_INITIALIZER;  // 多线程安全
 
 void kp_set_debug_logger(void (*fn)(const char *line)) {
@@ -38,17 +39,11 @@ void kp_set_debug_logger(void (*fn)(const char *line)) {
 }
 
 void kp_set_debug_enabled(int enabled) {
-    pthread_mutex_lock(&g_kp_dbg_lock);
     g_kp_dbg_enabled = enabled ? 1 : 0;
-    pthread_mutex_unlock(&g_kp_dbg_lock);
 }
 
 int kp_debug_enabled(void) {
-    int enabled;
-    pthread_mutex_lock(&g_kp_dbg_lock);
-    enabled = g_kp_dbg_enabled;
-    pthread_mutex_unlock(&g_kp_dbg_lock);
-    return enabled;
+    return g_kp_dbg_enabled;
 }
 
 void kp_debug_recent(char *out, size_t cap) {
@@ -1173,77 +1168,55 @@ static void kp_http_forward(int up, int client, const char *req, size_t reqlen) 
     }
 }
 
-static void kp_pipe(int a, int b) {
+// 单线程双向泵：用 poll 同时监听两个方向，避免每条 CONNECT 隧道创建 2 个线程。
+// a_to_b/b_to_a 可为 NULL；计数器仅统计成功转发字节数。
+static void kp_pipe_bidirectional_counted(int a, int b,
+                                          uint64_t *a_to_b,
+                                          uint64_t *b_to_a) {
     char buf[16384];
-    ssize_t r;
-    while ((r = recv(a, buf, sizeof(buf), 0)) > 0) {
-        if (kp_send_all(b, buf, (size_t)r) != 0) break;
+    struct pollfd pfds[2];
+    int a_open = 1, b_open = 1;
+
+    while (a_open || b_open) {
+        pfds[0].fd = a_open ? a : -1;
+        pfds[0].events = POLLIN;
+        pfds[1].fd = b_open ? b : -1;
+        pfds[1].events = POLLIN;
+        int n = poll(pfds, 2, -1);
+        if (n <= 0) break;
+
+        if (pfds[0].fd >= 0 && (pfds[0].revents & (POLLIN | POLLHUP | POLLERR))) {
+            ssize_t r = recv(a, buf, sizeof(buf), 0);
+            if (r > 0) {
+                if (kp_send_all(b, buf, (size_t)r) != 0) {
+                    a_open = 0;
+                    b_open = 0;
+                    break;
+                }
+                if (a_to_b) *a_to_b += (uint64_t)r;
+            } else {
+                a_open = 0;
+                shutdown(b, SHUT_WR);
+            }
+        }
+        if (pfds[1].fd >= 0 && (pfds[1].revents & (POLLIN | POLLHUP | POLLERR))) {
+            ssize_t r = recv(b, buf, sizeof(buf), 0);
+            if (r > 0) {
+                if (kp_send_all(a, buf, (size_t)r) != 0) {
+                    a_open = 0;
+                    b_open = 0;
+                    break;
+                }
+                if (b_to_a) *b_to_a += (uint64_t)r;
+            } else {
+                b_open = 0;
+                shutdown(a, SHUT_WR);
+            }
+        }
     }
-    // 单向 EOF 时主动关闭对端，避免另一个方向的 pipe 线程永久阻塞。
+    // 双向结束后确保对端不再等待。
+    shutdown(a, SHUT_RDWR);
     shutdown(b, SHUT_RDWR);
-}
-
-static void *kp_pipe_helper(void *arg) {
-    int *fds = arg;
-    kp_pipe(fds[0], fds[1]);
-    free(fds);
-    return NULL;
-}
-
-static int kp_pipe_up_and_client(int up, int client, pthread_t *t1, pthread_t *t2) {
-    int *fds1 = malloc(2 * sizeof(int));
-    int *fds2 = malloc(2 * sizeof(int));
-    if (!fds1 || !fds2) {
-        free(fds1);
-        free(fds2);
-        return -1;
-    }
-    fds1[0] = client; fds1[1] = up;
-    fds2[0] = up;     fds2[1] = client;
-    if (pthread_create(t1, NULL, kp_pipe_helper, fds1) != 0) { free(fds1); return -1; }
-    if (pthread_create(t2, NULL, kp_pipe_helper, fds2) != 0) { free(fds2); return -1; }
-    return 0;
-}
-
-typedef struct {
-    int from;
-    int to;
-    uint64_t *counter;
-} kp_pipe_counted_arg;
-
-static void kp_pipe_counted(int from, int to, uint64_t *counter) {
-    char buf[16384];
-    ssize_t r;
-    while ((r = recv(from, buf, sizeof(buf), 0)) > 0) {
-        if (kp_send_all(to, buf, (size_t)r) != 0) break;
-        if (counter) *counter += (uint64_t)r;
-    }
-    shutdown(to, SHUT_RDWR);
-}
-
-static void *kp_pipe_counted_helper(void *arg) {
-    kp_pipe_counted_arg *a = (kp_pipe_counted_arg *)arg;
-    kp_pipe_counted(a->from, a->to, a->counter);
-    free(a);
-    return NULL;
-}
-
-static int kp_pipe_up_and_client_counted(int up, int client,
-                                         uint64_t *client_to_up,
-                                         uint64_t *up_to_client,
-                                         pthread_t *t1, pthread_t *t2) {
-    kp_pipe_counted_arg *a1 = malloc(sizeof(kp_pipe_counted_arg));
-    kp_pipe_counted_arg *a2 = malloc(sizeof(kp_pipe_counted_arg));
-    if (!a1 || !a2) {
-        free(a1);
-        free(a2);
-        return -1;
-    }
-    a1->from = client; a1->to = up; a1->counter = client_to_up;
-    a2->from = up;     a2->to = client; a2->counter = up_to_client;
-    if (pthread_create(t1, NULL, kp_pipe_counted_helper, a1) != 0) { free(a1); return -1; }
-    if (pthread_create(t2, NULL, kp_pipe_counted_helper, a2) != 0) { free(a2); return -1; }
-    return 0;
 }
 
 // ---------- Queen 代理池与请求构造 ----------
@@ -1443,40 +1416,107 @@ static void kp_send_simple_response(int client, int code, const char *text) {
     kp_send_all(client, buf, strlen(buf));
 }
 
+// 客户端请求读取器：recv 大块，再从内存缓冲区消费，避免逐字节 recv。
+typedef struct {
+    int fd;
+    char buf[16384 + 1];
+    size_t start;
+    size_t end;
+} kp_reader;
+
+static void kp_reader_init(kp_reader *r, int fd) {
+    r->fd = fd;
+    r->start = 0;
+    r->end = 0;
+}
+
+static int kp_reader_fill(kp_reader *r) {
+    if (r->start < r->end) return 0;
+    r->start = 0;
+    r->end = 0;
+    ssize_t n = recv(r->fd, r->buf, sizeof(r->buf) - 1, 0);
+    if (n <= 0) return -1;
+    r->end = (size_t)n;
+    r->buf[r->end] = '\0';
+    return 0;
+}
+
+// 读取 HTTP 头（到 \r\n\r\n 为止），只消费头部，不消费头部之后的字节。
+// 成功返回 0，header_len 回填头长；失败返回 -1。
+static int kp_reader_read_header(kp_reader *r, char *out, size_t cap, size_t *header_len) {
+    size_t off = 0;
+    while (off + 1 < cap) {
+        if (r->start >= r->end && kp_reader_fill(r) != 0) return -1;
+        char *hay = r->buf + r->start;
+        size_t haylen = r->end - r->start;
+        r->buf[r->end] = '\0';
+        char *sep = strstr(hay, "\r\n\r\n");
+        if (sep) {
+            size_t n = (size_t)(sep - hay) + 4;
+            if (off + n >= cap) return -1;
+            memcpy(out + off, hay, n);
+            r->start += n;
+            *header_len = off + n;
+            return 0;
+        }
+        if (off + haylen >= cap - 1) return -1;
+        memcpy(out + off, hay, haylen);
+        off += haylen;
+        r->start = r->end;
+    }
+    return -1;
+}
+
+static size_t kp_reader_copy(kp_reader *r, char *out, size_t len) {
+    size_t got = 0;
+    while (got < len) {
+        if (r->start >= r->end && kp_reader_fill(r) != 0) break;
+        size_t avail = r->end - r->start;
+        size_t take = len - got;
+        if (take > avail) take = avail;
+        memcpy(out + got, r->buf + r->start, take);
+        r->start += take;
+        got += take;
+    }
+    return got;
+}
+
+// 把 reader 中已缓冲的剩余字节（例如 CONNECT 头之后提前到达的 TLS 数据）发给 fd。
+static int kp_reader_send_available(kp_reader *r, int fd, uint64_t *counter) {
+    size_t avail = r->end - r->start;
+    if (avail == 0) return 0;
+    if (kp_send_all(fd, r->buf + r->start, avail) != 0) return -1;
+    if (counter) *counter += (uint64_t)avail;
+    r->start = r->end;
+    return 0;
+}
+
+
 static void kp_handle_client(kp_forwarder *fw, int client) {
     char reqbuf[4096];
-    size_t off = 0;
-    int found = 0;
-    while (off < sizeof(reqbuf) - 1) {
-        ssize_t r = recv(client, reqbuf + off, 1, 0);
-        if (r <= 0) break;
-        off++;
-        if (off >= 4 && memcmp(reqbuf + off - 4, "\r\n\r\n", 4) == 0) { found = 1; break; }
-    }
-    reqbuf[off] = '\0';
-    if (!found) {
+    kp_reader reader;
+    kp_reader_init(&reader, client);
+
+    size_t header_len = 0;
+    if (kp_reader_read_header(&reader, reqbuf, sizeof(reqbuf), &header_len) != 0) {
         KP_CLOSESOCK(client);
         return;
     }
-    if (off < sizeof(reqbuf) - 1) {
+    size_t off = header_len;
+
+    // Content-Length body：从 reader 缓冲/套接字补齐到 reqbuf，避免逐字节 recv。
+    {
         char *cl = strstr(reqbuf, "Content-Length:");
         if (!cl) cl = strstr(reqbuf, "content-length:");
         if (cl) {
             int clen = atoi(cl + 15);
-            const char *sep = strstr(reqbuf, "\r\n\r\n");
-            size_t already = sep ? (off - (size_t)(sep + 4 - reqbuf)) : 0;
-            if (clen > 0 && already < (size_t)clen && off + (size_t)clen - already < sizeof(reqbuf)) {
-                size_t need = (size_t)clen - already;
-                while (need > 0 && off < sizeof(reqbuf) - 1) {
-                    ssize_t r = recv(client, reqbuf + off, 1, 0);
-                    if (r <= 0) break;
-                    off++;
-                    need--;
-                }
-                reqbuf[off] = '\0';
+            if (clen > 0 && off + (size_t)clen < sizeof(reqbuf)) {
+                size_t got = kp_reader_copy(&reader, reqbuf + off, (size_t)clen);
+                off += got;
             }
         }
     }
+    reqbuf[off] = '\0';
 
     char method[16];
     char host[256];
@@ -1621,10 +1661,8 @@ static void kp_handle_client(kp_forwarder *fw, int client) {
         if (up < 0) { kp_send_simple_response(client, 502, "Bad Gateway"); KP_CLOSESOCK(client); return; }
         const char *ok = "HTTP/1.1 200 Connection Established\r\n\r\n";
         if (kp_send_all(client, ok, strlen(ok)) == 0) {
-            pthread_t t1, t2;
-            if (kp_pipe_up_and_client(up, client, &t1, &t2) == 0) {
-                pthread_join(t1, NULL);
-                pthread_join(t2, NULL);
+            if (kp_reader_send_available(&reader, up, NULL) == 0) {
+                kp_pipe_bidirectional_counted(up, client, NULL, NULL);
             }
         }
         KP_CLOSESOCK(up);
@@ -1693,11 +1731,12 @@ https_retry:
                 KP_CLOSESOCK(client);
                 return;
             }
-            pthread_t t1, t2;
-            if (kp_pipe_up_and_client(dup, client, &t1, &t2) == 0) {
-                pthread_join(t1, NULL);
-                pthread_join(t2, NULL);
+            if (kp_reader_send_available(&reader, dup, NULL) != 0) {
+                KP_CLOSESOCK(dup);
+                KP_CLOSESOCK(client);
+                return;
             }
+            kp_pipe_bidirectional_counted(dup, client, NULL, NULL);
             KP_CLOSESOCK(dup);
             KP_CLOSESOCK(client);
             return;
@@ -1722,11 +1761,12 @@ https_retry:
             }
             uint64_t client_to_up = 0;
             uint64_t up_to_client = up_recv_extra;
-            pthread_t t1, t2;
-            if (kp_pipe_up_and_client_counted(up, client, &client_to_up, &up_to_client, &t1, &t2) == 0) {
-                pthread_join(t1, NULL);
-                pthread_join(t2, NULL);
+            if (kp_reader_send_available(&reader, up, &client_to_up) != 0) {
+                KP_CLOSESOCK(up);
+                KP_CLOSESOCK(client);
+                return;
             }
+            kp_pipe_bidirectional_counted(up, client, &up_to_client, &client_to_up);
             kp_dbg("[fw] CONNECT conn done host=%s:%d client_to_up=%llu up_to_client=%llu",
                    host, port, (unsigned long long)client_to_up, (unsigned long long)up_to_client);
             KP_CLOSESOCK(up);

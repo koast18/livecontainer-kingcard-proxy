@@ -84,10 +84,17 @@ static NSMutableString *gDiag = nil;
     return nil;
 }
 
-+ (NSData *)apiLatestRelease {
++ (NSString *)updateTag {
+    NSString *tag = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"LCProxyUpdateTag"];
+    return tag.length ? tag : nil;
+}
+
++ (NSData *)apiRelease {
+    NSString *tag = [self updateTag];
+    NSString *path = tag ? [NSString stringWithFormat:@"releases/tags/%@", tag] : @"releases/latest";
     NSArray *urls = @[
-        [NSString stringWithFormat:@"https://gh-proxy.com/https://api.github.com/repos/%@/releases/latest", self.repo],
-        [NSString stringWithFormat:@"https://api.github.com/repos/%@/releases/latest", self.repo],
+        [NSString stringWithFormat:@"https://gh-proxy.com/https://api.github.com/repos/%@/%@", self.repo, path],
+        [NSString stringWithFormat:@"https://api.github.com/repos/%@/%@", self.repo, path],
     ];
     for (NSString *u in urls) {
         NSData *d = [self fetchURL:u];
@@ -97,7 +104,7 @@ static NSMutableString *gDiag = nil;
 }
 
 + (NSString *)latestDylibAssetName {
-    NSData *data = [self apiLatestRelease];
+    NSData *data = [self apiRelease];
     if (!data) return nil;
     id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
     if (![obj isKindOfClass:[NSDictionary class]]) return nil;
@@ -136,7 +143,7 @@ static NSMutableString *gDiag = nil;
 }
 
 + (NSString *)downloadURLForAsset:(NSString *)name {
-    NSData *data = [self apiLatestRelease];
+    NSData *data = [self apiRelease];
     if (!data) return nil;
     id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
     if (![obj isKindOfClass:[NSDictionary class]]) return nil;
