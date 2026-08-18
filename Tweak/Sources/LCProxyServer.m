@@ -99,6 +99,15 @@ static const NSUInteger LCProxyDefaultPort = 19092;
     return nil;
 }
 
+- (NSString *)plainTextFromHTML:(NSString *)html {
+    if (!html.length) return @"";
+    NSError *err = nil;
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"<[^>]+>" options:0 error:&err];
+    NSString *s = err ? html : [re stringByReplacingMatchesInString:html options:0 range:NSMakeRange(0, html.length) withTemplate:@" "];
+    s = [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    return s ?: @"";
+}
+
 - (NSDictionary *)proxyTestOne:(NSString *)urlString {
     NSDictionary *settings = [[LCProxyConfig shared] load];
     BOOL enabled = [settings[@"proxyEnabled"] boolValue];
@@ -160,7 +169,8 @@ static const NSUInteger LCProxyDefaultPort = 19092;
     item[@"url"] = urlString ?: @"";
     item[@"rc"] = @(rc);
     item[@"ip"] = ip ?: @"";
-    item[@"body"] = text ? [text substringToIndex:MIN(text.length, 120)] : @"";
+    NSString *body = [self plainTextFromHTML:text];
+    item[@"body"] = body.length > 120 ? [body substringToIndex:120] : body;
     item[@"ok"] = @(ip.length > 0);
     item[@"effectiveMode"] = effectiveMode;
     return item;
@@ -205,7 +215,6 @@ static const NSUInteger LCProxyDefaultPort = 19092;
         @"http://ip.3322.net",
         @"http://ifconfig.me/ip",
         @"http://icanhazip.com",
-        @"http://ip.sb",
         @"http://members.3322.org/dyndns/getip",
         @"http://ip-api.com/line/?fields=query",
         @"http://myip.ipip.net",
@@ -243,7 +252,8 @@ static const NSUInteger LCProxyDefaultPort = 19092;
         item[@"url"] = urlString;
         item[@"rc"] = @(rc);
         item[@"ip"] = ip ?: @"";
-        item[@"body"] = text ? [text substringToIndex:MIN(text.length, 120)] : @"";
+        NSString *body = [self plainTextFromHTML:text];
+        item[@"body"] = body.length > 120 ? [body substringToIndex:120] : body;
         [results addObject:item];
     }
 

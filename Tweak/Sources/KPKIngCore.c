@@ -696,6 +696,8 @@ int kp_fetch_guid_token_via_proxy(const char *upstream_host, int upstream_port,
                                    guid, guid_cap, token, token_cap, timeout_ms, diag);
 }
 
+static int kp_parse_status_code(const char *buf, size_t len);
+
 int kp_http_get_via_proxy(const char *upstream_host, int upstream_port,
                           const char *target_host, int target_port, const char *path,
                           const char *guid, const char *token,
