@@ -17,6 +17,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/time.h>
+#include <time.h>
 
 // 王卡网关/代理期望的 UA（参考 https://ss.y4cc.cc/txwk 的 wanka 配置）
 #define KP_KING_UA "okhttp/3.11.0 Dalvik/2.1.0 (Linux; U; Android 13; Redmi K50 5G Build/RKQ1.200826.002)"
@@ -67,11 +68,21 @@ void kp_debug_recent(char *out, size_t cap) {
 
 void kp_dbg(const char *fmt, ...) {
     if (!kp_debug_enabled()) return;
-    char line[512];
+    char msg[512];
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(line, sizeof(line), fmt, ap);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
+
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    struct tm tmv;
+    localtime_r(&tv.tv_sec, &tmv);
+    char ts[32];
+    strftime(ts, sizeof(ts), "%H:%M:%S", &tmv);
+    char line[768];
+    snprintf(line, sizeof(line), "[%s.%03d] %s", ts, (int)(tv.tv_usec / 1000), msg);
+
     pthread_mutex_lock(&g_kp_dbg_lock);
     if (g_kp_dbg_log) g_kp_dbg_log(line);
     // 环形缓冲：存最近 8 条（满则整体前移）
@@ -1190,6 +1201,47 @@ static int kp_pipe_up_and_client(int up, int client, pthread_t *t1, pthread_t *t
     return 0;
 }
 
+typedef struct {
+    int from;
+    int to;
+    uint64_t *counter;
+} kp_pipe_counted_arg;
+
+static void kp_pipe_counted(int from, int to, uint64_t *counter) {
+    char buf[16384];
+    ssize_t r;
+    while ((r = recv(from, buf, sizeof(buf), 0)) > 0) {
+        if (kp_send_all(to, buf, (size_t)r) != 0) break;
+        if (counter) *counter += (uint64_t)r;
+    }
+    shutdown(to, SHUT_RDWR);
+}
+
+static void *kp_pipe_counted_helper(void *arg) {
+    kp_pipe_counted_arg *a = (kp_pipe_counted_arg *)arg;
+    kp_pipe_counted(a->from, a->to, a->counter);
+    free(a);
+    return NULL;
+}
+
+static int kp_pipe_up_and_client_counted(int up, int client,
+                                         uint64_t *client_to_up,
+                                         uint64_t *up_to_client,
+                                         pthread_t *t1, pthread_t *t2) {
+    kp_pipe_counted_arg *a1 = malloc(sizeof(kp_pipe_counted_arg));
+    kp_pipe_counted_arg *a2 = malloc(sizeof(kp_pipe_counted_arg));
+    if (!a1 || !a2) {
+        free(a1);
+        free(a2);
+        return -1;
+    }
+    a1->from = client; a1->to = up; a1->counter = client_to_up;
+    a2->from = up;     a2->to = client; a2->counter = up_to_client;
+    if (pthread_create(t1, NULL, kp_pipe_counted_helper, a1) != 0) { free(a1); return -1; }
+    if (pthread_create(t2, NULL, kp_pipe_counted_helper, a2) != 0) { free(a2); return -1; }
+    return 0;
+}
+
 // ---------- Queen 代理池与请求构造 ----------
 
 static void kp_proxy_pool_set(kp_proxy_pool *pool, const char *const items[], size_t count) {
@@ -1519,13 +1571,17 @@ static void kp_handle_client(kp_forwarder *fw, int client) {
                 struct timeval zero = {0, 0};
                 setsockopt(up, SOL_SOCKET, SO_RCVTIMEO, &zero, sizeof(zero));
                 setsockopt(up, SOL_SOCKET, SO_SNDTIMEO, &zero, sizeof(zero));
+                uint64_t up_recv = (uint64_t)rgot;
                 if (kp_send_all(client, resp, rgot) == 0) {
                     char buf[16384];
                     ssize_t r;
                     while ((r = recv(up, buf, sizeof(buf), 0)) > 0) {
                         if (kp_send_all(client, buf, (size_t)r) != 0) break;
+                        up_recv += (uint64_t)r;
                     }
                 }
+                kp_dbg("[fw] HTTP conn done host=%s:%d client_bytes=%zu up_sent=%zu up_recv=%llu",
+                       host, port, off, (size_t)qn, (unsigned long long)up_recv);
                 KP_CLOSESOCK(up);
                 KP_CLOSESOCK(client);
                 return;
@@ -1652,16 +1708,23 @@ https_retry:
                 KP_CLOSESOCK(client);
                 return;
             }
-            char *body = strstr(resp, "\r\n\r\n");
+                        char *body = strstr(resp, "\r\n\r\n");
             size_t consumed = body ? (size_t)(body - resp + 4) : rgot;
+            uint64_t up_recv_extra = 0;
             if (consumed < rgot) {
-                kp_send_all(client, resp + consumed, rgot - consumed);
+                size_t extra = rgot - consumed;
+                kp_send_all(client, resp + consumed, extra);
+                up_recv_extra = (uint64_t)extra;
             }
+            uint64_t client_to_up = 0;
+            uint64_t up_to_client = up_recv_extra;
             pthread_t t1, t2;
-            if (kp_pipe_up_and_client(up, client, &t1, &t2) == 0) {
+            if (kp_pipe_up_and_client_counted(up, client, &client_to_up, &up_to_client, &t1, &t2) == 0) {
                 pthread_join(t1, NULL);
                 pthread_join(t2, NULL);
             }
+            kp_dbg("[fw] CONNECT conn done host=%s:%d client_to_up=%llu up_to_client=%llu",
+                   host, port, (unsigned long long)client_to_up, (unsigned long long)up_to_client);
             KP_CLOSESOCK(up);
             KP_CLOSESOCK(client);
             return;
