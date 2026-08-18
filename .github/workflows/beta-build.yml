@@ -1,0 +1,58 @@
+name: Beta Build LiveProxy
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Beta release tag, e.g. v0.5.17-beta.1'
+        required: true
+        default: 'v0.5.17-beta.1'
+
+jobs:
+  beta:
+    runs-on: macos-14
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build beta dylib and IPA
+        env:
+          LC_PROXY_UPDATE_TAG: ${{ github.event.inputs.tag }}
+          LC_PROXY_BETA_BUNDLE_ID: com.liveproxy.console.beta
+        run: |
+          set -euo pipefail
+          ./Scripts/build_all.sh
+
+      - name: Create/update beta GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+          VER="$(cat version.txt | tr -d ' \r\n')"
+          DYLIB="build/LCProxyControl-${VER}.dylib"
+          IPA="build/LiveProxyConsole-${VER}.ipa"
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" "$DYLIB" "$IPA" \
+              --prerelease \
+              --title "LiveProxy ${TAG}" \
+              --notes "Beta test build from branch ${GITHUB_REF_NAME}."
+          else
+            gh release upload "$TAG" "$DYLIB" "$IPA" --clobber
+          fi
+
+      - name: Update beta AltStore source and push
+        env:
+          TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+          ./Scripts/update_beta_altstore_source.sh "${{ github.repository }}" "$TAG" "${{ github.ref_name }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add AltStore/beta-source.json
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: update beta AltStore source for ${TAG}"
+            git push origin HEAD:"${{ github.ref_name }}"
+          fi
