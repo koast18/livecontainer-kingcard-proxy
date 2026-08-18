@@ -52,6 +52,9 @@ th:first-child,td:first-child { text-align:left; }
     <div class="row"><span class="k">调试日志</span>
       <label class="switch"><input type="checkbox" id="debugLogging"><span class="slider"></span></label>
     </div>
+    <div class="row"><span class="k">启动显示代理加载横幅</span>
+      <label class="switch"><input type="checkbox" id="showProxyBanner"><span class="slider"></span></label>
+    </div>
     <div class="row" style="display:block">
       <label class="k">上游模式</label>
       <select id="proxyMode">
@@ -177,6 +180,7 @@ async function loadStatus() {
   $('proxyEnabled').checked = !!s.proxyEnabled;
   $('blockNonTcp').checked = !!s.blockNonTcp;
   $('debugLogging').checked = !!s.debugLogging;
+  $('showProxyBanner').checked = s.showProxyBanner != null ? !!s.showProxyBanner : true;
   $('proxyMode').value = s.proxyMode || 'custom';
   $('proxyType').value = s.proxyType || 'http';
   $('proxyHost').value = s.proxyHost || '';
@@ -209,7 +213,7 @@ async function loadStats() {
   $('buckets').innerHTML = rows || '<tr><td colspan=3 style="text-align:center;color:#8b949e">暂无数据</td></tr>';
 }
 $('proxyMode').onchange = () => { markDirty(); syncModeUI(); };
-['proxyEnabled','blockNonTcp','debugLogging','kingAutoDirectOnNonCellular'].forEach(id => { $(id).addEventListener('change', markDirty); });
+['proxyEnabled','blockNonTcp','debugLogging','showProxyBanner','kingAutoDirectOnNonCellular'].forEach(id => { $(id).addEventListener('change', markDirty); });
 ['proxyType','proxyHost','proxyPort','kingPhone','kingQType','kingMccmnc','kingApn','kingTypeName','kingSubtype','kingExtraInfo','kingCardType'].forEach(id => { $(id).addEventListener('input', markDirty); });
 $('kingRefreshBtn').onclick = async () => {
   $('kingError').textContent = '刷新中…';
@@ -222,6 +226,7 @@ $('saveConfig').onclick = async () => {
     proxyEnabled: $('proxyEnabled').checked,
     blockNonTcp: $('blockNonTcp').checked,
     debugLogging: $('debugLogging').checked,
+    showProxyBanner: $('showProxyBanner').checked,
     proxyMode: $('proxyMode').value,
     proxyType: $('proxyType').value.trim() || 'http',
     proxyHost: $('proxyHost').value.trim(),

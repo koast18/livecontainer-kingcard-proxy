@@ -43,6 +43,7 @@ static const NSTimeInterval LCProxyNetworkMonitorInterval = 2.0;
         @"proxyEnabled": @YES,
         @"blockNonTcp": @NO,
         @"debugLogging": @NO,
+        @"showProxyBanner": @YES,
         @"proxyMode": @"custom",
         @"proxyType": @"http",
         @"proxyHost": @"127.0.0.1",

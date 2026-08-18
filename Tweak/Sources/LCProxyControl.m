@@ -8,6 +8,7 @@
 #import "lcproxy_bridge.h"
 
 static void LCProxyShowBanner(NSDictionary *settings) {
+    if (![settings[@"showProxyBanner"] boolValue]) return;
     BOOL enabled = [settings[@"proxyEnabled"] boolValue];
     NSString *effectiveMode = [[LCProxyConfig shared] effectiveProxyModeForSettings:settings];
     NSString *text = nil;
@@ -65,7 +66,6 @@ static void LCProxyControlConstructor(void) {
                                                       usingBlock:^(NSNotification * _Nonnull note) {
             NSDictionary *settings = [[LCProxyConfig shared] load];
             [[LCProxyConfig shared] applyToRuntime];
-            LCProxyShowBanner(settings);
             NSString *effectiveMode = [[LCProxyConfig shared] effectiveProxyModeForSettings:settings];
             if ([effectiveMode isEqualToString:@"kingcard"] && [settings[@"proxyEnabled"] boolValue]) {
                 [[LCProxyKing shared] refreshCredentials];

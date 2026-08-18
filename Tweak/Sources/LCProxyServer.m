@@ -289,7 +289,7 @@ static const NSUInteger LCProxyDefaultPort = 19092;
                    processBlock:^GCDWebServerResponse *(GCDWebServerRequest *request) {
         NSDictionary *body = [self jsonBody:request];
         NSMutableDictionary *merged = [NSMutableDictionary dictionaryWithDictionary:[[LCProxyConfig shared] load]];
-        for (NSString *key in @[@"proxyEnabled", @"blockNonTcp", @"debugLogging", @"proxyMode", @"proxyType", @"proxyHost", @"proxyPort",
+        for (NSString *key in @[@"proxyEnabled", @"blockNonTcp", @"debugLogging", @"showProxyBanner", @"proxyMode", @"proxyType", @"proxyHost", @"proxyPort",
                                  @"kingUpstreamHost", @"kingUpstreamPort", @"kingRefreshURL", @"kingAutoDirectOnNonCellular",
                                  @"kingGuidOverride", @"kingTokenOverride", @"kingKeyOverride", @"kingPhone", @"kingQType",
                                  @"kingApn", @"kingTypeName", @"kingSubtype", @"kingExtraInfo", @"kingMccmnc", @"kingCardType"]) {
