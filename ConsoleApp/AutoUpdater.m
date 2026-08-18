@@ -179,6 +179,13 @@ static NSMutableString *gDiag = nil;
     }
 }
 
+struct lc_code_signature_command {
+    uint32_t cmd;
+    uint32_t cmdsize;
+    uint32_t dataoff;
+    uint32_t datasize;
+};
+
 static BOOL LCProxyCodeSignatureValid(NSString *path) {
     if (!path.length) return NO;
     int fd = open(path.UTF8String, O_RDONLY);
@@ -190,7 +197,7 @@ static BOOL LCProxyCodeSignatureValid(NSString *path) {
         return NO;
     }
 
-    struct code_signature_command cs = {0};
+    struct lc_code_signature_command cs = {0};
     BOOL found = NO;
     off_t off = (off_t)sizeof(struct mach_header_64);
     for (uint32_t i = 0; i < header.ncmds && i < 64; i++) {
