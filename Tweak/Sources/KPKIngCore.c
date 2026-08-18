@@ -4,6 +4,8 @@
 //
 #include "KPKIngCore.h"
 #include "KPKCrypto.h"
+
+extern void proxychains_write_log(char *str, ...);
 #include "Version.h"
 #include "KPSocketHook.h"
 
@@ -82,6 +84,8 @@ void kp_dbg(const char *fmt, ...) {
     strftime(ts, sizeof(ts), "%H:%M:%S", &tmv);
     char line[768];
     snprintf(line, sizeof(line), "[%s.%03d] %s", ts, (int)(tv.tv_usec / 1000), msg);
+
+    proxychains_write_log("%s\n", line);
 
     pthread_mutex_lock(&g_kp_dbg_lock);
     if (g_kp_dbg_log) g_kp_dbg_log(line);
