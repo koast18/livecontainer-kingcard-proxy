@@ -16,6 +16,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 static int kpq_connect_host(const char *host, int port, int timeout_ms) {
@@ -176,4 +177,18 @@ int kpq_http_body_offset(const uint8_t *resp, size_t resp_len) {
         p++;
     }
     return -1;
+}
+
+
+int kpq_tcp_connect_ms(const char *host, int port, int timeout_ms) {
+    if (!host || port <= 0 || port > 65535) return -1;
+    struct timeval start, end;
+    gettimeofday(&start, NULL);
+    int fd = kpq_connect_host(host, port, timeout_ms);
+    gettimeofday(&end, NULL);
+    if (fd < 0) return -1;
+    close(fd);
+    long long ms = ((long long)end.tv_sec - start.tv_sec) * 1000 + (end.tv_usec - start.tv_usec) / 1000;
+    if (ms < 0) ms = 0;
+    return (int)ms;
 }

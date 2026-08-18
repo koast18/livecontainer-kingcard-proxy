@@ -1,5 +1,6 @@
 #import "LCProxyKing.h"
 #import "KPKIngCore.h"
+#import "KPKQueenCore.h"
 #import "LCProxyPaths.h"
 #import "LCProxyKingClient.h"
 #import "lcproxy_bridge.h"
@@ -281,6 +282,29 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
     return info;
 }
 
+- (int)tcpConnectMsForProxy:(NSString *)proxy {
+    NSArray *parts = [proxy componentsSeparatedByString:@":"];
+    if (parts.count != 2) return -1;
+    int port = [parts[1] intValue];
+    if (port <= 0 || port > 65535) return -1;
+    return kpq_tcp_connect_ms([parts[0] UTF8String], port, 800);
+}
+
+- (NSArray<NSString *> *)proxiesSortedByLatency:(NSArray<NSString *> *)proxies {
+    if (proxies.count <= 1) return proxies;
+    NSMutableArray<NSString *> *items = [proxies mutableCopy];
+    [items sortUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
+        int msA = [self tcpConnectMsForProxy:a];
+        int msB = [self tcpConnectMsForProxy:b];
+        if (msA < 0) msA = INT32_MAX;
+        if (msB < 0) msB = INT32_MAX;
+        if (msA < msB) return NSOrderedAscending;
+        if (msA > msB) return NSOrderedDescending;
+        return NSOrderedSame;
+    }];
+    return items;
+}
+
 - (NSString *)localRandomGuid {
     uint8_t bytes[16];
     arc4random_buf(bytes, sizeof(bytes));
@@ -400,8 +424,8 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
             [self finishRefreshWithState:state success:NO error:[NSString stringWithFormat:@"Queen 代理池获取失败: %@", proxyErr.localizedDescription ?: @"unknown"]];
             return NO;
         }
-        queenHttp = proxyInfo[@"queen_http"];
-        queenHttps = proxyInfo[@"queen_https"];
+        queenHttp = [self proxiesSortedByLatency:proxyInfo[@"queen_http"]];
+        queenHttps = [self proxiesSortedByLatency:proxyInfo[@"queen_https"]];
         state[@"queen_http"] = queenHttp ?: @[];
         state[@"queen_https"] = queenHttps ?: @[];
         double proxyLife = 600.0;

@@ -154,13 +154,15 @@ static const NSTimeInterval LCProxyNetworkMonitorInterval = 2.0;
 - (void)applyToRuntime {
     NSDictionary *s = [self load];
     BOOL enabled = [s[@"proxyEnabled"] boolValue];
-    BOOL block = [s[@"blockNonTcp"] boolValue];
+    NSString *effectiveMode = [self effectiveProxyModeForSettings:s];
+    BOOL proxyActive = enabled && ![effectiveMode isEqualToString:@"direct"];
+    BOOL block = [s[@"blockNonTcp"] boolValue] && proxyActive;
     BOOL debugLogging = [s[@"debugLogging"] boolValue];
     kp_set_debug_enabled(debugLogging ? 1 : 0);
     // Re-read our dedicated proxychains.conf so changes made through the
     // console take effect without restarting the whole process.
     lcproxy_control_reload_config();
-    lcproxy_control_set_enabled(enabled ? 1 : 0);
+    lcproxy_control_set_enabled(proxyActive ? 1 : 0);
     lcproxy_control_set_block_non_tcp(block ? 1 : 0);
     [[LCProxyKing shared] applyConfig:s];
     _lastAppliedCellular = lcproxy_stats_is_cellular() ? 1 : 0;

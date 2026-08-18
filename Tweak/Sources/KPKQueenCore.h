@@ -26,6 +26,9 @@ int kpq_http_header(const uint8_t *resp, size_t resp_len,
 /// 从完整 HTTP 响应中定位 body 起始偏移；无 body 分隔返回 -1。
 int kpq_http_body_offset(const uint8_t *resp, size_t resp_len);
 
+/// 测量 TCP 连接耗时（毫秒），失败返回 -1。不发送任何数据。
+int kpq_tcp_connect_ms(const char *host, int port, int timeout_ms);
+
 #ifdef __cplusplus
 }
 #endif
