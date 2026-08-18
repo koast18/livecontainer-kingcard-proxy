@@ -8,17 +8,17 @@
       "bundleIdentifier": "com.liveproxy.console.beta",
       "developerName": "koast18",
       "version": "0.5.17-beta.1",
-      "versionDate": "2026-08-19T00:00:00Z",
+      "versionDate": "2026-08-19T00:35:00Z",
       "versionDescription": "LiveProxy 测试版控制台：perf/fix-dylib-lag 热路径性能修复。",
       "downloadURL": "https://gh-proxy.com/https://github.com/koast18/livecontainer-kingcard-proxy/releases/download/v0.5.17-beta.1/LiveProxyConsole-0.5.17.ipa",
       "localizedDescription": "测试版控制台 IPA。首次打开会从 GitHub Release v0.5.17-beta.1 自动下载对应的 LCProxyControl dylib。用于验证 dylib 注入后的性能修复。",
       "iconURL": "https://raw.githubusercontent.com/koast18/livecontainer-kingcard-proxy/perf/fix-dylib-lag/AltStore/icon.png",
       "tintColor": "2E7D32",
-      "size": 0,
+      "size": 19335,
       "versions": [
         {
           "version": "0.5.17-beta.1",
-          "date": "2026-08-19T00:00:00Z",
+          "date": "2026-08-19T00:35:00Z",
           "downloadURL": "https://gh-proxy.com/https://github.com/koast18/livecontainer-kingcard-proxy/releases/download/v0.5.17-beta.1/LiveProxyConsole-0.5.17.ipa",
           "localizedDescription": "测试版 v0.5.17-beta.1"
         }
