@@ -2,6 +2,10 @@
 #import <stdlib.h>
 #import <stdarg.h>
 #import <objc/message.h>
+#import <unistd.h>
+#import <fcntl.h>
+#import <sys/stat.h>
+#import <mach-o/loader.h>
 
 static BOOL gDownloadedNew = NO;
 static NSMutableString *gDiag = nil;
@@ -175,34 +179,74 @@ static NSMutableString *gDiag = nil;
     }
 }
 
-+ (NSArray<NSString *> *)tweakDirectories {
-    NSMutableArray<NSString *> *dirs = [NSMutableArray array];
-    NSString *root = [self lcRootDirectory];
-    if (root) [dirs addObject:[root stringByAppendingPathComponent:@"Tweaks"]];
+static BOOL LCProxyCodeSignatureValid(NSString *path) {
+    if (!path.length) return NO;
+    int fd = open(path.UTF8String, O_RDONLY);
+    if (fd < 0) return NO;
 
-    // 共享 App 模式使用 App Group 下 LiveContainer/Tweaks 的子文件夹。
-    // 根目录里的 dylib 可能不会被 LiveContainer 签名；放到子文件夹后，
-    // 用户在共享 App 设置里选择该文件夹即可触发签名。
-    Class lcSharedUtils = NSClassFromString(@"LCSharedUtils");
-    if (lcSharedUtils) {
-        SEL sel = NSSelectorFromString(@"appGroupID");
-        NSString *groupID = ((NSString *(*)(id, SEL))objc_msgSend)(lcSharedUtils, sel);
-        if ([groupID isKindOfClass:[NSString class]] && groupID.length) {
-            NSURL *groupURL = [[NSFileManager defaultManager] containerURLForSecurityApplicationGroupIdentifier:groupID];
-            if (groupURL) {
-                NSString *sharedRoot = [[groupURL URLByAppendingPathComponent:@"LiveContainer/Tweaks"] path];
-                [dirs addObject:[sharedRoot stringByAppendingPathComponent:@"LCProxyControl"]];
-                // 清理共享根目录里未签名的旧 dylib，避免 TweakLoader 直接加载报签名错误。
-                [self cleanOldDylibsIn:sharedRoot keep:nil];
+    struct mach_header_64 header;
+    if (read(fd, &header, sizeof(header)) != (ssize_t)sizeof(header) || header.magic != MH_MAGIC_64) {
+        close(fd);
+        return NO;
+    }
+
+    struct code_signature_command cs = {0};
+    BOOL found = NO;
+    off_t off = (off_t)sizeof(struct mach_header_64);
+    for (uint32_t i = 0; i < header.ncmds && i < 64; i++) {
+        struct load_command lc = {0};
+        if (lseek(fd, off, SEEK_SET) == -1) break;
+        if (read(fd, &lc, sizeof(lc)) != (ssize_t)sizeof(lc)) break;
+        if (lc.cmd == LC_CODE_SIGNATURE && lc.cmdsize >= sizeof(cs)) {
+            if (lseek(fd, off, SEEK_SET) != -1 && read(fd, &cs, sizeof(cs)) == (ssize_t)sizeof(cs)) {
+                found = YES;
             }
+            break;
         }
+        off += lc.cmdsize;
     }
 
-    NSMutableArray<NSString *> *out = [NSMutableArray array];
-    for (NSString *d in dirs) {
-        if (d.length && ![out containsObject:d]) [out addObject:d];
+    if (!found || cs.dataoff == 0 || cs.datasize == 0) {
+        close(fd);
+        return NO;
     }
-    return out;
+
+    fsignatures_t siginfo;
+    memset(&siginfo, 0, sizeof(siginfo));
+    siginfo.fs_file_start = 0;
+    siginfo.fs_blob_start = (void *)(long)cs.dataoff;
+    siginfo.fs_blob_size = cs.datasize;
+    if (fcntl(fd, F_ADDFILESIGS_RETURN, &siginfo) == -1) {
+        close(fd);
+        return NO;
+    }
+
+    char messageBuffer[512];
+    messageBuffer[0] = '\0';
+    fchecklv_t checkInfo;
+    memset(&checkInfo, 0, sizeof(checkInfo));
+    checkInfo.lv_error_message_size = sizeof(messageBuffer);
+    checkInfo.lv_error_message = messageBuffer;
+    checkInfo.lv_file_start = 0;
+    int checkResult = fcntl(fd, F_CHECK_LV, &checkInfo);
+    close(fd);
+    return checkResult == 0;
+}
+
++ (NSString *)normalTweaksDirectory {
+    NSString *root = [self lcRootDirectory];
+    return root ? [root stringByAppendingPathComponent:@"Tweaks"] : nil;
+}
+
++ (NSString *)sharedTweaksDirectory {
+    Class lcSharedUtils = NSClassFromString(@"LCSharedUtils");
+    if (!lcSharedUtils) return nil;
+    SEL sel = NSSelectorFromString(@"appGroupID");
+    NSString *groupID = ((NSString *(*)(id, SEL))objc_msgSend)(lcSharedUtils, sel);
+    if (![groupID isKindOfClass:[NSString class]] || groupID.length == 0) return nil;
+    NSURL *groupURL = [[NSFileManager defaultManager] containerURLForSecurityApplicationGroupIdentifier:groupID];
+    if (!groupURL) return nil;
+    return [[groupURL URLByAppendingPathComponent:@"LiveContainer/Tweaks"] path];
 }
 
 + (NSString *)runAutoUpdateWithProgress:(KPAutoUpdateProgress)progress {
@@ -211,15 +255,18 @@ static NSMutableString *gDiag = nil;
         if (progress) progress(s, f);
     };
     stage(@"定位 LiveContainer Tweaks 目录…", -1);
-    NSArray<NSString *> *tweakDirs = [self tweakDirectories];
-    if (tweakDirs.count == 0) {
-        NSString *msg = @"无法定位 LiveContainer Tweaks 目录（普通目录和共享 App 目录均不可写）。";
+    NSString *normalTweaks = [self normalTweaksDirectory];
+    NSString *sharedTweaks = [self sharedTweaksDirectory];
+    if (!normalTweaks) {
+        NSString *msg = @"无法定位 LiveContainer Tweaks 目录（LC_HOME_PATH 不可写）。";
         [self diag:msg];
         return [self diagnostics];
     }
-    for (NSString *dir in tweakDirs) {
-        [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
-        [self diag:@"[目录] %@", dir];
+    [[NSFileManager defaultManager] createDirectoryAtPath:normalTweaks withIntermediateDirectories:YES attributes:nil error:nil];
+    [self diag:@"[目录] 普通 Tweaks: %@", normalTweaks];
+    if (sharedTweaks) {
+        [[NSFileManager defaultManager] createDirectoryAtPath:sharedTweaks withIntermediateDirectories:YES attributes:nil error:nil];
+        [self diag:@"[目录] 共享 App Tweaks: %@", sharedTweaks];
     }
 
     stage(@"检查最新版本…", -1);
@@ -229,34 +276,54 @@ static NSMutableString *gDiag = nil;
         return [self diagnostics];
     }
 
-    NSString *firstDst = [tweakDirs[0] stringByAppendingPathComponent:asset];
-    if (![[NSFileManager defaultManager] fileExistsAtPath:firstDst]) {
+    NSString *normalDst = [normalTweaks stringByAppendingPathComponent:asset];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:normalDst]) {
         stage([NSString stringWithFormat:@"下载 %@…", asset], -1);
-        if (![self downloadAsset:asset toDirectory:tweakDirs[0]]) {
+        if (![self downloadAsset:asset toDirectory:normalTweaks]) {
             [self diag:@"下载失败。"];
             return [self diagnostics];
         }
         gDownloadedNew = YES;
     } else {
-        [self diag:@"已是最新：%@", asset];
+        [self diag:@"普通 Tweaks 已存在：%@", asset];
     }
 
-    // 复制到其它 Tweaks 目录（普通目录 + 共享 App 目录）。
-    for (NSUInteger i = 1; i < tweakDirs.count; i++) {
-        NSString *dst = [tweakDirs[i] stringByAppendingPathComponent:asset];
-        NSError *err = nil;
-        if (![[NSFileManager defaultManager] fileExistsAtPath:dst]) {
-            if (![[NSFileManager defaultManager] copyItemAtPath:firstDst toPath:dst error:&err]) {
-                [self diag:@"[复制] 到 %@ 失败: %@", dst, err.localizedDescription ?: @"?"];
+    // 只复制用户已签名的 dylib 到共享 App 目录。
+    BOOL normalSigned = LCProxyCodeSignatureValid(normalDst);
+    if (normalSigned) {
+        [self diag:@"[签名] %@ 已签名", asset];
+        if (sharedTweaks) {
+            NSString *sharedDst = [sharedTweaks stringByAppendingPathComponent:asset];
+            BOOL sharedExists = [[NSFileManager defaultManager] fileExistsAtPath:sharedDst];
+            BOOL sharedSigned = sharedExists && LCProxyCodeSignatureValid(sharedDst);
+            if (!sharedSigned) {
+                NSError *err = nil;
+                if (sharedExists) [[NSFileManager defaultManager] removeItemAtPath:sharedDst error:&err];
+                if ([[NSFileManager defaultManager] copyItemAtPath:normalDst toPath:sharedDst error:&err]) {
+                    [self diag:@"[复制] 已签名 dylib -> 共享 App: %@", sharedDst];
+                    gDownloadedNew = YES;
+                } else {
+                    [self diag:@"[复制] 到共享 App 失败: %@", err.localizedDescription ?: @"?"];
+                }
             } else {
-                [self diag:@"[复制] %@", dst];
-                gDownloadedNew = YES;
+                [self diag:@"共享 App 已有已签名 dylib：%@", asset];
             }
         }
+    } else {
+        [self diag:@"[签名] %@ 尚未签名。请在 LiveContainer 的 Tweaks 页签名后重新打开本控制台。", asset];
     }
 
-    for (NSString *dir in tweakDirs) {
-        [self cleanOldDylibsIn:dir keep:asset];
+    // 清理旧版本和未签名副本。
+    [self cleanOldDylibsIn:normalTweaks keep:asset];
+    if (sharedTweaks) {
+        // 共享目录只保留已签名的当前版本。
+        NSString *sharedDst = [sharedTweaks stringByAppendingPathComponent:asset];
+        BOOL sharedSigned = [[NSFileManager defaultManager] fileExistsAtPath:sharedDst] && LCProxyCodeSignatureValid(sharedDst);
+        [self cleanOldDylibsIn:sharedTweaks keep:sharedSigned ? asset : nil];
+    }
+
+    if (!normalSigned) {
+        [self diag:@"请完成 dylib 签名后重新打开本控制台。"];
     }
     return [self diagnostics];
 }
