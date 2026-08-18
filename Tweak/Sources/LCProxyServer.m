@@ -130,17 +130,10 @@ static const NSUInteger LCProxyDefaultPort = 19092;
         return @{@"url": urlString ?: @"", @"rc": @(-1), @"ip": @"", @"body": @"代理未启用或代理地址无效", @"ok": @NO};
     }
 
-    // 王卡模式：先确保转发器在运行，再确保本地有 GUID/TOKEN。
+    // 王卡模式：确保转发器运行且凭证已加载（等待正在进行的刷新完成）。
     // 如果自动直连已生效，则不需要本地转发器参与 IP 测试。
     if (enabled && [mode isEqualToString:@"kingcard"] && ![effectiveMode isEqualToString:@"direct"]) {
-        NSDictionary *kingStatus = [[LCProxyKing shared] status];
-        if (![kingStatus[@"running"] boolValue]) {
-            [[LCProxyKing shared] applyConfig:settings];
-        }
-        kingStatus = [[LCProxyKing shared] status];
-        if (![kingStatus[@"lastRefreshSuccess"] boolValue]) {
-            [[LCProxyKing shared] refreshCredentials];
-        }
+        [[LCProxyKing shared] ensureCredentialsReady];
     }
 
     NSURL *url = [NSURL URLWithString:urlString];
@@ -198,17 +191,9 @@ static const NSUInteger LCProxyDefaultPort = 19092;
         return @{@"ok": @NO, @"error": @"代理未启用或代理地址无效", @"results": @[]};
     }
 
-    // 王卡模式：先确保转发器在运行，再确保本地有 GUID/TOKEN。
-    // 如果转发器没起来，单纯 refreshCredentials 不会创建转发器。
+    // 王卡模式：确保转发器运行且凭证已加载（等待正在进行的刷新完成）。
     if (enabled && [mode isEqualToString:@"kingcard"] && ![effectiveMode isEqualToString:@"direct"]) {
-        NSDictionary *kingStatus = [[LCProxyKing shared] status];
-        if (![kingStatus[@"running"] boolValue]) {
-            [[LCProxyKing shared] applyConfig:settings];
-        }
-        kingStatus = [[LCProxyKing shared] status];
-        if (![kingStatus[@"lastRefreshSuccess"] boolValue]) {
-            [[LCProxyKing shared] refreshCredentials];
-        }
+        [[LCProxyKing shared] ensureCredentialsReady];
     }
 
     NSArray<NSString *> *sources = @[

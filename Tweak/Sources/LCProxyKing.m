@@ -108,6 +108,7 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
         if (kp_forwarder_start(fw) == 0) {
             self.forwarder = fw;
             [self.lock unlock];
+            [self loadCachedStateIntoForwarder];
             [self startRefreshTimer];
             dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
                 [self refreshCredentials];
@@ -142,6 +143,65 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
         dispatch_source_cancel(self.refreshTimer);
         self.refreshTimer = nil;
     }
+}
+
+- (void)loadCachedStateIntoForwarder {
+    NSMutableDictionary *state = [self loadState];
+    NSString *guid = [state[@"guid"] isKindOfClass:[NSString class]] ? state[@"guid"] : nil;
+    NSString *token = [state[@"token"] isKindOfClass:[NSString class]] ? state[@"token"] : nil;
+    NSString *qkey = [state[@"key"] isKindOfClass:[NSString class]] ? state[@"key"] : nil;
+    NSString *qua2 = [state[@"qua2"] isKindOfClass:[NSString class]] ? state[@"qua2"] : nil;
+    NSArray *queenHttp = [state[@"queen_http"] isKindOfClass:[NSArray class]] ? state[@"queen_http"] : nil;
+    NSArray *queenHttps = [state[@"queen_https"] isKindOfClass:[NSArray class]] ? state[@"queen_https"] : nil;
+    if (!guid.length || !token.length || !qkey.length || !qua2.length) return;
+    if (!queenHttp.count && !queenHttps.count) return;
+
+    [self.lock lock];
+    if (self.forwarder) {
+        NSInteger nhttp = MIN(queenHttp.count, 32);
+        NSInteger nhttps = MIN(queenHttps.count, 32);
+        const char **httpArr = nhttp > 0 ? (const char **)calloc((size_t)nhttp, sizeof(char *)) : NULL;
+        const char **httpsArr = nhttps > 0 ? (const char **)calloc((size_t)nhttps, sizeof(char *)) : NULL;
+        for (NSInteger i = 0; i < nhttp; i++) httpArr[i] = [queenHttp[(NSUInteger)i] UTF8String];
+        for (NSInteger i = 0; i < nhttps; i++) httpsArr[i] = [queenHttps[(NSUInteger)i] UTF8String];
+        kp_forwarder_set_king_state(self.forwarder,
+                                    guid.UTF8String, qua2.UTF8String,
+                                    token.UTF8String, qkey.UTF8String,
+                                    "httpcom",
+                                    httpArr, (size_t)nhttp,
+                                    httpsArr, (size_t)nhttps);
+        if (httpArr) free(httpArr);
+        if (httpsArr) free(httpsArr);
+        self.lastRefreshSuccess = YES;
+        self.lastRefresh = LCProxyKingNow();
+        self.lastError = @"";
+    }
+    [self.lock unlock];
+}
+
+- (BOOL)ensureCredentialsReady {
+    for (int i = 0; i < 60; i++) {
+        [self.lock lock];
+        BOOL refreshing = self.refreshing;
+        BOOL running = self.forwarder != NULL && kp_forwarder_is_running(self.forwarder) == 1;
+        BOOL success = self.lastRefreshSuccess;
+        [self.lock unlock];
+
+        if (running && success) return YES;
+
+        if (!refreshing) {
+            NSDictionary *settings = [self settingsSnapshot];
+            [self applyConfig:settings];
+            BOOL ok = [self refreshCredentials];
+            if (ok) return YES;
+        }
+        [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.25]];
+    }
+    [self.lock lock];
+    BOOL running = self.forwarder != NULL && kp_forwarder_is_running(self.forwarder) == 1;
+    BOOL success = self.lastRefreshSuccess;
+    [self.lock unlock];
+    return running && success;
 }
 
 // ---------------------------------------------------------------------------
