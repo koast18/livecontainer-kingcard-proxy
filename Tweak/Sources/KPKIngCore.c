@@ -708,35 +708,64 @@ int kp_http_get_via_proxy(const char *upstream_host, int upstream_port,
            guid && guid[0] ? guid[0] : '?', token && token[0] ? token[0] : '?');
     if (!upstream_host || !target_host) { kp_dbg("[ipcheck] 参数缺失"); return -1; }
     if (out && out_cap > 0) out[0] = '\0';
-    struct proxy_ctx ctx = { upstream_host, upstream_port, guid, token };
-    int fd = kp_open_via_proxy(target_host, target_port, timeout_ms, &ctx);
-    if (fd < 0) return -1;
-    char req[512];
-    snprintf(req, sizeof(req),
-             "GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: " KPTWEAK_UA "\r\nAccept: text/plain\r\nConnection: close\r\n\r\n",
-             path, target_host);
-    int rc = -1;
-    if (kp_send_all(fd, req, strlen(req)) == 0) {
-        char buf[4096];
-        size_t got = 0;
-        if (kp_recv_response(fd, buf, sizeof(buf), &got) == 0) {
-            char body[2048];
-            size_t blen = 0;
-            kp_fetch_diag d;
-            kp_fetch_diag_init(&d);
-            if (kp_parse_http_response(buf, got, body, sizeof(body), &blen, &d) == 0) {
-                if (out && out_cap > 0) {
-                    size_t cp = blen < out_cap - 1 ? blen : out_cap - 1;
-                    memcpy(out, body, cp);
-                    out[cp] = '\0';
+
+    char cur_host[256];
+    int cur_port = target_port;
+    char cur_path[512];
+    snprintf(cur_host, sizeof(cur_host), "%s", target_host);
+    snprintf(cur_path, sizeof(cur_path), "%s", path ? path : "/");
+
+    for (int hop = 0; hop < 4; hop++) {
+        struct proxy_ctx ctx = { upstream_host, upstream_port, guid, token };
+        int fd = kp_open_via_proxy(cur_host, cur_port, timeout_ms, &ctx);
+        if (fd < 0) return -1;
+        char req[512];
+        snprintf(req, sizeof(req),
+                 "GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: " KPTWEAK_UA "\r\nAccept: text/plain\r\nConnection: close\r\n\r\n",
+                 cur_path, cur_host);
+        int rc = -1;
+        if (kp_send_all(fd, req, strlen(req)) == 0) {
+            char buf[4096];
+            size_t got = 0;
+            if (kp_recv_response(fd, buf, sizeof(buf), &got) == 0) {
+                int code = kp_parse_status_code(buf, got);
+                if (code >= 200 && code < 300) {
+                    char body[2048];
+                    size_t blen = 0;
+                    kp_fetch_diag d;
+                    kp_fetch_diag_init(&d);
+                    if (kp_parse_http_response(buf, got, body, sizeof(body), &blen, &d) == 0) {
+                        if (out && out_cap > 0) {
+                            size_t cp = blen < out_cap - 1 ? blen : out_cap - 1;
+                            memcpy(out, body, cp);
+                            out[cp] = '\0';
+                        }
+                        rc = 0;
+                    }
+                } else if (code >= 300 && code < 400) {
+                    char loc[256];
+                    kp_header_value(buf, got, "location", loc, sizeof(loc));
+                    if (strncmp(loc, "http://", 7) == 0) {
+                        char rhost[256];
+                        int rport = 80;
+                        const char *rpath = NULL;
+                        if (kp_parse_url(loc, rhost, sizeof(rhost), &rport, &rpath) == 0) {
+                            snprintf(cur_host, sizeof(cur_host), "%s", rhost);
+                            cur_port = rport;
+                            snprintf(cur_path, sizeof(cur_path), "%s", rpath ? rpath : "/");
+                            KP_CLOSESOCK(fd);
+                            continue;
+                        }
+                    }
                 }
-                rc = 0;
             }
         }
+        KP_CLOSESOCK(fd);
+        kp_dbg("[ipcheck] 完成: rc=%d out=%.40s", rc, out && out[0] ? out : "(空)");
+        return rc;
     }
-    KP_CLOSESOCK(fd);
-    kp_dbg("[ipcheck] 完成: rc=%d out=%.40s", rc, out && out[0] ? out : "(空)");
-    return rc;
+    kp_dbg("[ipcheck] 完成: 重定向过多");
+    return -1;
 }
 
 int kp_http_get_direct(const char *target_host, int target_port, const char *path,
@@ -744,34 +773,63 @@ int kp_http_get_direct(const char *target_host, int target_port, const char *pat
     kp_dbg("[ipcheck/direct] 入口: 目标=%s:%d%s", target_host ? target_host : "(null)", target_port, path ? path : "");
     if (!target_host) { kp_dbg("[ipcheck/direct] 参数缺失"); return -1; }
     if (out && out_cap > 0) out[0] = '\0';
-    int fd = kp_connect_host(target_host, target_port, timeout_ms);
-    if (fd < 0) return -1;
-    char req[512];
-    snprintf(req, sizeof(req),
-             "GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: " KPTWEAK_UA "\r\nAccept: text/plain\r\nConnection: close\r\n\r\n",
-             path ? path : "/", target_host);
-    int rc = -1;
-    if (kp_send_all(fd, req, strlen(req)) == 0) {
-        char buf[4096];
-        size_t got = 0;
-        if (kp_recv_response(fd, buf, sizeof(buf), &got) == 0) {
-            char body[2048];
-            size_t blen = 0;
-            kp_fetch_diag d;
-            kp_fetch_diag_init(&d);
-            if (kp_parse_http_response(buf, got, body, sizeof(body), &blen, &d) == 0) {
-                if (out && out_cap > 0) {
-                    size_t cp = blen < out_cap - 1 ? blen : out_cap - 1;
-                    memcpy(out, body, cp);
-                    out[cp] = '\0';
+
+    char cur_host[256];
+    int cur_port = target_port;
+    char cur_path[512];
+    snprintf(cur_host, sizeof(cur_host), "%s", target_host);
+    snprintf(cur_path, sizeof(cur_path), "%s", path ? path : "/");
+
+    for (int hop = 0; hop < 4; hop++) {
+        int fd = kp_connect_host(cur_host, cur_port, timeout_ms);
+        if (fd < 0) return -1;
+        char req[512];
+        snprintf(req, sizeof(req),
+                 "GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: " KPTWEAK_UA "\r\nAccept: text/plain\r\nConnection: close\r\n\r\n",
+                 cur_path, cur_host);
+        int rc = -1;
+        if (kp_send_all(fd, req, strlen(req)) == 0) {
+            char buf[4096];
+            size_t got = 0;
+            if (kp_recv_response(fd, buf, sizeof(buf), &got) == 0) {
+                int code = kp_parse_status_code(buf, got);
+                if (code >= 200 && code < 300) {
+                    char body[2048];
+                    size_t blen = 0;
+                    kp_fetch_diag d;
+                    kp_fetch_diag_init(&d);
+                    if (kp_parse_http_response(buf, got, body, sizeof(body), &blen, &d) == 0) {
+                        if (out && out_cap > 0) {
+                            size_t cp = blen < out_cap - 1 ? blen : out_cap - 1;
+                            memcpy(out, body, cp);
+                            out[cp] = '\0';
+                        }
+                        rc = 0;
+                    }
+                } else if (code >= 300 && code < 400) {
+                    char loc[256];
+                    kp_header_value(buf, got, "location", loc, sizeof(loc));
+                    if (strncmp(loc, "http://", 7) == 0) {
+                        char rhost[256];
+                        int rport = 80;
+                        const char *rpath = NULL;
+                        if (kp_parse_url(loc, rhost, sizeof(rhost), &rport, &rpath) == 0) {
+                            snprintf(cur_host, sizeof(cur_host), "%s", rhost);
+                            cur_port = rport;
+                            snprintf(cur_path, sizeof(cur_path), "%s", rpath ? rpath : "/");
+                            KP_CLOSESOCK(fd);
+                            continue;
+                        }
+                    }
                 }
-                rc = 0;
             }
         }
+        KP_CLOSESOCK(fd);
+        kp_dbg("[ipcheck/direct] 完成: rc=%d out=%.40s", rc, out && out[0] ? out : "(空)");
+        return rc;
     }
-    KP_CLOSESOCK(fd);
-    kp_dbg("[ipcheck/direct] 完成: rc=%d out=%.40s", rc, out && out[0] ? out : "(空)");
-    return rc;
+    kp_dbg("[ipcheck/direct] 完成: 重定向过多");
+    return -1;
 }
 
 int kp_fetch_guid_token_best(const char *refresh_url,
