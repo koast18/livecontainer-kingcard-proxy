@@ -1,6 +1,7 @@
 #import "AutoUpdater.h"
 #import <stdlib.h>
 #import <stdarg.h>
+#import <objc/message.h>
 
 static BOOL gDownloadedNew = NO;
 static NSMutableString *gDiag = nil;
@@ -174,20 +175,47 @@ static NSMutableString *gDiag = nil;
     }
 }
 
++ (NSArray<NSString *> *)tweakDirectories {
+    NSMutableArray<NSString *> *dirs = [NSMutableArray array];
+    NSString *root = [self lcRootDirectory];
+    if (root) [dirs addObject:[root stringByAppendingPathComponent:@"Tweaks"]];
+
+    // 共享 App 模式使用 App Group 下的 LiveContainer/Tweaks。
+    Class lcSharedUtils = NSClassFromString(@"LCSharedUtils");
+    if (lcSharedUtils) {
+        SEL sel = NSSelectorFromString(@"appGroupID");
+        NSString *groupID = ((NSString *(*)(id, SEL))objc_msgSend)(lcSharedUtils, sel);
+        if ([groupID isKindOfClass:[NSString class]] && groupID.length) {
+            NSURL *groupURL = [[NSFileManager defaultManager] containerURLForSecurityApplicationGroupIdentifier:groupID];
+            if (groupURL) {
+                [dirs addObject:[[groupURL URLByAppendingPathComponent:@"LiveContainer/Tweaks"] path]];
+            }
+        }
+    }
+
+    NSMutableArray<NSString *> *out = [NSMutableArray array];
+    for (NSString *d in dirs) {
+        if (d.length && ![out containsObject:d]) [out addObject:d];
+    }
+    return out;
+}
+
 + (NSString *)runAutoUpdateWithProgress:(KPAutoUpdateProgress)progress {
     [self reset];
     void (^stage)(NSString *, double) = ^(NSString *s, double f) {
         if (progress) progress(s, f);
     };
-    stage(@"定位 LiveContainer 共享目录…", -1);
-    NSString *root = [self lcRootDirectory];
-    if (!root) {
-        NSString *msg = @"无法定位 LiveContainer 共享目录（LC_HOME_PATH 不可写）。";
+    stage(@"定位 LiveContainer Tweaks 目录…", -1);
+    NSArray<NSString *> *tweakDirs = [self tweakDirectories];
+    if (tweakDirs.count == 0) {
+        NSString *msg = @"无法定位 LiveContainer Tweaks 目录（普通目录和共享 App 目录均不可写）。";
         [self diag:msg];
         return [self diagnostics];
     }
-    NSString *tweaks = [root stringByAppendingPathComponent:@"Tweaks"];
-    [[NSFileManager defaultManager] createDirectoryAtPath:tweaks withIntermediateDirectories:YES attributes:nil error:nil];
+    for (NSString *dir in tweakDirs) {
+        [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+        [self diag:@"[目录] %@", dir];
+    }
 
     stage(@"检查最新版本…", -1);
     NSString *asset = [self latestDylibAssetName];
@@ -195,19 +223,36 @@ static NSMutableString *gDiag = nil;
         [self diag:@"未找到可下载的 dylib 资产（请检查 Release 是否已构建）。"];
         return [self diagnostics];
     }
-    NSString *dst = [tweaks stringByAppendingPathComponent:asset];
-    if ([[NSFileManager defaultManager] fileExistsAtPath:dst]) {
+
+    NSString *firstDst = [tweakDirs[0] stringByAppendingPathComponent:asset];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:firstDst]) {
+        stage([NSString stringWithFormat:@"下载 %@…", asset], -1);
+        if (![self downloadAsset:asset toDirectory:tweakDirs[0]]) {
+            [self diag:@"下载失败。"];
+            return [self diagnostics];
+        }
+        gDownloadedNew = YES;
+    } else {
         [self diag:@"已是最新：%@", asset];
-        return [self diagnostics];
     }
 
-    stage([NSString stringWithFormat:@"下载 %@…", asset], -1);
-    if (![self downloadAsset:asset toDirectory:tweaks]) {
-        [self diag:@"下载失败。"];
-        return [self diagnostics];
+    // 复制到其它 Tweaks 目录（普通目录 + 共享 App 目录）。
+    for (NSUInteger i = 1; i < tweakDirs.count; i++) {
+        NSString *dst = [tweakDirs[i] stringByAppendingPathComponent:asset];
+        NSError *err = nil;
+        if (![[NSFileManager defaultManager] fileExistsAtPath:dst]) {
+            if (![[NSFileManager defaultManager] copyItemAtPath:firstDst toPath:dst error:&err]) {
+                [self diag:@"[复制] 到 %@ 失败: %@", dst, err.localizedDescription ?: @"?"];
+            } else {
+                [self diag:@"[复制] %@", dst];
+                gDownloadedNew = YES;
+            }
+        }
     }
-    gDownloadedNew = YES;
-    [self cleanOldDylibsIn:tweaks keep:asset];
+
+    for (NSString *dir in tweakDirs) {
+        [self cleanOldDylibsIn:dir keep:asset];
+    }
     return [self diagnostics];
 }
 
