@@ -65,6 +65,11 @@
 }
 
 - (NSDictionary *)snapshotForCurrentProcess {
+    // 先取 current，强制把上一时间片转入 buckets，再读 bucket 列表。
+    int64_t cstart = 0;
+    uint64_t cup = 0, cdown = 0;
+    lcproxy_stats_get_current(&cstart, &cup, &cdown);
+
     int count = lcproxy_stats_bucket_count();
     NSMutableArray *buckets = [NSMutableArray arrayWithCapacity:count];
     for (int i = 0; i < count; i++) {
@@ -78,9 +83,6 @@
             }];
         }
     }
-    int64_t cstart = 0;
-    uint64_t cup = 0, cdown = 0;
-    lcproxy_stats_get_current(&cstart, &cup, &cdown);
     return @{
         @"bundleId": self.currentBundleId,
         @"updatedAt": @([[NSDate date] timeIntervalSince1970]),
