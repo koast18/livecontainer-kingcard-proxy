@@ -188,6 +188,17 @@ int kp_forwarder_is_running(kp_forwarder *fw);
 /// 监听端口。
 int kp_forwarder_port(kp_forwarder *fw);
 
+/// 转发器诊断统计。
+typedef struct {
+    uint64_t http_requests;
+    uint64_t https_connects;
+    uint64_t direct_fallbacks;
+    uint64_t refresh_calls;
+    uint64_t proxy_errors;
+} kp_forwarder_stats;
+
+void kp_forwarder_get_stats(kp_forwarder *fw, kp_forwarder_stats *stats);
+
 // ---------- 调试日志 ----------
 /// 宿主注册日志回调（每步网络操作都会输出，真机调试用）
 void kp_set_debug_logger(void (*fn)(const char *line));

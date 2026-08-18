@@ -499,6 +499,15 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
     }
     d[@"queenHttpCount"] = @([state[@"queen_http"] count]);
     d[@"queenHttpsCount"] = @([state[@"queen_https"] count]);
+    if (self.forwarder) {
+        kp_forwarder_stats stats;
+        kp_forwarder_get_stats(self.forwarder, &stats);
+        d[@"statHttpRequests"] = @(stats.http_requests);
+        d[@"statHttpsConnects"] = @(stats.https_connects);
+        d[@"statDirectFallbacks"] = @(stats.direct_fallbacks);
+        d[@"statRefreshCalls"] = @(stats.refresh_calls);
+        d[@"statProxyErrors"] = @(stats.proxy_errors);
+    }
     [self.lock unlock];
     return d;
 }

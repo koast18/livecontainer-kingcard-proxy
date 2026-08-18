@@ -1009,6 +1009,12 @@ struct kp_forwarder {
     kp_proxy_pool https_pool;  // queen_https（iptype 16）
     pthread_mutex_t cred_mutex;
 
+    uint64_t stat_http_requests;
+    uint64_t stat_https_connects;
+    uint64_t stat_direct_fallbacks;
+    uint64_t stat_refresh_calls;
+    uint64_t stat_proxy_errors;
+
     kp_refresh_fn refresh_fn;
     void *refresh_ctx;
 
@@ -1409,6 +1415,7 @@ static void kp_handle_client(kp_forwarder *fw, int client) {
 
     if (kp_parse_absolute_uri(reqbuf, off, method, sizeof(method),
                               host, sizeof(host), &port, path, sizeof(path)) == 0) {
+        fw->stat_http_requests++;
         kp_dbg("[fw] HTTP absolute URI: %s http://%s:%d%s", method, host, port, path);
 
         if (strncmp(host, "127.", 4) == 0 || strcmp(host, "localhost") == 0 ||
@@ -1477,6 +1484,7 @@ static void kp_handle_client(kp_forwarder *fw, int client) {
             }
             if (code == 822 || code == 824) {
                 KP_CLOSESOCK(up);
+                fw->stat_direct_fallbacks++;
                 char rebuilt[4096];
                 int rn = kp_rebuild_proxy_request(reqbuf, off, method, host, port, path,
                                                   rebuilt, sizeof(rebuilt));
@@ -1529,7 +1537,7 @@ static void kp_handle_client(kp_forwarder *fw, int client) {
         KP_CLOSESOCK(client);
         return;
     }
-
+    fw->stat_https_connects++;
     kp_dbg("[fw] CONNECT target %s:%d", host, port);
 
     if (strncmp(host, "127.", 4) == 0 || strcmp(host, "localhost") == 0 ||
@@ -1600,6 +1608,7 @@ https_retry:
         }
         if (code == 822 || code == 824) {
             KP_CLOSESOCK(up);
+            fw->stat_direct_fallbacks++;
             int dup = kp_connect_host(host, port, 10000);
             if (dup < 0) { kp_send_simple_response(client, 502, "Bad Gateway"); KP_CLOSESOCK(client); return; }
             const char *ok = "HTTP/1.1 200 Connection Established\r\n\r\n";
@@ -1658,6 +1667,7 @@ https_retry:
 
 static int kp_forwarder_refresh(kp_forwarder *fw) {
     if (!fw || !fw->refresh_fn) return -1;
+    fw->stat_refresh_calls++;
     return fw->refresh_fn(fw->refresh_ctx);
 }
 
@@ -1799,3 +1809,14 @@ void kp_forwarder_free(kp_forwarder *fw) {
 
 int kp_forwarder_is_running(kp_forwarder *fw) { return fw ? fw->running : 0; }
 int kp_forwarder_port(kp_forwarder *fw) { return fw ? fw->listen_port : 0; }
+
+void kp_forwarder_get_stats(kp_forwarder *fw, kp_forwarder_stats *stats) {
+    if (!stats) return;
+    memset(stats, 0, sizeof(*stats));
+    if (!fw) return;
+    stats->http_requests = fw->stat_http_requests;
+    stats->https_connects = fw->stat_https_connects;
+    stats->direct_fallbacks = fw->stat_direct_fallbacks;
+    stats->refresh_calls = fw->stat_refresh_calls;
+    stats->proxy_errors = fw->stat_proxy_errors;
+}
