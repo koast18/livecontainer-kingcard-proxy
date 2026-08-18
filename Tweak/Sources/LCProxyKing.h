@@ -9,6 +9,7 @@ NS_ASSUME_NONNULL_BEGIN
 - (BOOL)refreshCredentials;
 - (BOOL)isReady;
 - (BOOL)ensureCredentialsReadyWithTimeout:(NSTimeInterval)maxWait;
+- (NSDictionary *)forwarderStats;
 - (NSDictionary *)status;
 
 @end

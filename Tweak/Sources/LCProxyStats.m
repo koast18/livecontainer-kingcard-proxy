@@ -1,5 +1,6 @@
 #import "LCProxyStats.h"
 #import "LCProxyPaths.h"
+#import "LCProxyKing.h"
 #import "lcproxy_bridge.h"
 #import <objc/runtime.h>
 
@@ -85,29 +86,47 @@
         @"current": @{@"start": @(cstart), @"upload": @(cup), @"download": @(cdown)},
         @"totalUpload": @(lcproxy_stats_total_upload()),
         @"totalDownload": @(lcproxy_stats_total_download()),
+        @"forwarder": [[LCProxyKing shared] forwarderStats],
     };
 }
 
 - (NSDictionary *)aggregate {
-    NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:self.statsDirectory error:nil];
     NSMutableDictionary *byBucket = [NSMutableDictionary dictionary];
     uint64_t totalUp = 0, totalDown = 0;
+    uint64_t fwHttp = 0, fwHttps = 0, fwDirect = 0, fwRefresh = 0, fwErrors = 0;
     NSMutableArray *apps = [NSMutableArray array];
-    for (NSString *file in files) {
-        if (![file hasSuffix:@".json"]) continue;
-        NSString *path = [self.statsDirectory stringByAppendingPathComponent:file];
-        NSData *data = [NSData dataWithContentsOfFile:path];
-        if (!data) continue;
-        id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-        if (![obj isKindOfClass:[NSDictionary class]]) continue;
-        NSDictionary *dict = obj;
-        NSString *bundle = dict[@"bundleId"] ?: file;
-        uint64_t appUp = [dict[@"totalUpload"] unsignedLongLongValue];
-        uint64_t appDown = [dict[@"totalDownload"] unsignedLongLongValue];
-        totalUp += appUp;
-        totalDown += appDown;
-        [apps addObject:@{@"bundleId": bundle, @"totalUpload": @(appUp), @"totalDownload": @(appDown)}];
-        for (NSDictionary *b in dict[@"buckets"] ?: @[]) {
+    NSMutableOrderedSet *recentHosts = [NSMutableOrderedSet orderedSet];
+
+    for (NSString *dir in LCProxyAllDataDirectories()) {
+        NSString *statsDir = [dir stringByAppendingPathComponent:@"stats"];
+        NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:statsDir error:nil];
+        for (NSString *file in files) {
+            if (![file hasSuffix:@".json"]) continue;
+            NSString *path = [statsDir stringByAppendingPathComponent:file];
+            NSData *data = [NSData dataWithContentsOfFile:path];
+            if (!data) continue;
+            id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+            if (![obj isKindOfClass:[NSDictionary class]]) continue;
+            NSDictionary *dict = obj;
+            NSString *bundle = dict[@"bundleId"] ?: file;
+            uint64_t appUp = [dict[@"totalUpload"] unsignedLongLongValue];
+            uint64_t appDown = [dict[@"totalDownload"] unsignedLongLongValue];
+            totalUp += appUp;
+            totalDown += appDown;
+            [apps addObject:@{@"bundleId": bundle, @"totalUpload": @(appUp), @"totalDownload": @(appDown)}];
+
+            NSDictionary *fw = dict[@"forwarder"];
+            if ([fw isKindOfClass:[NSDictionary class]]) {
+                fwHttp += [fw[@"httpRequests"] unsignedLongLongValue];
+                fwHttps += [fw[@"httpsConnects"] unsignedLongLongValue];
+                fwDirect += [fw[@"directFallbacks"] unsignedLongLongValue];
+                fwRefresh += [fw[@"refreshCalls"] unsignedLongLongValue];
+                fwErrors += [fw[@"proxyErrors"] unsignedLongLongValue];
+                NSArray *hosts = fw[@"recentDirectHosts"];
+                if ([hosts isKindOfClass:[NSArray class]]) [recentHosts addObjectsFromArray:hosts];
+            }
+
+            for (NSDictionary *b in dict[@"buckets"] ?: @[]) {
             NSNumber *startNum = b[@"start"];
             if (!startNum) continue;
             NSNumber *upNum = b[@"upload"] ?: @0;
@@ -136,6 +155,8 @@
             }
         }
     }
+    }
+
     NSArray *buckets = [[byBucket allValues] sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
         return [a[@"start"] compare:b[@"start"]];
     }];
@@ -146,6 +167,14 @@
         @"buckets": buckets,
         @"apps": apps,
         @"bucketSeconds": @600,
+        @"forwarder": @{
+            @"httpRequests": @(fwHttp),
+            @"httpsConnects": @(fwHttps),
+            @"directFallbacks": @(fwDirect),
+            @"refreshCalls": @(fwRefresh),
+            @"proxyErrors": @(fwErrors),
+            @"recentDirectHosts": [recentHosts array],
+        },
     };
 }
 

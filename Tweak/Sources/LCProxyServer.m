@@ -79,6 +79,8 @@ static const NSUInteger LCProxyDefaultPort = 19092;
     d[@"settingsPath"] = [[LCProxyConfig shared] settingsPath];
     d[@"settingsExists"] = @([[NSFileManager defaultManager] fileExistsAtPath:[[LCProxyConfig shared] settingsPath]]);
     d[@"king"] = [[LCProxyKing shared] status];
+    NSDictionary *stats = [[LCProxyStats shared] aggregate];
+    d[@"kingAggregate"] = stats[@"forwarder"] ?: @{};
     return d;
 }
 

@@ -481,6 +481,37 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
     [self.lock unlock];
 }
 
+- (NSDictionary *)forwarderStats {
+    [self.lock lock];
+    NSMutableDictionary *d = [NSMutableDictionary dictionary];
+    d[@"httpRequests"] = @0;
+    d[@"httpsConnects"] = @0;
+    d[@"directFallbacks"] = @0;
+    d[@"refreshCalls"] = @0;
+    d[@"proxyErrors"] = @0;
+    d[@"recentDirectHosts"] = @[];
+    if (self.forwarder) {
+        kp_forwarder_stats stats;
+        kp_forwarder_get_stats(self.forwarder, &stats);
+        d[@"httpRequests"] = @(stats.http_requests);
+        d[@"httpsConnects"] = @(stats.https_connects);
+        d[@"directFallbacks"] = @(stats.direct_fallbacks);
+        d[@"refreshCalls"] = @(stats.refresh_calls);
+        d[@"proxyErrors"] = @(stats.proxy_errors);
+        NSMutableArray *hosts = [NSMutableArray array];
+        int hostCount = kp_forwarder_direct_host_count(self.forwarder);
+        for (int i = 0; i < hostCount && i < 16; i++) {
+            char hostBuf[128];
+            if (kp_forwarder_get_direct_host(self.forwarder, i, hostBuf, sizeof(hostBuf)) == 0) {
+                [hosts addObject:[NSString stringWithUTF8String:hostBuf] ?: @""];
+            }
+        }
+        d[@"recentDirectHosts"] = hosts;
+    }
+    [self.lock unlock];
+    return d;
+}
+
 - (NSDictionary *)status {
     [self.lock lock];
     NSMutableDictionary *d = [NSMutableDictionary dictionary];
