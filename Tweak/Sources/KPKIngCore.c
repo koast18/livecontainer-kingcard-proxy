@@ -1221,14 +1221,6 @@ static int kp_proxy_pool_pick_index(kp_proxy_pool *pool, int index,
     return 0;
 }
 
-static void kp_forwarder_record_direct_host(kp_forwarder *fw, const char *host) {
-    if (!fw || !host || host[0] == '\0') return;
-    int idx = fw->direct_host_log_rr % KP_DIRECT_HOST_LOG_MAX;
-    fw->direct_host_log_rr++;
-    snprintf(fw->direct_host_log[idx], sizeof(fw->direct_host_log[idx]), "%s", host);
-    if (fw->direct_host_log_count < KP_DIRECT_HOST_LOG_MAX) fw->direct_host_log_count++;
-}
-
 static void kp_forwarder_snapshot(kp_forwarder *fw,
                                   char *guid, size_t gc,
                                   char *token, size_t tc,
