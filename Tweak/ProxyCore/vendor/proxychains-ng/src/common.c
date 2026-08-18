@@ -96,19 +96,39 @@ char *get_config_path(char* default_path, char* pbuf, size_t bufsize) {
 
 	// Only read the config file managed by LCProxyControl.
 	// This avoids interference from other proxychains.conf files on the system.
-	const char *base = strrchr(pbuf, '/');
-	base = base ? base + 1 : pbuf;
-	if(strcmp(base, "LCProxy") == 0) {
-		if(strlen(pbuf) + sizeof("/" PROXYCHAINS_CONF_FILE) <= bufsize) {
-			strncat(pbuf, "/" PROXYCHAINS_CONF_FILE, bufsize - strlen(pbuf) - 1);
+	// The dylib may be installed in <shared root>/Tweaks or a subfolder of Tweaks
+	// (LiveContainer shared-app mode). In both cases the managed config lives in
+	// <shared root>/LCProxy/proxychains.conf.
+	char *tweaks = NULL;
+	size_t plen = strlen(pbuf);
+	for (size_t i = plen; i >= 7; i--) {
+		if (pbuf[i - 7] == '/' && strncmp(pbuf + i - 7, "/Tweaks", 7) == 0) {
+			tweaks = pbuf + i - 7;
+			break;
+		}
+	}
+	if (tweaks) {
+		*tweaks = '\0';
+		if (strlen(pbuf) + sizeof("/LCProxy/" PROXYCHAINS_CONF_FILE) <= bufsize) {
+			strncat(pbuf, "/LCProxy/" PROXYCHAINS_CONF_FILE, bufsize - strlen(pbuf) - 1);
 		} else {
 			return NULL;
 		}
 	} else {
-		if(strlen(pbuf) + sizeof("/../LCProxy/" PROXYCHAINS_CONF_FILE) <= bufsize) {
-			strncat(pbuf, "/../LCProxy/" PROXYCHAINS_CONF_FILE, bufsize - strlen(pbuf) - 1);
+		const char *base = strrchr(pbuf, '/');
+		base = base ? base + 1 : pbuf;
+		if(strcmp(base, "LCProxy") == 0) {
+			if(strlen(pbuf) + sizeof("/" PROXYCHAINS_CONF_FILE) <= bufsize) {
+				strncat(pbuf, "/" PROXYCHAINS_CONF_FILE, bufsize - strlen(pbuf) - 1);
+			} else {
+				return NULL;
+			}
 		} else {
-			return NULL;
+			if(strlen(pbuf) + sizeof("/../LCProxy/" PROXYCHAINS_CONF_FILE) <= bufsize) {
+				strncat(pbuf, "/../LCProxy/" PROXYCHAINS_CONF_FILE, bufsize - strlen(pbuf) - 1);
+			} else {
+				return NULL;
+			}
 		}
 	}
 

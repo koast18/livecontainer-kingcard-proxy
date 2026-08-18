@@ -85,16 +85,22 @@ static const NSTimeInterval LCProxyNetworkMonitorInterval = 2.0;
         id v = settings[key];
         if (v) merged[key] = v;
     }
-    NSError *err = nil;
-    if (![[NSFileManager defaultManager] createDirectoryAtPath:self.dataDirectory
-                                  withIntermediateDirectories:YES attributes:nil error:&err]) {
-        return NO;
+    BOOL ok = YES;
+    for (NSString *dir in LCProxyAllDataDirectories()) {
+        NSError *err = nil;
+        if (![[NSFileManager defaultManager] createDirectoryAtPath:dir
+                                      withIntermediateDirectories:YES attributes:nil error:&err]) {
+            ok = NO;
+            continue;
+        }
+        NSData *data = [NSJSONSerialization dataWithJSONObject:merged options:NSJSONWritingPrettyPrinted error:&err];
+        if (!data || ![data writeToFile:[dir stringByAppendingPathComponent:@"settings.json"] options:NSDataWritingAtomic error:&err]) {
+            ok = NO;
+            continue;
+        }
+        if (![self writeProxychainsConf:merged toDirectory:dir]) ok = NO;
     }
-    NSData *data = [NSJSONSerialization dataWithJSONObject:merged options:NSJSONWritingPrettyPrinted error:&err];
-    if (!data || ![data writeToFile:self.settingsPath options:NSDataWritingAtomic error:&err]) {
-        return NO;
-    }
-    return [self writeProxychainsConf:merged];
+    return ok;
 }
 
 - (NSString *)effectiveProxyModeForSettings:(NSDictionary *)settings {
@@ -108,6 +114,10 @@ static const NSTimeInterval LCProxyNetworkMonitorInterval = 2.0;
 }
 
 - (BOOL)writeProxychainsConf:(NSDictionary *)settings {
+    return [self writeProxychainsConf:settings toDirectory:self.dataDirectory];
+}
+
+- (BOOL)writeProxychainsConf:(NSDictionary *)settings toDirectory:(NSString *)dir {
     NSString *effectiveMode = [self effectiveProxyModeForSettings:settings];
     NSString *type = @"http";
     NSString *host = @"127.0.0.1";
@@ -148,7 +158,7 @@ static const NSTimeInterval LCProxyNetworkMonitorInterval = 2.0;
         [conf appendFormat:@"%@ %@ %ld\n", type, host, (long)port];
     }
     NSError *err = nil;
-    return [conf writeToFile:self.proxychainsConfPath atomically:YES encoding:NSUTF8StringEncoding error:&err];
+    return [conf writeToFile:[dir stringByAppendingPathComponent:@"proxychains.conf"] atomically:YES encoding:NSUTF8StringEncoding error:&err];
 }
 
 - (void)applyToRuntime {

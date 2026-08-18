@@ -180,7 +180,9 @@ static NSMutableString *gDiag = nil;
     NSString *root = [self lcRootDirectory];
     if (root) [dirs addObject:[root stringByAppendingPathComponent:@"Tweaks"]];
 
-    // 共享 App 模式使用 App Group 下的 LiveContainer/Tweaks。
+    // 共享 App 模式使用 App Group 下 LiveContainer/Tweaks 的子文件夹。
+    // 根目录里的 dylib 可能不会被 LiveContainer 签名；放到子文件夹后，
+    // 用户在共享 App 设置里选择该文件夹即可触发签名。
     Class lcSharedUtils = NSClassFromString(@"LCSharedUtils");
     if (lcSharedUtils) {
         SEL sel = NSSelectorFromString(@"appGroupID");
@@ -188,7 +190,10 @@ static NSMutableString *gDiag = nil;
         if ([groupID isKindOfClass:[NSString class]] && groupID.length) {
             NSURL *groupURL = [[NSFileManager defaultManager] containerURLForSecurityApplicationGroupIdentifier:groupID];
             if (groupURL) {
-                [dirs addObject:[[groupURL URLByAppendingPathComponent:@"LiveContainer/Tweaks"] path]];
+                NSString *sharedRoot = [[groupURL URLByAppendingPathComponent:@"LiveContainer/Tweaks"] path];
+                [dirs addObject:[sharedRoot stringByAppendingPathComponent:@"LCProxyControl"]];
+                // 清理共享根目录里未签名的旧 dylib，避免 TweakLoader 直接加载报签名错误。
+                [self cleanOldDylibsIn:sharedRoot keep:nil];
             }
         }
     }

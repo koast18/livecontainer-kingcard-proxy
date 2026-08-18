@@ -226,10 +226,11 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
 }
 
 - (void)saveState:(NSDictionary *)state {
-    NSString *dir = LCProxyDataDirectory();
-    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
-    NSData *data = [NSJSONSerialization dataWithJSONObject:state options:NSJSONWritingPrettyPrinted error:nil];
-    if (data) [data writeToFile:self.statePath atomically:YES];
+    for (NSString *dir in LCProxyAllDataDirectories()) {
+        [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+        NSData *data = [NSJSONSerialization dataWithJSONObject:state options:NSJSONWritingPrettyPrinted error:nil];
+        if (data) [data writeToFile:[dir stringByAppendingPathComponent:@"kingcard-state.json"] atomically:YES];
+    }
 }
 
 - (NSDictionary *)settingsSnapshot {
