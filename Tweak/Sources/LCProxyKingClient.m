@@ -1015,12 +1015,20 @@ static NSData *KPKSyncPost(NSString *urlString, NSDictionary *headers, NSData *b
         NSArray *infos = fields[@0];
         NSMutableArray<NSString *> *queenHttp = [NSMutableArray array];
         NSMutableArray<NSString *> *queenHttps = [NSMutableArray array];
+        NSInteger minLifePeriod = NSIntegerMax;
         if ([infos isKindOfClass:[NSArray class]]) {
             for (id info in infos) {
                 if (![info isKindOfClass:[NSDictionary class]]) continue;
                 NSNumber *iptype = info[@0];
                 NSArray *vip = info[@1];
                 if (![iptype isKindOfClass:[NSNumber class]] || ![vip isKindOfClass:[NSArray class]]) continue;
+                if (iptype.integerValue == 15 || iptype.integerValue == 16) {
+                    NSNumber *life = info[@3];
+                    if ([life isKindOfClass:[NSNumber class]]) {
+                        NSInteger lifeValue = life.integerValue;
+                        if (lifeValue > 0 && lifeValue < minLifePeriod) minLifePeriod = lifeValue;
+                    }
+                }
                 if (iptype.integerValue == 15) {
                     for (id s in vip) if ([s isKindOfClass:[NSString class]]) [queenHttp addObject:s];
                 } else if (iptype.integerValue == 16) {
@@ -1035,6 +1043,7 @@ static NSData *KPKSyncPost(NSString *urlString, NSDictionary *headers, NSData *b
         NSMutableDictionary *info = [NSMutableDictionary dictionary];
         info[@"queen_http"] = queenHttp;
         info[@"queen_https"] = queenHttps;
+        info[@"lifePeriod"] = @(minLifePeriod == NSIntegerMax ? 600 : minLifePeriod);
         info[@"server"] = parsed[@"url"];
         info[@"mode"] = parsed[@"mode"];
         info[@"sApn"] = fields[@1] ?: @"";

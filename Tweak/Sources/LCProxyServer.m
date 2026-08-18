@@ -301,7 +301,6 @@ static const NSUInteger LCProxyDefaultPort = 19092;
             return [self jsonError:@"保存配置失败" statusCode:500];
         }
         [[LCProxyConfig shared] applyToRuntime];
-        livecontainer_reload_webkit_proxy();
         return [self json:[self configPayload]];
     }];
 

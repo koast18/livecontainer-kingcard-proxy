@@ -163,6 +163,7 @@ static const NSTimeInterval LCProxyNetworkMonitorInterval = 2.0;
     lcproxy_control_set_block_non_tcp(block ? 1 : 0);
     [[LCProxyKing shared] applyConfig:s];
     _lastAppliedCellular = lcproxy_stats_is_cellular() ? 1 : 0;
+    livecontainer_reload_webkit_proxy();
 }
 
 - (void)startNetworkMonitor {
@@ -192,7 +193,6 @@ static const NSTimeInterval LCProxyNetworkMonitorInterval = 2.0;
     if (cellular != _lastAppliedCellular) {
         _lastAppliedCellular = cellular;
         [self applyToRuntime];
-        livecontainer_reload_webkit_proxy();
     }
 }
 

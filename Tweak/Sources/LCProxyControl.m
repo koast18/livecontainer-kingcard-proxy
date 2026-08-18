@@ -1,6 +1,7 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import "LCProxyConfig.h"
+#import "LCProxyKing.h"
 #import "LCProxyStats.h"
 #import "LCProxyServer.h"
 #import "LCProxyPaths.h"
@@ -13,6 +14,18 @@ static void LCProxyControlConstructor(void) {
         // initialized by its own constructor; these calls update runtime flags.
         [[LCProxyConfig shared] applyToRuntime];
         [[LCProxyConfig shared] startNetworkMonitor];
+
+        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
+                                                          object:nil
+                                                           queue:[NSOperationQueue mainQueue]
+                                                      usingBlock:^(NSNotification * _Nonnull note) {
+            [[LCProxyConfig shared] applyToRuntime];
+            NSDictionary *settings = [[LCProxyConfig shared] load];
+            NSString *effectiveMode = [[LCProxyConfig shared] effectiveProxyModeForSettings:settings];
+            if ([effectiveMode isEqualToString:@"kingcard"] && [settings[@"proxyEnabled"] boolValue]) {
+                [[LCProxyKing shared] refreshCredentials];
+            }
+        }];
 
         // Persist this process's cellular traffic in 10-minute buckets.
         [[LCProxyStats shared] start];

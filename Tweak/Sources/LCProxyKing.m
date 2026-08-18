@@ -2,9 +2,10 @@
 #import "KPKIngCore.h"
 #import "LCProxyPaths.h"
 #import "LCProxyKingClient.h"
+#import "lcproxy_bridge.h"
 #import <stdlib.h>
 
-static const NSTimeInterval LCProxyKingRefreshInterval = 10 * 60;
+static const NSTimeInterval LCProxyKingRefreshInterval = 5 * 60;
 static const NSTimeInterval LCProxyKingRefreshLeeway = 30;
 
 static int LCProxyKingRefreshHook(void *ctx) {
@@ -80,7 +81,10 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
 
 - (void)applyConfig:(NSDictionary *)settings {
     NSString *mode = [settings[@"proxyMode"] isKindOfClass:[NSString class]] ? settings[@"proxyMode"] : @"custom";
-    BOOL shouldRun = [mode isEqualToString:@"kingcard"];
+    BOOL shouldRun = [mode isEqualToString:@"kingcard"] && [settings[@"proxyEnabled"] boolValue];
+    if (shouldRun && [settings[@"kingAutoDirectOnNonCellular"] boolValue] && !lcproxy_stats_is_cellular()) {
+        shouldRun = NO;
+    }
     [self.lock lock];
     if (!shouldRun) {
         [self stopRefreshTimer];
@@ -334,7 +338,12 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
         queenHttps = proxyInfo[@"queen_https"];
         state[@"queen_http"] = queenHttp ?: @[];
         state[@"queen_https"] = queenHttps ?: @[];
-        state[@"proxyExpireEpoch"] = @(nowEpoch2 + 600.0);
+        double proxyLife = 600.0;
+        if ([proxyInfo[@"lifePeriod"] isKindOfClass:[NSNumber class]] && [proxyInfo[@"lifePeriod"] doubleValue] > 0) {
+            proxyLife = [proxyInfo[@"lifePeriod"] doubleValue];
+        }
+        if (proxyLife < 60.0) proxyLife = 60.0;
+        state[@"proxyExpireEpoch"] = @(nowEpoch2 + proxyLife - 30.0);
         self.lastSource = [NSString stringWithFormat:@"proxy-oldwup-%@", proxyInfo[@"mode"] ?: @"?"];
     }
 
