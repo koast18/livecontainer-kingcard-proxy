@@ -169,8 +169,8 @@ static const NSUInteger LCProxyDefaultPort = 19092;
     item[@"url"] = urlString ?: @"";
     item[@"rc"] = @(rc);
     item[@"ip"] = ip ?: @"";
-    NSString *body = [self plainTextFromHTML:text];
-    item[@"body"] = body.length > 120 ? [body substringToIndex:120] : body;
+    NSString *bodyText = [self plainTextFromHTML:text];
+    item[@"body"] = bodyText.length > 120 ? [bodyText substringToIndex:120] : bodyText;
     item[@"ok"] = @(ip.length > 0);
     item[@"effectiveMode"] = effectiveMode;
     return item;
@@ -252,8 +252,8 @@ static const NSUInteger LCProxyDefaultPort = 19092;
         item[@"url"] = urlString;
         item[@"rc"] = @(rc);
         item[@"ip"] = ip ?: @"";
-        NSString *body = [self plainTextFromHTML:text];
-        item[@"body"] = body.length > 120 ? [body substringToIndex:120] : body;
+        NSString *bodyText = [self plainTextFromHTML:text];
+        item[@"body"] = bodyText.length > 120 ? [bodyText substringToIndex:120] : bodyText;
         [results addObject:item];
     }
 
