@@ -1,7 +1,6 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import "LCProxyConfig.h"
-#import "LCProxyKing.h"
 #import "LCProxyStats.h"
 #import "LCProxyServer.h"
 #import "LCProxyPaths.h"
@@ -64,12 +63,11 @@ static void LCProxyControlConstructor(void) {
                                                           object:nil
                                                            queue:[NSOperationQueue mainQueue]
                                                       usingBlock:^(NSNotification * _Nonnull note) {
-            NSDictionary *settings = [[LCProxyConfig shared] load];
             [[LCProxyConfig shared] applyToRuntime];
-            NSString *effectiveMode = [[LCProxyConfig shared] effectiveProxyModeForSettings:settings];
-            if ([effectiveMode isEqualToString:@"kingcard"] && [settings[@"proxyEnabled"] boolValue]) {
-                [[LCProxyKing shared] refreshCredentials];
-            }
+            // applyToRuntime already schedules a Wangka refresh when the cached
+            // credentials/proxies are missing or stale. Do not force a network
+            // refresh here: at launch we want to use the cache immediately and
+            // avoid blocking the main thread.
         }];
 
         // Persist this process's cellular traffic in 10-minute buckets.

@@ -2,12 +2,14 @@
 #import "KPKIngCore.h"
 #import "KPKQueenCore.h"
 #import "LCProxyPaths.h"
+#import "LCProxyConfig.h"
 #import "LCProxyKingClient.h"
 #import "lcproxy_bridge.h"
 #import <stdlib.h>
 
 static const NSTimeInterval LCProxyKingRefreshInterval = 5 * 60;
 static const NSTimeInterval LCProxyKingRefreshLeeway = 30;
+static const NSTimeInterval LCProxyKingRefreshLeadTime = 2 * 60;
 
 static int LCProxyKingRefreshHook(void *ctx) {
     LCProxyKing *king = (__bridge LCProxyKing *)ctx;
@@ -44,6 +46,7 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
 @property (nonatomic, assign) BOOL lastRefreshSuccess;
 @property (nonatomic, strong) dispatch_source_t refreshTimer;
 @property (nonatomic, assign) BOOL refreshing;
+@property (nonatomic, copy) NSString *lastSettingsSignature;
 - (void)startRefreshTimer;
 - (void)stopRefreshTimer;
 @end
@@ -86,7 +89,22 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
     if (shouldRun && [settings[@"kingAutoDirectOnNonCellular"] boolValue] && !lcproxy_stats_is_cellular()) {
         shouldRun = NO;
     }
+    NSString *signature = [self settingsSignature:settings];
+
     [self.lock lock];
+    BOOL alreadyRunning = shouldRun && self.forwarder != NULL && kp_forwarder_is_running(self.forwarder) == 1;
+    if (alreadyRunning) {
+        [self.lock unlock];
+        BOOL settingsChanged = ![signature isEqualToString:self.lastSettingsSignature];
+        if (settingsChanged) self.lastSettingsSignature = signature;
+        [self startRefreshTimer];
+        [self loadCachedStateIntoForwarder];
+        if (settingsChanged || ![self hasFreshCachedState]) {
+            [self refreshCredentialsAsync];
+        }
+        return;
+    }
+
     if (!shouldRun) {
         [self stopRefreshTimer];
         if (self.forwarder) {
@@ -94,6 +112,7 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
             kp_forwarder_free(self.forwarder);
             self.forwarder = NULL;
         }
+        self.lastSettingsSignature = nil;
         [self.lock unlock];
         return;
     }
@@ -103,6 +122,7 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
         self.forwarder = NULL;
     }
     [self stopRefreshTimer];
+    self.lastSettingsSignature = signature;
     kp_forwarder *fw = kp_forwarder_new("127.0.0.1", 18080, "", 0);
     if (fw) {
         kp_forwarder_set_refresh_hook(fw, LCProxyKingRefreshHook, (__bridge void *)self);
@@ -111,9 +131,9 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
             [self.lock unlock];
             [self loadCachedStateIntoForwarder];
             [self startRefreshTimer];
-            dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-                [self refreshCredentials];
-            });
+            if (![self hasFreshCachedState]) {
+                [self refreshCredentialsAsync];
+            }
             return;
         }
         kp_forwarder_free(fw);
@@ -123,12 +143,62 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
     [self.lock unlock];
 }
 
+- (NSString *)settingsSignature:(NSDictionary *)settings {
+    NSArray<NSString *> *keys = @[
+        @"proxyEnabled", @"proxyMode", @"kingAutoDirectOnNonCellular",
+        @"kingGuidOverride", @"kingTokenOverride", @"kingKeyOverride",
+        @"kingPhone", @"kingQType", @"kingApn", @"kingTypeName",
+        @"kingSubtype", @"kingExtraInfo", @"kingMccmnc", @"kingCardType"
+    ];
+    NSMutableString *signature = [NSMutableString string];
+    for (NSString *key in keys) {
+        id value = settings[key];
+        if ([value isKindOfClass:[NSString class]] || [value isKindOfClass:[NSNumber class]]) {
+            [signature appendFormat:@"%@=%@|", key, value];
+        } else if ([value isKindOfClass:[NSNull class]]) {
+            [signature appendFormat:@"%@=null|", key];
+        } else {
+            [signature appendFormat:@"%@=|", key];
+        }
+    }
+    return signature;
+}
+
+- (void)refreshCredentialsAsync {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        [self refreshCredentials];
+    });
+}
+
 - (void)startRefreshTimer {
     [self stopRefreshTimer];
+
+    NSTimeInterval interval = LCProxyKingRefreshInterval;
+    NSDictionary *state = [self loadState];
+    double now = [[NSDate date] timeIntervalSince1970];
+    BOOL hasExpiry = NO;
+    double earliestExpiry = 0;
+    NSNumber *tokenExpireEpoch = [state[@"tokenExpireEpoch"] isKindOfClass:[NSNumber class]] ? state[@"tokenExpireEpoch"] : nil;
+    NSNumber *proxyExpireEpoch = [state[@"proxyExpireEpoch"] isKindOfClass:[NSNumber class]] ? state[@"proxyExpireEpoch"] : nil;
+    if (tokenExpireEpoch) {
+        hasExpiry = YES;
+        earliestExpiry = tokenExpireEpoch.doubleValue;
+    }
+    if (proxyExpireEpoch && (!hasExpiry || proxyExpireEpoch.doubleValue < earliestExpiry)) {
+        hasExpiry = YES;
+        earliestExpiry = proxyExpireEpoch.doubleValue;
+    }
+    if (hasExpiry) {
+        NSTimeInterval next = earliestExpiry - now - LCProxyKingRefreshLeadTime;
+        if (next > 1.0 && next < interval) {
+            interval = next;
+        }
+    }
+
     dispatch_queue_t q = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
     dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
     dispatch_source_set_timer(timer,
-                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)(LCProxyKingRefreshInterval * NSEC_PER_SEC)),
+                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)(interval * NSEC_PER_SEC)),
                               (uint64_t)(LCProxyKingRefreshInterval * NSEC_PER_SEC),
                               (uint64_t)(LCProxyKingRefreshLeeway * NSEC_PER_SEC));
     __weak LCProxyKing *weakSelf = self;
@@ -180,6 +250,31 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
     [self.lock unlock];
 }
 
+- (BOOL)hasFreshCachedState {
+    NSDictionary *state = [self loadState];
+    NSString *guid = [state[@"guid"] isKindOfClass:[NSString class]] ? state[@"guid"] : nil;
+    NSString *token = [state[@"token"] isKindOfClass:[NSString class]] ? state[@"token"] : nil;
+    NSString *qkey = [state[@"key"] isKindOfClass:[NSString class]] ? state[@"key"] : nil;
+    NSString *qua2 = [state[@"qua2"] isKindOfClass:[NSString class]] ? state[@"qua2"] : nil;
+    NSArray *queenHttp = [state[@"queen_http"] isKindOfClass:[NSArray class]] ? state[@"queen_http"] : nil;
+    NSArray *queenHttps = [state[@"queen_https"] isKindOfClass:[NSArray class]] ? state[@"queen_https"] : nil;
+    if (!guid.length || !token.length || !qkey.length || !qua2.length) return NO;
+    if (!queenHttp.count || !queenHttps.count) return NO;
+
+    double now = [[NSDate date] timeIntervalSince1970];
+    NSNumber *tokenExpireEpoch = [state[@"tokenExpireEpoch"] isKindOfClass:[NSNumber class]] ? state[@"tokenExpireEpoch"] : nil;
+    NSNumber *proxyExpireEpoch = [state[@"proxyExpireEpoch"] isKindOfClass:[NSNumber class]] ? state[@"proxyExpireEpoch"] : nil;
+    if (!tokenExpireEpoch || tokenExpireEpoch.doubleValue <= now + LCProxyKingRefreshLeadTime) return NO;
+    if (!proxyExpireEpoch) {
+        // Legacy cache without an explicit proxy TTL. As long as the token is
+        // still valid and proxy lists are present, use the cached pools and let
+        // the periodic/on-demand refresh replace them if they become unusable.
+        return YES;
+    }
+    if (proxyExpireEpoch.doubleValue <= now + LCProxyKingRefreshLeadTime) return NO;
+    return YES;
+}
+
 - (BOOL)isReady {
     [self.lock lock];
     BOOL running = self.forwarder != NULL && kp_forwarder_is_running(self.forwarder) == 1;
@@ -219,10 +314,14 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
 }
 
 - (NSMutableDictionary *)loadState {
-    NSData *data = [NSData dataWithContentsOfFile:self.statePath];
-    if (!data) return [NSMutableDictionary dictionary];
-    id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-    return [obj isKindOfClass:[NSDictionary class]] ? [obj mutableCopy] : [NSMutableDictionary dictionary];
+    for (NSString *dir in LCProxyAllDataDirectories()) {
+        NSString *path = [dir stringByAppendingPathComponent:@"kingcard-state.json"];
+        NSData *data = [NSData dataWithContentsOfFile:path];
+        if (!data) continue;
+        id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        if ([obj isKindOfClass:[NSDictionary class]]) return [obj mutableCopy];
+    }
+    return [NSMutableDictionary dictionary];
 }
 
 - (void)saveState:(NSDictionary *)state {
@@ -234,11 +333,7 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
 }
 
 - (NSDictionary *)settingsSnapshot {
-    NSString *path = [LCProxyDataDirectory() stringByAppendingPathComponent:@"settings.json"];
-    NSData *data = [NSData dataWithContentsOfFile:path];
-    if (!data) return @{};
-    id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-    return [obj isKindOfClass:[NSDictionary class]] ? obj : @{};
+    return [[LCProxyConfig shared] load];
 }
 
 - (NSString *)syncFetchGuid:(NSString *)qua2 timeout:(NSTimeInterval)timeout error:(NSError **)outErr {
@@ -377,7 +472,7 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
         NSString *storedToken = [state[@"token"] isKindOfClass:[NSString class]] ? state[@"token"] : nil;
         NSString *storedKey = [state[@"key"] isKindOfClass:[NSString class]] ? state[@"key"] : nil;
         double nowEpoch = [[NSDate date] timeIntervalSince1970];
-        if (storedToken.length && storedKey.length && tokenExpireEpoch && tokenExpireEpoch.doubleValue > nowEpoch + 60.0) {
+        if (storedToken.length && storedKey.length && tokenExpireEpoch && tokenExpireEpoch.doubleValue > nowEpoch + LCProxyKingRefreshLeadTime) {
             token = storedToken;
             qkey = storedKey;
         } else {
@@ -410,7 +505,7 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
     NSArray *queenHttps = [state[@"queen_https"] isKindOfClass:[NSArray class]] ? state[@"queen_https"] : nil;
     NSNumber *proxyExpireEpoch = [state[@"proxyExpireEpoch"] isKindOfClass:[NSNumber class]] ? state[@"proxyExpireEpoch"] : nil;
     double nowEpoch2 = [[NSDate date] timeIntervalSince1970];
-    if (!queenHttp.count || !queenHttps.count || !proxyExpireEpoch || proxyExpireEpoch.doubleValue <= nowEpoch2 + 30.0) {
+    if (!queenHttp.count || !queenHttps.count || !proxyExpireEpoch || proxyExpireEpoch.doubleValue <= nowEpoch2 + LCProxyKingRefreshLeadTime) {
         NSDictionary *params = @{
             @"apn": [settings[@"kingApn"] isKindOfClass:[NSString class]] ? settings[@"kingApn"] : @"UNKNOW",
             @"typeName": [settings[@"kingTypeName"] isKindOfClass:[NSString class]] ? settings[@"kingTypeName"] : @"UNKNOW",

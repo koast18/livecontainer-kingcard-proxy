@@ -67,13 +67,21 @@ static const NSTimeInterval LCProxyNetworkMonitorInterval = 2.0;
 }
 
 - (NSDictionary *)load {
-    NSData *data = [NSData dataWithContentsOfFile:self.settingsPath];
-    if (!data) return [self defaults];
-    id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-    if (![obj isKindOfClass:[NSDictionary class]]) return [self defaults];
+    NSDictionary *raw = nil;
+    for (NSString *dir in LCProxyAllDataDirectories()) {
+        NSString *path = [dir stringByAppendingPathComponent:LCProxySettingsFile];
+        NSData *data = [NSData dataWithContentsOfFile:path];
+        if (!data) continue;
+        id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        if ([obj isKindOfClass:[NSDictionary class]]) {
+            raw = obj;
+            break;
+        }
+    }
+    if (!raw) return [self defaults];
     NSMutableDictionary *merged = [NSMutableDictionary dictionaryWithDictionary:[self defaults]];
     for (NSString *key in [self defaults]) {
-        id v = obj[key];
+        id v = raw[key];
         if (v) merged[key] = v;
     }
     return merged;
