@@ -34,6 +34,7 @@ unsigned int proxychains_proxy_count = 1;
 chain_type proxychains_ct = STRICT_TYPE;
 unsigned int proxychains_max_chain = 1;
 
+connect_t true_connect = (connect_t)connect;
 int g_upstream_port = 0;
 int g_fail_connect = 0;
 
