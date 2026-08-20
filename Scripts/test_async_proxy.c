@@ -182,7 +182,7 @@ static int test_echo(size_t payload_len, const char *name) {
     int rc = lcproxy_async_connect_start(sock, target, 443, flags | O_NONBLOCK);
     clock_gettime(CLOCK_MONOTONIC, &end);
     if (rc != 0) {
-        fprintf(stderr, "%s: lcproxy_async_connect_start failed\n", name);
+        perror(name);
         close(sock);
         return 1;
     }
