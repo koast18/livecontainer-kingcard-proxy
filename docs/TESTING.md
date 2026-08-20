@@ -7,7 +7,7 @@
 | 层级 | 覆盖内容 | 关键脚本 |
 | --- | --- | --- |
 | 静态检查 | 王卡缓存/刷新逻辑是否仍满足预期 | `Scripts/test_king_cache_logic.sh` |
-| 单元测试 | 异步 socketpair relay 的核心行为 | `Scripts/test_async_proxy.sh` |
+| 单元测试 | 异步 loopback TCP relay 的核心行为 | `Scripts/test_async_proxy.sh` |
 | 加密自测 | Queen 协议相关 crypto 原始字节正确性 | `Scripts/test_queen_crypto.sh` |
 | 二进制对比 | native 与 Python 参考实现的 WUP 字节一致 | `Scripts/test_queen_wup_compare.sh` |
 | 构建验证 | iOS dylib 能完整编译/链接 | `Scripts/build_ios.sh` |
@@ -23,7 +23,7 @@
 
 2. **调用方 fd 可通过 `poll()` 使用**
    - `POLLOUT` 应快速返回；
-   - 证明 fd 已经被替换为可用的 socketpair。
+   - 证明 fd 已经是可用的本地回环 TCP 连接。
 
 3. **小包双向转发 + ACK**
    - App → relay → upstream server → relay → App；
