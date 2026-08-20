@@ -7,5 +7,5 @@ cc -std=c99 -O0 -g \
   -ITweak/ProxyCore/vendor/proxychains-ng/src \
   Scripts/test_async_proxy.c \
   Tweak/ProxyCore/src/async_proxy.c \
-  -lpthread -o build/async-test/async_proxy_test
+  -o build/async-test/async_proxy_test
 ./build/async-test/async_proxy_test
