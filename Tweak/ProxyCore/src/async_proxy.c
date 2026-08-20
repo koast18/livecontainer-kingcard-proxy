@@ -166,6 +166,8 @@ static int make_local_tcp_pair(int sock, int v6, int orig_flags, int *peer_fd) {
         a4->sin_port = 0;
     }
 
+    slen = v6 ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in);
+
     if (bind(listen_fd, (struct sockaddr *)&ss, slen) != 0 ||
         listen(listen_fd, 1) != 0) {
         close(listen_fd);
@@ -180,6 +182,7 @@ static int make_local_tcp_pair(int sock, int v6, int orig_flags, int *peer_fd) {
         close(listen_fd);
         return -1;
     }
+    slen = v6 ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in);
 
     /* Temporarily make the app socket blocking only for the local loopback
      * connect; this is a local operation and should complete immediately. */
