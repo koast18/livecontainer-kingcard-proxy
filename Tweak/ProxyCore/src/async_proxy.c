@@ -1,7 +1,9 @@
 #include "async_proxy.h"
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -32,7 +34,7 @@ static void disable_sigpipe(int fd) {
 }
 
 typedef struct {
-    int peer_fd;               /* socketpair peer used by the relay thread */
+    int peer_fd;               /* local TCP peer used by the relay thread */
     ip_type target_ip;
     unsigned short target_port; /* host byte order */
 } async_connect_job;
@@ -134,45 +136,98 @@ static void *relay_worker(void *arg) {
     return NULL;
 }
 
-int lcproxy_async_connect_start(int sock, ip_type target_ip,
-                                unsigned short target_port, int orig_flags) {
-    int fds[2];
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
+/* Create a loopback TCP pair:
+ *   - the app's existing `sock` is connected to a local listener;
+ *   - the accepted side is returned as the relay peer fd.
+ *
+ * This keeps the app-facing descriptor a real TCP socket, so Dart/Flutter
+ * socket options, getsockname/getpeername and TLS stacks behave like a normal
+ * Internet socket instead of seeing an AF_UNIX socketpair.
+ */
+static int make_local_tcp_pair(int sock, int v6, int orig_flags, int *peer_fd) {
+    int listen_fd = -1;
+    int accepted = -1;
+    struct sockaddr_storage ss;
+    socklen_t slen = sizeof(ss);
+    memset(&ss, 0, sizeof(ss));
+
+    listen_fd = socket(v6 ? AF_INET6 : AF_INET, SOCK_STREAM, 0);
+    if (listen_fd < 0) return -1;
+
+    if (v6) {
+        struct sockaddr_in6 *a6 = (struct sockaddr_in6 *)&ss;
+        a6->sin6_family = AF_INET6;
+        a6->sin6_addr = in6addr_loopback;
+        a6->sin6_port = 0;
+    } else {
+        struct sockaddr_in *a4 = (struct sockaddr_in *)&ss;
+        a4->sin_family = AF_INET;
+        a4->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        a4->sin_port = 0;
+    }
+
+    if (bind(listen_fd, (struct sockaddr *)&ss, slen) != 0 ||
+        listen(listen_fd, 1) != 0) {
+        close(listen_fd);
         return -1;
     }
 
-    /* Preserve the caller's non-blocking mode on the app-facing side. */
-    if (orig_flags != 0) {
-        fcntl(fds[0], F_SETFL, orig_flags);
+    slen = sizeof(ss);
+    if (getsockname(listen_fd, (struct sockaddr *)&ss, &slen) != 0) {
+        close(listen_fd);
+        return -1;
+    }
+
+    /* Temporarily make the app socket blocking only for the local loopback
+     * connect; this is a local operation and should complete immediately. */
+    int save_flags = fcntl(sock, F_GETFL, 0);
+    if (save_flags < 0) {
+        close(listen_fd);
+        return -1;
+    }
+    fcntl(sock, F_SETFL, save_flags & ~O_NONBLOCK);
+    int rc = true_connect(sock, (struct sockaddr *)&ss, slen);
+    fcntl(sock, F_SETFL, orig_flags >= 0 ? orig_flags : save_flags);
+    if (rc != 0) {
+        close(listen_fd);
+        return -1;
+    }
+
+    accepted = accept(listen_fd, NULL, NULL);
+    close(listen_fd);
+    if (accepted < 0) return -1;
+
+    *peer_fd = accepted;
+    return 0;
+}
+
+int lcproxy_async_connect_start(int sock, ip_type target_ip,
+                                unsigned short target_port, int orig_flags) {
+    int peer_fd = -1;
+    if (make_local_tcp_pair(sock, target_ip.is_v6, orig_flags, &peer_fd) != 0) {
+        return -1;
     }
 
     async_connect_job *job = calloc(1, sizeof(*job));
     if (!job) {
-        close(fds[0]);
-        close(fds[1]);
+        close(peer_fd);
         return -1;
     }
 
-    job->peer_fd = fds[1];
+    job->peer_fd = peer_fd;
     job->target_ip = target_ip;
     job->target_port = target_port;
 
     pthread_t thread;
     if (pthread_create(&thread, NULL, relay_worker, job) != 0) {
         free(job);
-        close(fds[0]);
-        close(fds[1]);
+        close(peer_fd);
         return -1;
     }
     pthread_detach(thread);
 
-    /* Replace the caller's fd before returning, so any subsequent
-     * poll/select/kqueue registration sees the connected socketpair. */
-    if (dup2(fds[0], sock) < 0) {
-        close(fds[0]);
-        close(fds[1]);
-        return -1;
-    }
-    close(fds[0]);
+    /* The caller's fd is now a connected loopback TCP socket. Return
+     * EINPROGRESS so Dart/Flutter wait for POLLOUT just like a normal
+     * non-blocking connect. */
     return 0;
 }
