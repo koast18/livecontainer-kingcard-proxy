@@ -15,7 +15,7 @@ jobs:
       - name: Install Python dependencies
         run: |
           set -euo pipefail
-          python3 -m pip install --quiet -r Tools/queen_proxy_kit/requirements.txt
+          python3 -m pip install --user --break-system-packages --quiet -r Tools/queen_proxy_kit/requirements.txt
 
       - name: King cache/refresh logic static tests
         run: bash Scripts/test_king_cache_logic.sh
