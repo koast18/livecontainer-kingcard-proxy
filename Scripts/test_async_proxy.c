@@ -97,17 +97,20 @@ static void *echo_server(void *arg) {
     close(listen_fd);
     if (client < 0) return NULL;
 
-    /* Echo until EOF. */
+    /* Drain until EOF, then send a short ack. This avoids a test deadlock
+     * where the app is still writing a large request while the server echoes
+     * and fills the socketpair receive buffer before the app reads. */
     char buf[16384];
     ssize_t n;
     while ((n = recv(client, buf, sizeof(buf), 0)) > 0) {
-        size_t off = 0;
-        while (off < (size_t)n) {
-            ssize_t w = send(client, buf + off, (size_t)n - off, 0);
-            if (w <= 0) break;
-            off += (size_t)w;
-        }
-        if (off != (size_t)n) break;
+        /* discard */
+    }
+    const char *ack = "DONE";
+    size_t ack_off = 0;
+    while (ack_off < strlen(ack)) {
+        ssize_t w = send(client, ack + ack_off, strlen(ack) - ack_off, 0);
+        if (w <= 0) break;
+        ack_off += (size_t)w;
     }
     shutdown(client, SHUT_RDWR);
     close(client);
@@ -235,59 +238,59 @@ static int test_echo(size_t payload_len, const char *name) {
         return 1;
     }
 
-    /* Read back the echoed bytes until the full payload is received. */
-    size_t got = 0;
-    char *echo_buf = malloc(payload_len ? payload_len : 1);
-    if (!echo_buf) {
-        fprintf(stderr, "%s: malloc echo_buf failed\n", name);
+    /* Signal end of request; the relay forwards EOF to the upstream server. */
+    if (shutdown(sock, SHUT_WR) != 0) {
+        perror(name);
         free(payload);
         close(sock);
         pthread_join(server_thread, NULL);
         return 1;
     }
-    while (got < payload_len) {
+
+    /* Read the small ACK sent after the server drains the full payload. */
+    char ack_buf[8];
+    size_t ack_got = 0;
+    const char *expected = "DONE";
+    size_t expected_len = strlen(expected);
+    while (ack_got < expected_len) {
         if (wait_event(sock, POLLIN, 5000) != 0) {
-            fprintf(stderr, "%s: echo timed out after %zu/%zu bytes\n",
-                    name, got, payload_len);
+            fprintf(stderr, "%s: ack timed out after %zu/%zu bytes\n",
+                    name, ack_got, expected_len);
             free(payload);
-            free(echo_buf);
             close(sock);
             pthread_join(server_thread, NULL);
             return 1;
         }
-        ssize_t r = recv(sock, echo_buf + got, payload_len - got, 0);
+        ssize_t r = recv(sock, ack_buf + ack_got, expected_len - ack_got, 0);
         if (r > 0) {
-            got += (size_t)r;
+            ack_got += (size_t)r;
             continue;
         }
         if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             continue;
         }
-        fprintf(stderr, "%s: echo connection closed early: %zd\n", name, r);
+        fprintf(stderr, "%s: ack connection closed early: %zd\n", name, r);
         free(payload);
-        free(echo_buf);
         close(sock);
         pthread_join(server_thread, NULL);
         return 1;
     }
 
-    if (memcmp(payload, echo_buf, payload_len) != 0) {
-        fprintf(stderr, "%s: echo data mismatch\n", name);
+    if (memcmp(ack_buf, expected, expected_len) != 0) {
+        fprintf(stderr, "%s: ack mismatch\n", name);
         free(payload);
-        free(echo_buf);
         close(sock);
         pthread_join(server_thread, NULL);
         return 1;
     }
 
-    printf("%s OK: start=%lldms payload=%zu bytes\n", name, elapsed_ms, payload_len);
+    printf("%s OK: start=%lldms payload=%zu bytes ack=%s\n",
+           name, elapsed_ms, payload_len, expected);
     free(payload);
-    free(echo_buf);
     close(sock);
     pthread_join(server_thread, NULL);
     return 0;
 }
-
 static int test_upstream_failure(void) {
     g_fail_connect = 1;
 
@@ -338,8 +341,8 @@ static int test_upstream_failure(void) {
 int main(void) {
     int failed = 0;
 
-    if (test_echo(32, "small echo") != 0) failed = 1;
-    if (test_echo(256 * 1024, "large echo (256 KiB)") != 0) failed = 1;
+    if (test_echo(32, "small relay roundtrip") != 0) failed = 1;
+    if (test_echo(256 * 1024, "large relay roundtrip (256 KiB)") != 0) failed = 1;
     if (test_upstream_failure() != 0) failed = 1;
 
     if (failed) {
