@@ -25,11 +25,11 @@
    - `POLLOUT` 应快速返回；
    - 证明 fd 已经被替换为可用的 socketpair。
 
-3. **小包回显**
-   - App → relay → upstream echo server → relay → App；
+3. **小包双向转发 + ACK**
+   - App → relay → upstream server → relay → App；
    - 验证双向泵和基础转发正确。
 
-4. **大包回显（256 KiB）**
+4. **大包双向转发（256 KiB）**
    - 验证 `pump_bidirectional()` 能处理连续/分片数据，不丢数据。
 
 5. **上游连接失败**
@@ -45,8 +45,8 @@ bash Scripts/test_async_proxy.sh
 预期输出：
 
 ```text
-small echo OK: start=0ms payload=32 bytes
-large echo OK: start=0ms payload=262144 bytes
+small relay roundtrip OK: start=0ms payload=32 bytes ack=DONE
+large relay roundtrip (256 KiB) OK: start=0ms payload=262144 bytes ack=DONE
 upstream failure test OK: relay reported EOF to caller
 all async proxy tests passed
 ```
