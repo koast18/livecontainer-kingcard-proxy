@@ -53,6 +53,23 @@ AltStore/           AltStore 源
 
 两个产物均**故意不签名**，由 LiveContainer 导入/签名时用你导入的证书处理。
 
+## 测试
+
+完整的测试流程见 [`docs/TESTING.md`](docs/TESTING.md)。
+
+本地运行全部非 iOS 测试：
+
+```bash
+bash Scripts/run_all_tests.sh
+```
+
+GitHub Actions 会自动在 push/PR 时运行 CI，包含：
+
+- 异步 connect relay 单元测试
+- King cache/refresh 静态检查
+- Queen crypto/WUP 对比测试
+- iOS dylib 编译链接检查
+
 ## 使用
 
 1. 将 `LiveProxyConsole.ipa` 导入 LiveContainer 并打开。
