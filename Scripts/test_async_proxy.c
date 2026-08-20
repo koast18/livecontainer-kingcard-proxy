@@ -148,6 +148,7 @@ static int make_nonblocking_socket(void) {
 
 static int test_echo(size_t payload_len, const char *name) {
     pthread_t server_thread;
+    g_upstream_port = 0;
     if (pthread_create(&server_thread, NULL, echo_server, NULL) != 0) {
         fprintf(stderr, "%s: failed to create echo server\n", name);
         return 1;
