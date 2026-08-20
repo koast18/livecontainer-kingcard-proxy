@@ -23,6 +23,8 @@ SRC := $(VENDOR)/src
 FISHHOOK_DIR := fishhook
 WEBKIT_PROXY_SRC := src/webkit_proxy.m
 WEBKIT_PROXY_OBJ := src/webkit_proxy.o
+ASYNC_PROXY_SRC := src/async_proxy.c
+ASYNC_PROXY_OBJ := src/async_proxy.o
 
 DEBUG ?= 0
 ifeq ($(DEBUG),1)
@@ -37,6 +39,7 @@ STATIC_LIB := libproxychains_livecontainer.a
 OBJS := \
 	$(FISHHOOK_DIR)/fishhook.o \
 	$(WEBKIT_PROXY_OBJ) \
+	$(ASYNC_PROXY_OBJ) \
 	$(SRC)/version.o \
 	$(SRC)/core.o \
 	$(SRC)/common.o \
@@ -56,7 +59,7 @@ CPPFLAGS += -DDEBUG
 endif
 
 CFLAGS := -std=c99 -Wall -O2 -fPIC \
-	-Ifishhook -isysroot $(SDKROOT) -arch $(ARCH) -miphoneos-version-min=$(IOS_DEPLOYMENT_TARGET)
+	-Isrc -Ifishhook -isysroot $(SDKROOT) -arch $(ARCH) -miphoneos-version-min=$(IOS_DEPLOYMENT_TARGET)
 
 LDFLAGS := -dynamiclib -arch $(ARCH) -isysroot $(SDKROOT) \
 	-miphoneos-version-min=$(IOS_DEPLOYMENT_TARGET) \
@@ -77,6 +80,9 @@ $(STATIC_LIB): $(OBJS)
 $(WEBKIT_PROXY_OBJ): $(WEBKIT_PROXY_SRC)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -fno-objc-arc -c -o $@ $<
 
+$(ASYNC_PROXY_OBJ): $(ASYNC_PROXY_SRC)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+
 $(FISHHOOK_DIR)/fishhook.o: $(FISHHOOK_DIR)/fishhook.c $(FISHHOOK_DIR)/fishhook.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
 
@@ -89,7 +95,7 @@ sign: $(PRODUCT)
 	$(CODESIGN) --force --sign - $(PRODUCT)
 
 clean:
-	rm -f $(PRODUCT) $(STATIC_LIB) $(OBJS) $(FISHHOOK_DIR)/fishhook.o $(WEBKIT_PROXY_OBJ)
+	rm -f $(PRODUCT) $(STATIC_LIB) $(OBJS) $(FISHHOOK_DIR)/fishhook.o $(WEBKIT_PROXY_OBJ) $(ASYNC_PROXY_OBJ)
 
 install: all
 	install -d $(DESTDIR)/Library/MobileSubstrate/DynamicLibraries $(DESTDIR)/usr/lib

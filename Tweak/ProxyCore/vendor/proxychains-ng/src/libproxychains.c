@@ -45,6 +45,7 @@
 #include "common.h"
 #include "rdns.h"
 #include "fishhook.h"
+#include "async_proxy.h"
 
 #undef 		satosin
 #define     satosin(x)      ((struct sockaddr_in *) &(x))
@@ -1066,10 +1067,17 @@ HOOKFUNC(int, connect, int sock, const struct sockaddr *addr, unsigned int len) 
 		lc_fd_class_set(sock, LC_FD_CLASS_COUNT);
 
 	flags = fcntl(sock, F_GETFL, 0);
-	if(flags & O_NONBLOCK)
-		fcntl(sock, F_SETFL, !O_NONBLOCK);
 
 	memcpy(dest_ip.addr.v6, v6 ? (void*)p_addr_in6 : (void*)p_addr_in, v6?16:4);
+
+	if((flags & O_NONBLOCK) && lcproxy_async_connect_start(sock, dest_ip, port, flags) == 0) {
+		lc_fd_class_set(sock, LC_FD_CLASS_NOCOUNT);
+		errno = EINPROGRESS;
+		return -1;
+	}
+
+	if(flags & O_NONBLOCK)
+		fcntl(sock, F_SETFL, !O_NONBLOCK);
 
 	lc_bypass_set(1);
 	ret = connect_proxy_chain(sock,

@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: King cache/refresh logic static tests
+        run: bash Scripts/test_king_cache_logic.sh
+
+      - name: Async proxy relay test
+        run: bash Scripts/test_async_proxy.sh
+
+      - name: Queen crypto self-test
+        run: bash Scripts/test_queen_crypto.sh
+
+      - name: Queen WUP binary comparison
+        run: bash Scripts/test_queen_wup_compare.sh
+
+      - name: Build dylib (compile/link check)
+        run: |
+          set -euo pipefail
+          ./Scripts/build_ios.sh

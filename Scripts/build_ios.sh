@@ -19,7 +19,7 @@ node Scripts/gen_console_asset.js Resources/console.html Tweak/Sources/ConsoleHT
 
 SRCS="$(find Tweak/ProxyCore/vendor/proxychains-ng/src -maxdepth 1 -name '*.c' ! -name 'main.c' | sort) \
 Tweak/ProxyCore/fishhook/fishhook.c \
-Tweak/ProxyCore/src/webkit_proxy.m \
+Tweak/ProxyCore/src/webkit_proxy.m Tweak/ProxyCore/src/async_proxy.c \
 $(find Tweak/Sources -name '*.m' -o -name '*.c' | sort) \
 $(find Tweak/Vendor/GCDWebServer -name '*.m' | sort)"
 
