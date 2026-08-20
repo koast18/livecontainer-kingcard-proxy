@@ -12,7 +12,10 @@ static const NSTimeInterval LCProxyNetworkMonitorInterval = 2.0;
 @interface LCProxyConfig ()
 @property (nonatomic, strong) dispatch_source_t networkTimer;
 @property (nonatomic, assign) int lastAppliedCellular;
+@property (nonatomic, copy) NSString *lastAppliedRuntimeSignature;
+@property (nonatomic, assign) int lastAppliedForwarderPort;
 - (void)checkNetworkAndApplyIfNeeded;
+- (NSString *)runtimeSignatureForSettings:(NSDictionary *)settings;
 @end
 
 @implementation LCProxyConfig
@@ -169,22 +172,72 @@ static const NSTimeInterval LCProxyNetworkMonitorInterval = 2.0;
     return [conf writeToFile:[dir stringByAppendingPathComponent:@"proxychains.conf"] atomically:YES encoding:NSUTF8StringEncoding error:&err];
 }
 
+- (NSString *)runtimeSignatureForSettings:(NSDictionary *)settings {
+    NSArray<NSString *> *keys = @[
+        @"proxyEnabled", @"proxyMode", @"proxyType", @"proxyHost", @"proxyPort",
+        @"blockNonTcp", @"debugLogging", @"kingAutoDirectOnNonCellular",
+        @"kingGuidOverride", @"kingTokenOverride", @"kingKeyOverride",
+        @"kingPhone", @"kingQType", @"kingApn", @"kingTypeName", @"kingSubtype",
+        @"kingExtraInfo", @"kingMccmnc", @"kingCardType"
+    ];
+    NSMutableString *signature = [NSMutableString string];
+    for (NSString *key in keys) {
+        id value = settings[key];
+        if ([value isKindOfClass:[NSString class]] || [value isKindOfClass:[NSNumber class]]) {
+            [signature appendFormat:@"%@=%@|", key, value];
+        } else if ([value isKindOfClass:[NSNull class]]) {
+            [signature appendFormat:@"%@=null|", key];
+        } else {
+            [signature appendFormat:@"%@=|", key];
+        }
+    }
+    [signature appendFormat:@"effective=%@|", [self effectiveProxyModeForSettings:settings]];
+    return signature;
+}
+
 - (void)applyToRuntime {
     NSDictionary *s = [self load];
-    BOOL enabled = [s[@"proxyEnabled"] boolValue];
+    NSString *signature = [self runtimeSignatureForSettings:s];
+    BOOL settingsChanged = !self.lastAppliedRuntimeSignature || ![signature isEqualToString:self.lastAppliedRuntimeSignature];
+
+    // Start/refresh the KingCard forwarder before computing the per-process
+    // override. Multiple LiveContainer processes each own an ephemeral port, so
+    // they no longer contend for the fixed 127.0.0.1:18080 listener.
+    [[LCProxyKing shared] applyConfig:s];
+
     NSString *effectiveMode = [self effectiveProxyModeForSettings:s];
+    int desiredForwarderPort = 0;
+    if ([effectiveMode isEqualToString:@"kingcard"]) {
+        desiredForwarderPort = [[LCProxyKing shared] localForwarderPort];
+    }
+    BOOL forwarderPortChanged = self.lastAppliedForwarderPort != desiredForwarderPort;
+    if (desiredForwarderPort > 0) {
+        lcproxy_control_set_proxy_override("127.0.0.1", desiredForwarderPort);
+    } else {
+        lcproxy_control_set_proxy_override(NULL, 0);
+    }
+
+    BOOL enabled = [s[@"proxyEnabled"] boolValue];
     BOOL proxyActive = enabled && ![effectiveMode isEqualToString:@"direct"];
     BOOL block = [s[@"blockNonTcp"] boolValue] && proxyActive;
     BOOL debugLogging = [s[@"debugLogging"] boolValue];
     kp_set_debug_enabled(debugLogging ? 1 : 0);
-    // Re-read our dedicated proxychains.conf so changes made through the
-    // console take effect without restarting the whole process.
-    lcproxy_control_reload_config();
+
+    BOOL needsRuntimeReload = settingsChanged || forwarderPortChanged;
+    if (needsRuntimeReload) {
+        // Re-read our dedicated proxychains.conf so changes made through the
+        // console take effect without restarting the whole process. The
+        // per-process proxy override is applied by the C core after parsing.
+        lcproxy_control_reload_config();
+    }
     lcproxy_control_set_enabled(proxyActive ? 1 : 0);
     lcproxy_control_set_block_non_tcp(block ? 1 : 0);
-    [[LCProxyKing shared] applyConfig:s];
     _lastAppliedCellular = lcproxy_stats_is_cellular() ? 1 : 0;
-    livecontainer_reload_webkit_proxy();
+    if (needsRuntimeReload) {
+        livecontainer_reload_webkit_proxy();
+    }
+    self.lastAppliedRuntimeSignature = signature;
+    self.lastAppliedForwarderPort = desiredForwarderPort;
 }
 
 - (void)startNetworkMonitor {

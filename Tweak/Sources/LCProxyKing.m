@@ -123,7 +123,7 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
     }
     [self stopRefreshTimer];
     self.lastSettingsSignature = signature;
-    kp_forwarder *fw = kp_forwarder_new("127.0.0.1", 18080, "", 0);
+    kp_forwarder *fw = kp_forwarder_new("127.0.0.1", 0, "", 0);
     if (fw) {
         kp_forwarder_set_refresh_hook(fw, LCProxyKingRefreshHook, (__bridge void *)self);
         if (kp_forwarder_start(fw) == 0) {
@@ -282,6 +282,13 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
     BOOL refreshing = self.refreshing;
     [self.lock unlock];
     return running && success && !refreshing;
+}
+
+- (int)localForwarderPort {
+    [self.lock lock];
+    int port = self.forwarder ? kp_forwarder_port(self.forwarder) : 0;
+    [self.lock unlock];
+    return port;
 }
 
 - (BOOL)ensureCredentialsReadyWithTimeout:(NSTimeInterval)maxWait {
@@ -611,6 +618,7 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
     [self.lock lock];
     NSMutableDictionary *d = [NSMutableDictionary dictionary];
     d[@"running"] = @([self isRunning]);
+    d[@"forwarderPort"] = @(self.forwarder ? kp_forwarder_port(self.forwarder) : 0);
     d[@"lastRefreshSuccess"] = @(self.lastRefreshSuccess);
     d[@"lastRefresh"] = self.lastRefresh ?: @"";
     d[@"lastSource"] = self.lastSource ?: @"";

@@ -5,6 +5,7 @@
 ## 功能
 
 - **代理开关**：随时启用/禁用 HTTP 代理，不修改 `proxychains.conf` 也能立即生效。
+- **共享 App 多实例兼容**：王卡本地转发器改为每进程独立临时端口，避免多个 LiveContainer 共享同一 App Group 时争用 `127.0.0.1:18080`，修复前后台切换时被切换应用短暂无网的问题。
 - **丢弃非 TCP**：开关 `block_non_tcp`，禁止 UDP/QUIC/ICMP/raw socket 绕过代理。
 - **代理地址配置**：在控制台修改 `http host port`，保存后写回共享 `proxychains.conf`。
 - **上游模式**：支持“直连（无代理）”、“自定义代理”、“王卡代理”三种模式。

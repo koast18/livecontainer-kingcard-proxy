@@ -19,6 +19,10 @@ jobs:
 
       - name: King cache/refresh logic static tests
         run: bash Scripts/test_king_cache_logic.sh
+      - name: Foreground reload/shared-app forwarder static checks
+        run: bash Scripts/test_foreground_reload_logic.sh
+      - name: Proxy override unit tests
+        run: bash Scripts/test_proxy_override.sh
 
       - name: Async proxy relay test
         run: bash Scripts/test_async_proxy.sh

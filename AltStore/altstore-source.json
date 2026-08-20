@@ -7,20 +7,20 @@
       "name": "LiveProxy 控制台",
       "bundleIdentifier": "com.liveproxy.console",
       "developerName": "koast18",
-      "version": "0.5.20",
-      "versionDate": "2026-08-20T03:11:49Z",
-      "versionDescription": "LiveProxy 控制台 0.5.20：修复 PiliPlus/dart:io 在异步 connect 下出现网络错误的问题，将内部转发从 AF_UNIX socketpair 改为本地回环 TCP，保持真实 TCP socket 语义。",
-      "downloadURL": "https://gh-proxy.com/https://github.com/koast18/livecontainer-kingcard-proxy/releases/download/v0.5.20/LiveProxyConsole-0.5.20.ipa",
+      "version": "0.5.21",
+      "versionDate": "2026-08-20T06:43:10Z",
+      "versionDescription": "LiveProxy 控制台 0.5.21：修复共享 App 多 LiveContainer 前后台切换时被切换应用短暂无网的问题。王卡本地转发器改为每进程独立临时端口，避免多实例争用 18080；前台不再无条件重载 proxychains/WKWebView 代理配置。",
+      "downloadURL": "https://gh-proxy.com/https://github.com/koast18/livecontainer-kingcard-proxy/releases/download/v0.5.21/LiveProxyConsole-0.5.21.ipa",
       "localizedDescription": "LiveContainer 内任意 App 走 HTTP 代理的控制台 IPA。依赖 LCProxyControl dylib（自动下载到 LiveContainer Tweaks 目录），支持代理开关、丢弃非 TCP、蜂窝网络上传/下载流量统计（10 分钟时段）。",
       "iconURL": "https://raw.githubusercontent.com/koast18/livecontainer-kingcard-proxy/master/AltStore/icon.png",
       "tintColor": "2E7D32",
       "size": 19319,
       "versions": [
         {
-          "version": "0.5.20",
-          "date": "2026-08-20T03:11:49Z",
-          "downloadURL": "https://gh-proxy.com/https://github.com/koast18/livecontainer-kingcard-proxy/releases/download/v0.5.20/LiveProxyConsole-0.5.20.ipa",
-          "localizedDescription": "修复 PiliPlus/dart:io 网络错误：异步 connect 内部改用本地回环 TCP，保持真实 TCP socket 语义。"
+          "version": "0.5.21",
+          "date": "2026-08-20T06:43:10Z",
+          "downloadURL": "https://gh-proxy.com/https://github.com/koast18/livecontainer-kingcard-proxy/releases/download/v0.5.21/LiveProxyConsole-0.5.21.ipa",
+          "localizedDescription": "修复共享 App 多实例切换断网：王卡转发器使用每进程独立临时端口，前台配置无变化时不再重载代理/WKWebView 配置。"
         }
       ]
     }

@@ -8,6 +8,7 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)applyConfig:(NSDictionary *)settings;
 - (BOOL)refreshCredentials;
 - (BOOL)isReady;
+- (int)localForwarderPort;
 - (BOOL)ensureCredentialsReadyWithTimeout:(NSTimeInterval)maxWait;
 - (NSDictionary *)forwarderStats;
 - (NSDictionary *)status;

@@ -13,7 +13,7 @@
 #import "GCDWebServerDataResponse.h"
 #import "GCDWebServerRequest.h"
 
-static NSString *const LCProxyVersion = @"0.5.17";
+static NSString *const LCProxyVersion = @"0.5.21";
 static const NSUInteger LCProxyDefaultPort = 19092;
 
 @interface LCProxyServer ()
@@ -123,12 +123,12 @@ static const NSUInteger LCProxyDefaultPort = 19092;
         direct = YES;
     } else if (enabled && [effectiveMode isEqualToString:@"kingcard"]) {
         upstreamHost = @"127.0.0.1";
-        upstreamPort = 18080;
+        upstreamPort = [[LCProxyKing shared] localForwarderPort];
     } else if (enabled) {
         upstreamHost = [settings[@"proxyHost"] isKindOfClass:[NSString class]] && [settings[@"proxyHost"] length] ? settings[@"proxyHost"] : nil;
         upstreamPort = [settings[@"proxyPort"] respondsToSelector:@selector(integerValue)] ? [settings[@"proxyPort"] integerValue] : 0;
     }
-    if (!direct && (!upstreamHost.length || upstreamPort <= 0)) {
+    if (!direct && (!upstreamHost.length || (upstreamPort <= 0 && ![effectiveMode isEqualToString:@"kingcard"]))) {
         return @{@"url": urlString ?: @"", @"rc": @(-1), @"ip": @"", @"body": @"代理未启用或代理地址无效", @"ok": @NO};
     }
 
@@ -136,6 +136,10 @@ static const NSUInteger LCProxyDefaultPort = 19092;
     if (enabled && [mode isEqualToString:@"kingcard"] && ![effectiveMode isEqualToString:@"direct"]) {
         if (![[LCProxyKing shared] ensureCredentialsReadyWithTimeout:8.0]) {
             return @{@"url": urlString ?: @"", @"rc": @(-1), @"ip": @"", @"body": @"王卡凭证正在刷新或暂不可用，请稍后重试", @"ok": @NO, @"effectiveMode": effectiveMode};
+        }
+        upstreamPort = [[LCProxyKing shared] localForwarderPort];
+        if (upstreamPort <= 0) {
+            return @{@"url": urlString ?: @"", @"rc": @(-1), @"ip": @"", @"body": @"王卡转发器未就绪", @"ok": @NO, @"effectiveMode": effectiveMode};
         }
     }
 
@@ -185,12 +189,12 @@ static const NSUInteger LCProxyDefaultPort = 19092;
         direct = YES;
     } else if (enabled && [effectiveMode isEqualToString:@"kingcard"]) {
         upstreamHost = @"127.0.0.1";
-        upstreamPort = 18080;
+        upstreamPort = [[LCProxyKing shared] localForwarderPort];
     } else if (enabled) {
         upstreamHost = [settings[@"proxyHost"] isKindOfClass:[NSString class]] && [settings[@"proxyHost"] length] ? settings[@"proxyHost"] : nil;
         upstreamPort = [settings[@"proxyPort"] respondsToSelector:@selector(integerValue)] ? [settings[@"proxyPort"] integerValue] : 0;
     }
-    if (!direct && (!upstreamHost.length || upstreamPort <= 0)) {
+    if (!direct && (!upstreamHost.length || (upstreamPort <= 0 && ![effectiveMode isEqualToString:@"kingcard"]))) {
         return @{@"ok": @NO, @"error": @"代理未启用或代理地址无效", @"results": @[]};
     }
 
@@ -198,6 +202,10 @@ static const NSUInteger LCProxyDefaultPort = 19092;
     if (enabled && [mode isEqualToString:@"kingcard"] && ![effectiveMode isEqualToString:@"direct"]) {
         if (![[LCProxyKing shared] ensureCredentialsReadyWithTimeout:8.0]) {
             return @{@"ok": @NO, @"error": @"王卡凭证正在刷新或暂不可用，请稍后重试", @"results": @[], @"mode": mode, @"effectiveMode": effectiveMode};
+        }
+        upstreamPort = [[LCProxyKing shared] localForwarderPort];
+        if (upstreamPort <= 0) {
+            return @{@"ok": @NO, @"error": @"王卡转发器未就绪", @"results": @[], @"mode": mode, @"effectiveMode": effectiveMode};
         }
     }
 

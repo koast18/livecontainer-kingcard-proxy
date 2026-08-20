@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include "../vendor/proxychains-ng/src/common.h"
+#include "proxy_override.h"
 
 extern void proxychains_write_log(char *str, ...);
 
@@ -95,8 +96,15 @@ static int lc_create_proxy_config(void) {
 
     if (g_lc_proxy_config)
         return 1;
-    if (!lc_parse_proxy(host, sizeof(host), port, sizeof(port),
-                        user, sizeof(user), pass, sizeof(pass))) {
+
+    int overridePort = 0;
+    if (lcproxy_control_get_proxy_override(host, sizeof(host), &overridePort)) {
+        snprintf(port, sizeof(port), "%d", overridePort);
+        user[0] = 0;
+        pass[0] = 0;
+        proxychains_write_log("[proxychains] webkit proxy: using per-process override %s:%s\n", host, port);
+    } else if (!lc_parse_proxy(host, sizeof(host), port, sizeof(port),
+                               user, sizeof(user), pass, sizeof(pass))) {
         proxychains_write_log("[proxychains] webkit proxy: no http proxy parsed\n");
         return 0;
     }
@@ -258,4 +266,3 @@ void livecontainer_reload_webkit_proxy(void) {
         proxychains_write_log("[proxychains] webkit proxy reload: WKWebsiteDataStore unavailable\n");
     }
 }
-

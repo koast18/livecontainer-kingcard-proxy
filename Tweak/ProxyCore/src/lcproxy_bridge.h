@@ -2,6 +2,7 @@
 #define LCPROXY_BRIDGE_H
 
 #include <stdint.h>
+#include "proxy_override.h"
 
 #ifdef __cplusplus
 extern "C" {

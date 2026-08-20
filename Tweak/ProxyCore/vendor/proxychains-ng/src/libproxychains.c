@@ -46,6 +46,7 @@
 #include "rdns.h"
 #include "fishhook.h"
 #include "async_proxy.h"
+#include "proxy_override.h"
 
 #undef 		satosin
 #define     satosin(x)      ((struct sockaddr_in *) &(x))
@@ -856,6 +857,7 @@ void lcproxy_control_reload_config(void) {
 	proxychains_got_chain_data = 0;
 	proxychains_proxy_count = 0;
 	get_chain_data(proxychains_pd, &proxychains_proxy_count, &proxychains_ct);
+	lcproxy_control_apply_proxy_override(proxychains_pd, proxychains_proxy_count);
 	proxychains_write_log(LOG_PREFIX "config reloaded, proxy_count=%u\n", proxychains_proxy_count);
 }
 

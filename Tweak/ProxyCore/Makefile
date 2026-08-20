@@ -25,6 +25,8 @@ WEBKIT_PROXY_SRC := src/webkit_proxy.m
 WEBKIT_PROXY_OBJ := src/webkit_proxy.o
 ASYNC_PROXY_SRC := src/async_proxy.c
 ASYNC_PROXY_OBJ := src/async_proxy.o
+PROXY_OVERRIDE_SRC := src/proxy_override.c
+PROXY_OVERRIDE_OBJ := src/proxy_override.o
 
 DEBUG ?= 0
 ifeq ($(DEBUG),1)
@@ -40,6 +42,7 @@ OBJS := \
 	$(FISHHOOK_DIR)/fishhook.o \
 	$(WEBKIT_PROXY_OBJ) \
 	$(ASYNC_PROXY_OBJ) \
+	$(PROXY_OVERRIDE_OBJ) \
 	$(SRC)/version.o \
 	$(SRC)/core.o \
 	$(SRC)/common.o \
@@ -83,6 +86,9 @@ $(WEBKIT_PROXY_OBJ): $(WEBKIT_PROXY_SRC)
 $(ASYNC_PROXY_OBJ): $(ASYNC_PROXY_SRC)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
 
+$(PROXY_OVERRIDE_OBJ): $(PROXY_OVERRIDE_SRC)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+
 $(FISHHOOK_DIR)/fishhook.o: $(FISHHOOK_DIR)/fishhook.c $(FISHHOOK_DIR)/fishhook.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
 
@@ -95,7 +101,7 @@ sign: $(PRODUCT)
 	$(CODESIGN) --force --sign - $(PRODUCT)
 
 clean:
-	rm -f $(PRODUCT) $(STATIC_LIB) $(OBJS) $(FISHHOOK_DIR)/fishhook.o $(WEBKIT_PROXY_OBJ) $(ASYNC_PROXY_OBJ)
+	rm -f $(PRODUCT) $(STATIC_LIB) $(OBJS) $(FISHHOOK_DIR)/fishhook.o $(WEBKIT_PROXY_OBJ) $(ASYNC_PROXY_OBJ) $(PROXY_OVERRIDE_OBJ)
 
 install: all
 	install -d $(DESTDIR)/Library/MobileSubstrate/DynamicLibraries $(DESTDIR)/usr/lib

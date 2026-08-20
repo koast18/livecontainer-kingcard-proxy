@@ -1898,6 +1898,17 @@ int kp_forwarder_start(kp_forwarder *fw) {
         KP_CLOSESOCK(fd);
         return -1;
     }
+    struct sockaddr_storage bound_addr;
+    socklen_t bound_len = sizeof(bound_addr);
+    if (getsockname(fd, (struct sockaddr *)&bound_addr, &bound_len) == 0) {
+        if (bound_addr.ss_family == AF_INET) {
+            struct sockaddr_in *sin = (struct sockaddr_in *)&bound_addr;
+            fw->listen_port = ntohs(sin->sin_port);
+        } else if (bound_addr.ss_family == AF_INET6) {
+            struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&bound_addr;
+            fw->listen_port = ntohs(sin6->sin6_port);
+        }
+    }
     fw->listen_fd = fd;
     fw->running = 1;
     if (pthread_create(&fw->thread, NULL, kp_forwarder_run, fw) != 0) {

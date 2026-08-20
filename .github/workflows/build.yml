@@ -27,12 +27,17 @@ jobs:
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
           VER="$(cat version.txt | tr -d ' \r\n')"
-          gh release create "$TAG" \
-            "build/LCProxyControl-${VER}.dylib" \
-            "build/LiveProxyConsole-${VER}.ipa" \
-            --title "LiveProxy ${VER}" \
-            --notes "LiveProxy 控制台 IPA + LCProxyControl dylib。添加 AltStore 源：https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/master/AltStore/altstore-source.json"
-
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              "build/LCProxyControl-${VER}.dylib" \
+              "build/LiveProxyConsole-${VER}.ipa" \
+              --title "LiveProxy ${VER}" \
+              --notes "LiveProxy 控制台 IPA + LCProxyControl dylib。添加 AltStore 源：https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/master/AltStore/altstore-source.json"
+          else
+            gh release upload "$TAG" \
+              "build/LCProxyControl-${VER}.dylib" \
+              "build/LiveProxyConsole-${VER}.ipa" --clobber
+          fi
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
