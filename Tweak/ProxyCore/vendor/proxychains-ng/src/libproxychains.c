@@ -126,6 +126,8 @@ static uint64_t lc_current_upload = 0;
 static uint64_t lc_current_download = 0;
 static int lc_cellular_cache = -1;
 static time_t lc_cellular_checked = 0;
+static int lc_network_known = 0;
+static int lc_network_non_cellular = 0;
 
 static pthread_key_t lc_bypass_key;
 static pthread_once_t lc_bypass_once = PTHREAD_ONCE_INIT;
@@ -178,8 +180,20 @@ static void lc_stats_rotate_locked(int64_t now_bucket) {
     lc_current_start = now_bucket;
 }
 
+static void lc_direct_track_close_all(void);
+static void lc_direct_track_remove(int fd);
+static void lc_direct_track_remove_range(unsigned first, unsigned last);
+static void lc_direct_track_add_if_remote(int sock, const struct sockaddr *addr, socklen_t addrlen);
+
 void lcproxy_control_set_enabled(int enabled) {
-    lc_proxy_disabled = enabled ? 0 : 1;
+    int was_disabled = lc_proxy_disabled;
+    int now_disabled = enabled ? 0 : 1;
+    if (was_disabled && !now_disabled) {
+        // Leaving direct mode: kill sockets that were opened directly while on
+        // Wi-Fi/auto-direct so they cannot keep leaking on cellular.
+        lc_direct_track_close_all();
+    }
+    lc_proxy_disabled = now_disabled;
 }
 int lcproxy_control_get_enabled(void) {
     return lc_proxy_disabled ? 0 : 1;
@@ -220,6 +234,19 @@ int lcproxy_stats_is_cellular(void) {
     lc_cellular_cache = cellular;
     lc_cellular_checked = now;
     return cellular;
+}
+
+void lcproxy_network_monitor_update(int known, int non_cellular) {
+    lc_network_known = known ? 1 : 0;
+    lc_network_non_cellular = non_cellular ? 1 : 0;
+    if (known) {
+        lc_cellular_cache = non_cellular ? 0 : 1;
+        lc_cellular_checked = time(NULL);
+    }
+}
+
+int lcproxy_network_should_direct(void) {
+    return lc_network_known && lc_network_non_cellular;
 }
 
 // 热路径专用：只读取缓存，不在每个 read/write 上跑 getifaddrs。
@@ -342,6 +369,119 @@ static int lc_should_count_fd(int fd) {
     }
     lc_fd_class_set(fd, LC_FD_CLASS_COUNT);
     return 1;
+}
+
+// Direct-connection kill switch tracking.
+// While auto-direct mode is active, remote TCP sockets are recorded so that a
+// later transition to cellular can close them before proxy mode is enabled.
+// This prevents old Wi-Fi direct connections from continuing to send traffic
+// on the cellular interface after the network path has changed.
+#define LC_DIRECT_FD_MAX 2048
+static int lc_direct_fds[LC_DIRECT_FD_MAX];
+static int lc_direct_fd_count = 0;
+static pthread_mutex_t lc_direct_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int lc_direct_is_local_addr(const struct sockaddr *addr, unsigned short port) {
+    if (!addr) return 0;
+    int family = addr->sa_family;
+    size_t i;
+    for (i = 0; i < num_localnet_addr; i++) {
+        if (localnet_addr[i].port && localnet_addr[i].port != port)
+            continue;
+        if (localnet_addr[i].family != family)
+            continue;
+        if (family == AF_INET) {
+            const struct sockaddr_in *sin = (const struct sockaddr_in *)addr;
+            if (((sin->sin_addr.s_addr ^ localnet_addr[i].in_addr.s_addr) &
+                 localnet_addr[i].in_mask.s_addr) == 0)
+                return 1;
+        } else if (family == AF_INET6) {
+            const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)addr;
+            size_t prefix_bytes = localnet_addr[i].in6_prefix / CHAR_BIT;
+            size_t prefix_bits = localnet_addr[i].in6_prefix % CHAR_BIT;
+            if (prefix_bytes && memcmp(&sin6->sin6_addr, &localnet_addr[i].in6_addr, prefix_bytes) != 0)
+                continue;
+            if (prefix_bits && (sin6->sin6_addr.s6_addr[prefix_bytes] ^ localnet_addr[i].in6_addr.s6_addr[prefix_bytes]) >> (CHAR_BIT - prefix_bits))
+                continue;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void lc_direct_track_add_if_remote(int sock, const struct sockaddr *addr, socklen_t addrlen) {
+    if (!addr || addrlen < sizeof(sa_family_t))
+        return;
+    int socktype = 0;
+    socklen_t optlen = sizeof(socktype);
+    if (getsockopt(sock, SOL_SOCKET, SO_TYPE, &socktype, &optlen) != 0)
+        return;
+    if (socktype != SOCK_STREAM)
+        return;
+    unsigned short port = 0;
+    if (addr->sa_family == AF_INET) {
+        const struct sockaddr_in *sin = (const struct sockaddr_in *)addr;
+        port = ntohs(sin->sin_port);
+    } else if (addr->sa_family == AF_INET6) {
+        const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)addr;
+        port = ntohs(sin6->sin6_port);
+    } else {
+        return;
+    }
+    if (lc_direct_is_local_addr(addr, port))
+        return;
+
+    pthread_mutex_lock(&lc_direct_lock);
+    int i;
+    for (i = 0; i < lc_direct_fd_count; i++) {
+        if (lc_direct_fds[i] == sock) {
+            pthread_mutex_unlock(&lc_direct_lock);
+            return;
+        }
+    }
+    if (lc_direct_fd_count < LC_DIRECT_FD_MAX)
+        lc_direct_fds[lc_direct_fd_count++] = sock;
+    pthread_mutex_unlock(&lc_direct_lock);
+}
+
+static void lc_direct_track_remove(int fd) {
+    pthread_mutex_lock(&lc_direct_lock);
+    int i;
+    for (i = 0; i < lc_direct_fd_count; i++) {
+        if (lc_direct_fds[i] == fd) {
+            lc_direct_fds[i] = lc_direct_fds[lc_direct_fd_count - 1];
+            lc_direct_fd_count--;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&lc_direct_lock);
+}
+
+static void lc_direct_track_remove_range(unsigned first, unsigned last) {
+    pthread_mutex_lock(&lc_direct_lock);
+    int out = 0;
+    int i;
+    for (i = 0; i < lc_direct_fd_count; i++) {
+        int fd = lc_direct_fds[i];
+        if (fd >= (int)first && fd <= (int)last)
+            continue;
+        lc_direct_fds[out++] = fd;
+    }
+    lc_direct_fd_count = out;
+    pthread_mutex_unlock(&lc_direct_lock);
+}
+
+static void lc_direct_track_close_all(void) {
+    pthread_mutex_lock(&lc_direct_lock);
+    int i;
+    for (i = 0; i < lc_direct_fd_count; i++) {
+        int fd = lc_direct_fds[i];
+        if (fd >= 0 && fcntl(fd, F_GETFD) != -1) {
+            true_close(fd);
+        }
+    }
+    lc_direct_fd_count = 0;
+    pthread_mutex_unlock(&lc_direct_lock);
 }
 
 static void get_chain_data(proxy_data * pd, unsigned int *proxy_count, chain_type * ct);
@@ -854,10 +994,15 @@ no_proxy:
 }
 
 void lcproxy_control_reload_config(void) {
+	unsigned int old_proxy_count = proxychains_proxy_count;
 	proxychains_got_chain_data = 0;
 	proxychains_proxy_count = 0;
 	get_chain_data(proxychains_pd, &proxychains_proxy_count, &proxychains_ct);
 	lcproxy_control_apply_proxy_override(proxychains_pd, proxychains_proxy_count);
+	// If a direct-mode config (no proxy list) is replaced by a proxy config
+	// while proxy mode is already enabled, close old direct sockets too.
+	if (!lc_proxy_disabled && old_proxy_count == 0 && proxychains_proxy_count > 0)
+		lc_direct_track_close_all();
 	proxychains_write_log(LOG_PREFIX "config reloaded, proxy_count=%u\n", proxychains_proxy_count);
 }
 
@@ -885,6 +1030,7 @@ static int lc_drop_non_tcp_if_enabled(int fd) {
 }
 
 HOOKFUNC(int, close, int fd) {
+	lc_direct_track_remove(fd);
 	lc_fd_class_set(fd, LC_FD_CLASS_UNKNOWN);
 	if(!init_l) {
 		if(close_fds_cnt>=(sizeof close_fds/sizeof close_fds[0])) goto err;
@@ -921,6 +1067,7 @@ static void intsort(int *a, int n) {
 /* Warning: Linux manual says the third arg is `unsigned int`, but unistd.h says `int`. */
 HOOKFUNC(int, close_range, unsigned first, unsigned last, int flags) {
 	// close_range 可能批量关闭 fd；为避免 fd 复用时命中陈旧分类，整体清空缓存。
+	lc_direct_track_remove_range(first, last);
 	memset(lc_fd_class, 0, sizeof(lc_fd_class));
 	if(true_close_range == NULL) {
 		fprintf(stderr, "Calling close_range, but this platform does not provide this system call. ");
@@ -979,8 +1126,10 @@ HOOKFUNC(int, connect, int sock, const struct sockaddr *addr, unsigned int len) 
 
 	if(lc_bypass_get())
 		return true_connect(sock, addr, len);
-	if(!proxychains_proxy_count || lc_proxy_disabled)
+	if(!proxychains_proxy_count || lc_proxy_disabled) {
+		lc_direct_track_add_if_remote(sock, addr, len);
 		return true_connect(sock, addr, len);
+	}
 	int socktype = 0, flags = 0, ret = 0;
 	socklen_t optlen = 0;
 	ip_type dest_ip;

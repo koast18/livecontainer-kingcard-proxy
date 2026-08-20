@@ -13,7 +13,7 @@
 #import "GCDWebServerDataResponse.h"
 #import "GCDWebServerRequest.h"
 
-static NSString *const LCProxyVersion = @"0.5.21";
+static NSString *const LCProxyVersion = @"0.5.22";
 static const NSUInteger LCProxyDefaultPort = 19092;
 
 @interface LCProxyServer ()

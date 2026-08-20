@@ -7,20 +7,20 @@
       "name": "LiveProxy 控制台",
       "bundleIdentifier": "com.liveproxy.console",
       "developerName": "koast18",
-      "version": "0.5.21",
-      "versionDate": "2026-08-20T06:43:10Z",
-      "versionDescription": "LiveProxy 控制台 0.5.21：修复共享 App 多 LiveContainer 前后台切换时被切换应用短暂无网的问题。王卡本地转发器改为每进程独立临时端口，避免多实例争用 18080；前台不再无条件重载 proxychains/WKWebView 代理配置。",
-      "downloadURL": "https://gh-proxy.com/https://github.com/koast18/livecontainer-kingcard-proxy/releases/download/v0.5.21/LiveProxyConsole-0.5.21.ipa",
+      "version": "0.5.22",
+      "versionDate": "2026-08-20T07:10:00Z",
+      "versionDescription": "LiveProxy 控制台 0.5.22：网络状态变化改为实时路径监听 + fail-closed 处理。Wi-Fi/蜂窝自动直连切换时优先保持王卡代理，避免切换窗口内直连公网；从直连切回代理时会关闭旧直连 TCP 连接。",
+      "downloadURL": "https://gh-proxy.com/https://github.com/koast18/livecontainer-kingcard-proxy/releases/download/v0.5.22/LiveProxyConsole-0.5.22.ipa",
       "localizedDescription": "LiveContainer 内任意 App 走 HTTP 代理的控制台 IPA。依赖 LCProxyControl dylib（自动下载到 LiveContainer Tweaks 目录），支持代理开关、丢弃非 TCP、蜂窝网络上传/下载流量统计（10 分钟时段）。",
       "iconURL": "https://raw.githubusercontent.com/koast18/livecontainer-kingcard-proxy/master/AltStore/icon.png",
       "tintColor": "2E7D32",
       "size": 19319,
       "versions": [
         {
-          "version": "0.5.21",
-          "date": "2026-08-20T06:43:10Z",
-          "downloadURL": "https://gh-proxy.com/https://github.com/koast18/livecontainer-kingcard-proxy/releases/download/v0.5.21/LiveProxyConsole-0.5.21.ipa",
-          "localizedDescription": "修复共享 App 多实例切换断网：王卡转发器使用每进程独立临时端口，前台配置无变化时不再重载代理/WKWebView 配置。"
+          "version": "0.5.22",
+          "date": "2026-08-20T07:10:00Z",
+          "downloadURL": "https://gh-proxy.com/https://github.com/koast18/livecontainer-kingcard-proxy/releases/download/v0.5.22/LiveProxyConsole-0.5.22.ipa",
+          "localizedDescription": "网络切换 fail-closed：NWPathMonitor 实时感知 Wi-Fi/蜂窝变化，切换期间默认走代理，并关闭旧直连连接。"
         }
       ]
     }

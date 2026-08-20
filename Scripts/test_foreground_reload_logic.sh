@@ -52,5 +52,18 @@ assert 'void lcproxy_control_set_proxy_override' in override_c
 assert 'int lcproxy_control_get_proxy_override' in override_c
 assert 'void lcproxy_control_apply_proxy_override' in override_c
 
+# Fail-closed network monitoring.
+assert 'lcproxy_network_monitor_update' in config, 'missing network monitor update call'
+assert 'lcproxy_network_should_direct' in config, 'effective mode does not use fail-closed direct decision'
+assert 'nw_path_monitor_create' in config, 'missing NWPathMonitor integration'
+assert 'handleNetworkPath' in config, 'missing path handler'
+assert 'writeProxychainsConf:s toDirectory:dir' in config, 'does not regenerate conf on effective mode change'
+assert 'lcproxy_network_monitor_update' in lib, 'missing network monitor update implementation'
+assert 'lcproxy_network_should_direct' in lib, 'missing network direct decision implementation'
+assert 'lc_direct_track_close_all' in lib, 'missing direct socket kill switch'
+assert 'lc_direct_track_add_if_remote' in lib, 'missing direct socket tracking'
+assert 'lc_direct_track_remove' in lib, 'missing direct socket untrack on close'
+assert 'lc_direct_track_remove_range' in lib, 'missing direct socket untrack on close_range'
+
 print('foreground reload / shared-app forwarder static checks OK')
 PY

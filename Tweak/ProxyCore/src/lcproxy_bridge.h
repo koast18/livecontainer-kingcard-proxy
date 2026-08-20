@@ -17,6 +17,10 @@ int  lcproxy_control_get_enabled(void);
 void lcproxy_control_set_block_non_tcp(int enabled);
 int  lcproxy_control_get_block_non_tcp(void);
 
+// Real-time network path hints (NWPathMonitor updates routing fail-closed)
+void     lcproxy_network_monitor_update(int known, int non_cellular);
+int      lcproxy_network_should_direct(void);
+
 // Cellular traffic statistics
 int      lcproxy_stats_is_cellular(void);
 void     lcproxy_stats_add_upload(uint64_t n);

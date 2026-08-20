@@ -3,6 +3,7 @@
 #import "lcproxy_bridge.h"
 #import "LCProxyKing.h"
 #import "KPKIngCore.h"
+#import <Network/Network.h>
 #include "webkit_proxy.h"
 
 static NSString *const LCProxySettingsFile = @"settings.json";
@@ -11,10 +12,11 @@ static const NSTimeInterval LCProxyNetworkMonitorInterval = 2.0;
 
 @interface LCProxyConfig ()
 @property (nonatomic, strong) dispatch_source_t networkTimer;
-@property (nonatomic, assign) int lastAppliedCellular;
+@property (nonatomic, assign) int lastAppliedShouldDirect;
 @property (nonatomic, copy) NSString *lastAppliedRuntimeSignature;
 @property (nonatomic, assign) int lastAppliedForwarderPort;
 - (void)checkNetworkAndApplyIfNeeded;
+- (void)handleNetworkPath:(nw_path_t)path;
 - (NSString *)runtimeSignatureForSettings:(NSDictionary *)settings;
 @end
 
@@ -118,7 +120,7 @@ static const NSTimeInterval LCProxyNetworkMonitorInterval = 2.0;
     NSString *mode = [settings[@"proxyMode"] isKindOfClass:[NSString class]] ? settings[@"proxyMode"] : @"custom";
     if ([mode isEqualToString:@"kingcard"] &&
         [settings[@"kingAutoDirectOnNonCellular"] boolValue] &&
-        !lcproxy_stats_is_cellular()) {
+        lcproxy_network_should_direct()) {
         return @"direct";
     }
     return mode;
@@ -225,6 +227,13 @@ static const NSTimeInterval LCProxyNetworkMonitorInterval = 2.0;
 
     BOOL needsRuntimeReload = settingsChanged || forwarderPortChanged;
     if (needsRuntimeReload) {
+        // Regenerate the shared conf with the current effective mode first.
+        // This is required for auto-direct mode: when the network changes from
+        // Wi-Fi (direct conf) to cellular, the on-disk conf must become the
+        // KingCard proxy list before reload, otherwise proxy_count stays 0.
+        for (NSString *dir in LCProxyAllDataDirectories()) {
+            [self writeProxychainsConf:s toDirectory:dir];
+        }
         // Re-read our dedicated proxychains.conf so changes made through the
         // console take effect without restarting the whole process. The
         // per-process proxy override is applied by the C core after parsing.
@@ -232,7 +241,7 @@ static const NSTimeInterval LCProxyNetworkMonitorInterval = 2.0;
     }
     lcproxy_control_set_enabled(proxyActive ? 1 : 0);
     lcproxy_control_set_block_non_tcp(block ? 1 : 0);
-    _lastAppliedCellular = lcproxy_stats_is_cellular() ? 1 : 0;
+    _lastAppliedShouldDirect = lcproxy_network_should_direct() ? 1 : 0;
     if (needsRuntimeReload) {
         livecontainer_reload_webkit_proxy();
     }
@@ -240,9 +249,14 @@ static const NSTimeInterval LCProxyNetworkMonitorInterval = 2.0;
     self.lastAppliedForwarderPort = desiredForwarderPort;
 }
 
+static nw_path_monitor_t g_networkMonitor;
+
 - (void)startNetworkMonitor {
     if (_networkTimer) return;
     dispatch_queue_t q = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
+
+    // Keep a low-frequency fallback so stats/state are refreshed even if the
+    // Network.framework monitor is unavailable or stops delivering updates.
     dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
     dispatch_source_set_timer(timer,
                               dispatch_time(DISPATCH_TIME_NOW, (int64_t)(LCProxyNetworkMonitorInterval * NSEC_PER_SEC)),
@@ -254,18 +268,43 @@ static const NSTimeInterval LCProxyNetworkMonitorInterval = 2.0;
     });
     dispatch_resume(timer);
     _networkTimer = timer;
+
+    if (g_networkMonitor) return;
+    g_networkMonitor = nw_path_monitor_create();
+    if (!g_networkMonitor) return;
+    nw_path_monitor_set_update_handler(g_networkMonitor, ^(nw_path_t path) {
+        __strong LCProxyConfig *strongSelf = weakSelf;
+        if (!strongSelf) return;
+        [strongSelf handleNetworkPath:path];
+    });
+    nw_path_monitor_set_queue(g_networkMonitor, q);
+    nw_path_monitor_start(g_networkMonitor);
+}
+
+- (void)handleNetworkPath:(nw_path_t)path {
+    nw_path_status_t status = nw_path_get_status(path);
+    BOOL satisfied = status == nw_path_status_satisfied;
+    BOOL hasCellular = nw_path_uses_interface_type(path, nw_interface_type_cellular);
+    // Fail-closed: only allow direct when we are sure the active path is
+    // non-cellular. Unknown/unsatisfied/cellular all keep proxy mode.
+    int known = satisfied ? 1 : 0;
+    int nonCellular = (satisfied && !hasCellular) ? 1 : 0;
+    lcproxy_network_monitor_update(known, nonCellular);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self applyToRuntime];
+    });
 }
 
 - (void)checkNetworkAndApplyIfNeeded {
     NSDictionary *settings = [self load];
     NSString *mode = [settings[@"proxyMode"] isKindOfClass:[NSString class]] ? settings[@"proxyMode"] : @"custom";
     if (![mode isEqualToString:@"kingcard"] || ![settings[@"kingAutoDirectOnNonCellular"] boolValue]) {
-        _lastAppliedCellular = -1;
+        _lastAppliedShouldDirect = -1;
         return;
     }
-    int cellular = lcproxy_stats_is_cellular() ? 1 : 0;
-    if (cellular != _lastAppliedCellular) {
-        _lastAppliedCellular = cellular;
+    int shouldDirect = lcproxy_network_should_direct() ? 1 : 0;
+    if (shouldDirect != _lastAppliedShouldDirect) {
+        _lastAppliedShouldDirect = shouldDirect;
         [self applyToRuntime];
     }
 }
