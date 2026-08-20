@@ -172,6 +172,9 @@ static int make_local_tcp_pair(int sock, int v6, int orig_flags, int *peer_fd) {
         return -1;
     }
 
+    int lflags = fcntl(listen_fd, F_GETFL, 0);
+    if (lflags >= 0) fcntl(listen_fd, F_SETFL, lflags | O_NONBLOCK);
+
     slen = sizeof(ss);
     if (getsockname(listen_fd, (struct sockaddr *)&ss, &slen) != 0) {
         close(listen_fd);
@@ -193,7 +196,16 @@ static int make_local_tcp_pair(int sock, int v6, int orig_flags, int *peer_fd) {
         return -1;
     }
 
-    accepted = accept(listen_fd, NULL, NULL);
+    {
+        struct pollfd pfd;
+        pfd.fd = listen_fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        int prc = poll(&pfd, 1, 2000);
+        if (prc > 0 && (pfd.revents & POLLIN)) {
+            accepted = accept(listen_fd, NULL, NULL);
+        }
+    }
     close(listen_fd);
     if (accepted < 0) return -1;
 
