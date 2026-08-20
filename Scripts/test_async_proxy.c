@@ -17,6 +17,7 @@
 #include <netinet/in.h>
 #include <pthread.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -151,22 +152,22 @@ static int make_nonblocking_socket(void) {
 }
 
 static int test_echo(size_t payload_len, const char *name) {
+    puts("start test"); fflush(stderr);
     pthread_t server_thread;
     g_upstream_port = 0;
     if (pthread_create(&server_thread, NULL, echo_server, NULL) != 0) {
         fprintf(stderr, "%s: failed to create echo server\n", name);
         return 1;
     }
+    pthread_detach(server_thread);
     if (wait_for_port() != 0) {
         fprintf(stderr, "%s: echo server did not publish port\n", name);
-        pthread_join(server_thread, NULL);
         return 1;
     }
 
     int sock = make_nonblocking_socket();
     if (sock < 0) {
         perror(name);
-        pthread_join(server_thread, NULL);
         return 1;
     }
 
@@ -183,7 +184,6 @@ static int test_echo(size_t payload_len, const char *name) {
     if (rc != 0) {
         fprintf(stderr, "%s: lcproxy_async_connect_start failed\n", name);
         close(sock);
-        pthread_join(server_thread, NULL);
         return 1;
     }
     long long elapsed_ms =
@@ -192,14 +192,12 @@ static int test_echo(size_t payload_len, const char *name) {
     if (elapsed_ms > 500) {
         fprintf(stderr, "%s: async start too slow: %lld ms\n", name, elapsed_ms);
         close(sock);
-        pthread_join(server_thread, NULL);
         return 1;
     }
 
     if (wait_event(sock, POLLOUT, 2000) != 0) {
         fprintf(stderr, "%s: socketpair not writable\n", name);
         close(sock);
-        pthread_join(server_thread, NULL);
         return 1;
     }
 
@@ -207,7 +205,6 @@ static int test_echo(size_t payload_len, const char *name) {
     if (!payload) {
         fprintf(stderr, "%s: malloc failed\n", name);
         close(sock);
-        pthread_join(server_thread, NULL);
         return 1;
     }
     for (size_t i = 0; i < payload_len; i++) {
@@ -227,7 +224,6 @@ static int test_echo(size_t payload_len, const char *name) {
                 fprintf(stderr, "%s: send timed out\n", name);
                 free(payload);
                 close(sock);
-                pthread_join(server_thread, NULL);
                 return 1;
             }
             continue;
@@ -235,7 +231,6 @@ static int test_echo(size_t payload_len, const char *name) {
         perror(name);
         free(payload);
         close(sock);
-        pthread_join(server_thread, NULL);
         return 1;
     }
 
@@ -244,7 +239,6 @@ static int test_echo(size_t payload_len, const char *name) {
         perror(name);
         free(payload);
         close(sock);
-        pthread_join(server_thread, NULL);
         return 1;
     }
 
@@ -259,7 +253,6 @@ static int test_echo(size_t payload_len, const char *name) {
                     name, ack_got, expected_len);
             free(payload);
             close(sock);
-            pthread_join(server_thread, NULL);
             return 1;
         }
         ssize_t r = recv(sock, ack_buf + ack_got, expected_len - ack_got, 0);
@@ -273,7 +266,6 @@ static int test_echo(size_t payload_len, const char *name) {
         fprintf(stderr, "%s: ack connection closed early: %zd\n", name, r);
         free(payload);
         close(sock);
-        pthread_join(server_thread, NULL);
         return 1;
     }
 
@@ -281,7 +273,6 @@ static int test_echo(size_t payload_len, const char *name) {
         fprintf(stderr, "%s: ack mismatch\n", name);
         free(payload);
         close(sock);
-        pthread_join(server_thread, NULL);
         return 1;
     }
 
@@ -289,7 +280,6 @@ static int test_echo(size_t payload_len, const char *name) {
            name, elapsed_ms, payload_len, expected);
     free(payload);
     close(sock);
-    pthread_join(server_thread, NULL);
     return 0;
 }
 static int test_upstream_failure(void) {
@@ -340,6 +330,7 @@ static int test_upstream_failure(void) {
 }
 
 int main(void) {
+    alarm(30);
     int failed = 0;
 
     if (test_echo(32, "small relay roundtrip") != 0) failed = 1;
