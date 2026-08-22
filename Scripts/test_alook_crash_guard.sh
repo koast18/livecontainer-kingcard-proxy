@@ -2,15 +2,23 @@
 # Static guards for the Alook/Speedtest high-download crash fixes.
 #
 # These are cheap source-level assertions that catch accidental regressions of
-# the two crash fixes already merged in v0.5.24 / v0.5.27:
-#   1. WKWebView nw_proxy_config is not released immediately on reload.
-#   2. KingCard forwarder caps concurrent clients and waits for client threads
-#      before freeing the forwarder.
+# the crash fixes:
+#   v0.5.24:
+#     - WKWebView nw_proxy_config is not released immediately on reload.
+#     - KingCard forwarder caps concurrent clients.
+#   v0.5.27:
+#     - KingCard forwarder waits for client threads before freeing.
+#   This branch:
+#     - async_proxy relay threads are capped.
+#     - WKWebView keeps multiple old nw_proxy_config generations.
+#     - LCProxyKing does not stop/free the forwarder while holding self.lock.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 WEBKIT="Tweak/ProxyCore/src/webkit_proxy.m"
 CORE="Tweak/Sources/KPKIngCore.c"
+ASYNC="Tweak/ProxyCore/src/async_proxy.c"
+KING="Tweak/Sources/LCProxyKing.m"
 
 fail() {
     echo "Alook crash guard FAILED: $1" >&2
@@ -18,10 +26,10 @@ fail() {
 }
 
 # --- nw_proxy_config lifecycle guard ---
-grep -q "g_lc_proxy_config_old" "$WEBKIT" \
-    || fail "webkit_proxy.m no longer keeps a stale nw_proxy_config generation"
-grep -q "nw_release(g_lc_proxy_config_old)" "$WEBKIT" \
-    || fail "webkit_proxy.m no longer defers nw_proxy_config release"
+grep -q "LC_WEBKIT_MAX_OLD_PROXY_CONFIGS" "$WEBKIT" \
+    || fail "webkit_proxy.m no longer keeps multiple stale nw_proxy_config generations"
+grep -q "lc_retire_current_proxy_config" "$WEBKIT" \
+    || fail "webkit_proxy.m no longer defers nw_proxy_config release through a retirement queue"
 
 # --- forwarder thread cap guard ---
 grep -q "define KP_FORWARDER_MAX_CLIENTS 64" "$CORE" \
@@ -36,5 +44,15 @@ grep -q "pthread_cond_wait(&fw->client_cond, &fw->client_lock)" "$CORE" \
     || fail "KPKIngCore.c no longer waits for active clients in kp_forwarder_stop"
 grep -q "while (fw->active_clients > 0)" "$CORE" \
     || fail "KPKIngCore.c no longer waits on active_clients before freeing"
+
+# --- async_proxy relay thread cap guard ---
+grep -q "define LC_ASYNC_MAX_RELAY_THREADS 64" "$ASYNC" \
+    || fail "async_proxy.c lost the relay thread cap"
+grep -q "lc_async_relay_try_acquire" "$ASYNC" \
+    || fail "async_proxy.c no longer bounds relay thread creation"
+
+# --- LCProxyKing deadlock guard ---
+grep -q "不要在持有 self.lock 时 stop/free" "$KING" \
+    || fail "LCProxyKing.m lost the no-stop-under-lock comment/guard marker"
 
 echo "Alook crash guard static checks OK"

@@ -7,16 +7,16 @@
 
 ## 0. 结论速览
 
-本项目 dylib 在“高速下载 10 秒左右闪退”上，**已经有两个明确的代码级根因被修复**，还有一个 **v0.5.27 之后新暴露/仍然存在的并发死锁风险**，以及若干**需要 crash report 才能确认的 WebKit/资源型候选**：
+本项目 dylib 在“高速下载 10 秒左右闪退”上，**已经有多个明确的代码级根因被修复**；本分支又补上了 **死锁、async_proxy 线程上限、WebKit 多代 UAF 加固**，剩余主要是**需要 crash report 才能确认的 WebKit/资源型候选**：
 
 | # | 根因 | 状态 | 对应提交/代码 |
 |---|---|---|---|
 | 1 | `nw_proxy_config` 被提前释放，WebKit 下载/网络栈 use-after-free | 已修复（延迟一代释放） | `7ed66fa` (v0.5.24), `Tweak/ProxyCore/src/webkit_proxy.m` |
 | 2 | KingCard 本地转发器并发连接风暴，无限创建线程耗尽资源 | 已修复（64 并发上限 + 失败处理） | `7ed66fa` (v0.5.24), `Tweak/Sources/KPKIngCore.c` |
 | 3 | 转发器 stop/free 时仍有 detached client 线程访问已释放结构体 | 已修复（跟踪 fd、shutdown、等待归零） | `f5078ec` (v0.5.27), `Tweak/Sources/KPKIngCore.c` |
-| 4 | `LCProxyKing.applyConfig` 持锁调用 `kp_forwarder_stop`，与 client 线程取号刷新可能死锁 | **未修复/仍存在** | `Tweak/Sources/LCProxyKing.m:98-132`, `Tweak/Sources/KPKIngCore.c:2068-2098` |
-| 5 | `async_proxy.c` 每个非阻塞 connect 都 detach 一个 relay 线程，无上限/无跟踪 | **未修复/仍存在** | `Tweak/ProxyCore/src/async_proxy.c:219-243` |
-| 6 | WebKit 下载进行中反复 reload/clear `WKWebsiteDataStore.proxyConfigurations`，可能触发 WebKit 内部重配置崩溃 | 需真机验证 | `Tweak/ProxyCore/src/webkit_proxy.m:144-183,245-276` |
+| 4 | `LCProxyKing.applyConfig` 持锁调用 `kp_forwarder_stop`，与 client 线程取号刷新可能死锁 | **已修复（本分支）** | `Tweak/Sources/LCProxyKing.m:98-132`, `Tweak/Sources/KPKIngCore.c:2068-2098` |
+| 5 | `async_proxy.c` 每个非阻塞 connect 都 detach 一个 relay 线程，无上限/无跟踪 | **已修复（本分支）** | `Tweak/ProxyCore/src/async_proxy.c:219-243` |
+| 6 | WebKit 下载进行中反复 reload/clear `WKWebsiteDataStore.proxyConfigurations`，可能触发 WebKit 内部重配置崩溃 | 已加固（多代保留），真机验证 | `Tweak/ProxyCore/src/webkit_proxy.m:144-183,245-276` |
 | 7 | iOS Jetsam 内存/线程超限被杀，表现为“闪退” | 需 crash report 确认 | 与 #2/#5 相关 |
 
 ## 1. 已确认根因 1：`nw_proxy_config` Use-After-Free（v0.5.24 修复）
@@ -103,7 +103,7 @@ Speedtest / 多线程下载器会瞬间建立大量并发 TCP 连接，每个连
 
 这个根因通常在“下载进行中切换代理/关闭王卡/切换网络模式”时触发，和用户“大流量下载约 10 秒闪退”高度吻合。
 
-## 4. 仍未修复的并发风险：`applyConfig` 持锁 stop/free 转发器可能死锁
+## 4. 已修复的并发风险：`applyConfig` 持锁 stop/free 转发器可能死锁
 
 ### 代码路径
 
@@ -155,14 +155,18 @@ kp_forwarder_refresh_retry(fw, 3, 500)
 5. 该 client 线程在 `refreshCredentialsWithForce:` 开头等待 `self.lock`，永远不退出。
 6. 主线程死等，App 卡死；iOS Watchdog 可能随后杀进程，表现也是“闪退”。
 
-### 建议修复方向
+### 本分支修复
 
-- 不要把 `kp_forwarder_stop/free` 放在持有 `self.lock` 的临界区内；
-- 先摘除 `self.forwarder` 引用并释放锁，再 stop/free；
-- 或者让 `kp_forwarder_refresh_retry` 使用独立的 C 锁/异步刷新，不依赖 `LCProxyKing.lock`；
+- `applyConfig:` 已改为：先在锁内摘除 `self.forwarder` 引用并释放 `self.lock`，再在锁外调用 `kp_forwarder_stop/free`；
+- 创建新转发器也在锁外完成，最后回锁确认仍应运行且没有别的转发器被安装；
+- 因此 client 线程取号刷新等待 `self.lock` 时，不会再与主线程的 stop 等待互相死锁。
+
+### 建议修复方向（如果后续还要更稳）
+
+- 让 `kp_forwarder_refresh_retry` 使用独立的 C 锁/异步刷新，不依赖 `LCProxyKing.lock`；
 - 或给 stop 增加超时，超时后不无限等待，避免主线程永久卡死。
 
-## 5. 仍未修复的并发风险：`async_proxy.c` 的 relay 线程无上限
+## 5. 已修复的并发风险：`async_proxy.c` 的 relay 线程无上限
 
 `Tweak/ProxyCore/src/async_proxy.c` 为非阻塞 `connect()` 提供异步代理：
 
@@ -185,11 +189,16 @@ pthread_detach(thread);
 
 线程/栈内存仍然可能被打爆，尤其是多个 App 或多次测速叠加时。
 
-### 建议
+### 本分支修复
 
-- 给 `async_proxy` 也加全局活跃 relay 线程上限；
-- `pthread_create` 失败时不要简单 fallback 到同步路径，还要避免同步阻塞主线程；
-- 或把 relay 线程池化，避免每次连接都新建线程。
+- `async_proxy.c` 已增加 `LC_ASYNC_MAX_RELAY_THREADS 64` 全局活跃 relay 线程上限；
+- 达到上限时 `lcproxy_async_connect_start` 返回失败，调用方回退到同步代理路径，不再无限创建 detached 线程；
+- `make_local_tcp_pair` / `calloc` / `pthread_create` 失败路径都会正确释放已占用的 relay 名额。
+
+### 后续可选优化
+
+- 把 relay 线程池化，避免每次连接都新建线程；
+- `pthread_create` 失败时避免直接同步阻塞主线程，可考虑排队异步重试。
 
 ## 6. 需真机日志确认的 WebKit 行为
 
@@ -213,7 +222,7 @@ pthread_detach(thread);
 
 ### 6.2 多个 WKWebsiteDataStore / 多个代 config 的 UAF 残留
 
-当前只保留一代旧 config。若 Alook 或系统同时存在多个 data store（默认、non-persistent、自定义），且每个 store 都持有一个不同代的 `nw_proxy_config`，则“只留一代”仍可能不够。
+本分支已把“只保留一代旧 config”改为“保留最多 3 个旧 config”，降低多 data store / 多次 reload 时的多代 UAF 风险。若仍出现崩溃，需用 crash report 确认是否还有 WebKit 内部生命周期问题。
 
 ### 6.3 Speedtest 使用 QUIC/HTTP3 与 `block_non_tcp`
 
@@ -241,16 +250,20 @@ Speedtest 某些节点可能使用 UDP/QUIC。若用户开启了“丢弃非 TCP
    - 开启 vs 关闭 `block_non_tcp`
    - Speedtest 用 1 线程 vs 多线程
 4. **版本确认**
-   - 当前 master 是 v0.5.27，已包含 v0.5.24 + v0.5.27 两个关键修复；
+   - 当前 master 是 v0.5.28，已包含 v0.5.24 + v0.5.27 两个关键修复；本分支另有死锁/线程上限/WebKit 加固。
    - 如果用户实际使用的是早于 v0.5.24 的 dylib，先升级再复测。
 
-## 8. 建议的后续代码动作（按优先级）
+## 8. 已完成的代码动作
 
 1. 修复 `LCProxyKing.applyConfig` 持锁 stop/free 的死锁风险（第 4 节）。
-2. 给 `async_proxy` relay 线程加上限/池化（第 5 节）。
-3. 增加“下载/测速期间延迟 WebKit proxy reload”或“只在空闲时 reload”的策略。
-4. 对 `nw_proxy_config` 生命周期做更保守的保留：至少保留 N 代，或在每次 reload 前显式等待 WebKit 完成下载（难以做到，因此建议减少 reload）。
-5. 在 CI/静态测试中加入针对上述并发不变量的检查，防止回归。
+2. 给 `async_proxy` relay 线程加上限（第 5 节）。
+3. 对 `nw_proxy_config` 生命周期做更保守的保留：保留最多 3 个旧 config（第 1/6 节）。
+4. 在 CI 静态测试中加入针对上述并发不变量的检查。
+
+### 仍建议的真机验证/后续
+
+- 增加“下载/测速期间延迟 WebKit proxy reload”或“只在空闲时 reload”的策略。
+- 获取真机 `.ips`，确认是否还有 WebKit 内部重配置或 Jetsam 相关问题。
 
 ## 9. 与现有测试/GitHub Actions 的关系
 
@@ -262,4 +275,4 @@ Speedtest 某些节点可能使用 UDP/QUIC。若用户开启了“丢弃非 TCP
 - Queen crypto/WUP 对比
 - iOS dylib 编译链接（macOS runner）
 
-这些测试可以验证代码可编译、基础逻辑不回归，但**不能替代真机 crash log**。本分支已创建，可 push 后由 GitHub Actions 自动跑一遍现有 CI；若后续添加“死锁/线程上限”静态检查，也会在 CI 中执行。
+这些测试可以验证代码可编译、基础逻辑不回归，但**不能替代真机 crash log**。本分支的 CI 已加入 `Alook high-download crash guard static checks`，覆盖 WebKit 多代保留、转发器线程上限/等待、async_proxy relay 上限和死锁修复标记。
