@@ -1101,8 +1101,13 @@ struct kp_forwarder {
     pthread_t thread;
     // 活跃客户端/转发线程计数：防止高速下载并发连接风暴瞬间创建过量线程，
     // 耗尽系统线程/栈内存导致整个 App 闪退。达到上限时拒绝新连接（503）。
+    // client_fds 记录当前活跃连接，kp_forwarder_stop 会 shutdown 它们让阻塞的
+    // recv/poll 返回，然后等待 active_clients 归零再释放，避免 use-after-free。
     pthread_mutex_t client_lock;
+    pthread_cond_t client_cond;
     int active_clients;
+    int client_fds[KP_FORWARDER_MAX_CLIENTS];
+    int client_fd_count;
 };
 
 struct client_arg {
@@ -1878,10 +1883,19 @@ static int kp_forwarder_refresh_retry(kp_forwarder *fw, int attempts, int backof
 static void *kp_client_thread(void *arg) {
     struct client_arg *ca = arg;
     kp_forwarder *fw = ca->fw;
-    kp_handle_client(fw, ca->fd);
+    int fd = ca->fd;
+    kp_handle_client(fw, fd);
     free(ca);
     pthread_mutex_lock(&fw->client_lock);
+    for (int i = 0; i < fw->client_fd_count; i++) {
+        if (fw->client_fds[i] == fd) {
+            fw->client_fds[i] = fw->client_fds[fw->client_fd_count - 1];
+            fw->client_fd_count--;
+            break;
+        }
+    }
     if (fw->active_clients > 0) fw->active_clients--;
+    pthread_cond_broadcast(&fw->client_cond);
     pthread_mutex_unlock(&fw->client_lock);
     return NULL;
 }
@@ -1899,7 +1913,10 @@ static void *kp_forwarder_run(void *arg) {
         // 高速下载并发上限：超出则立即拒绝，避免线程风暴耗尽进程资源。
         pthread_mutex_lock(&fw->client_lock);
         int over = fw->active_clients >= KP_FORWARDER_MAX_CLIENTS;
-        if (!over) fw->active_clients++;
+        if (!over) {
+            fw->active_clients++;
+            fw->client_fds[fw->client_fd_count++] = client;
+        }
         pthread_mutex_unlock(&fw->client_lock);
         if (over) {
             char *msg = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
@@ -1911,6 +1928,13 @@ static void *kp_forwarder_run(void *arg) {
         if (!ca) {
             pthread_mutex_lock(&fw->client_lock);
             if (fw->active_clients > 0) fw->active_clients--;
+            for (int i = 0; i < fw->client_fd_count; i++) {
+                if (fw->client_fds[i] == client) {
+                    fw->client_fds[i] = fw->client_fds[fw->client_fd_count - 1];
+                    fw->client_fd_count--;
+                    break;
+                }
+            }
             pthread_mutex_unlock(&fw->client_lock);
             KP_CLOSESOCK(client);
             continue;
@@ -1921,6 +1945,13 @@ static void *kp_forwarder_run(void *arg) {
         if (pthread_create(&t, NULL, kp_client_thread, ca) != 0) {
             pthread_mutex_lock(&fw->client_lock);
             if (fw->active_clients > 0) fw->active_clients--;
+            for (int i = 0; i < fw->client_fd_count; i++) {
+                if (fw->client_fds[i] == client) {
+                    fw->client_fds[i] = fw->client_fds[fw->client_fd_count - 1];
+                    fw->client_fd_count--;
+                    break;
+                }
+            }
             pthread_mutex_unlock(&fw->client_lock);
             free(ca);
             KP_CLOSESOCK(client);
@@ -1945,8 +1976,10 @@ kp_forwarder *kp_forwarder_new(const char *listen_host, int listen_port,
     fw->refresh_fn = NULL;
     fw->refresh_ctx = NULL;
     fw->active_clients = 0;
+    fw->client_fd_count = 0;
     pthread_mutex_init(&fw->cred_mutex, NULL);
     pthread_mutex_init(&fw->client_lock, NULL);
+    pthread_cond_init(&fw->client_cond, NULL);
     return fw;
 }
 
@@ -2034,15 +2067,35 @@ int kp_forwarder_start(kp_forwarder *fw) {
 
 void kp_forwarder_stop(kp_forwarder *fw) {
     if (!fw) return;
-    if (!fw->running) return;
-    fw->running = 0;
-    if (fw->listen_fd >= 0) {
-        // shutdown 先唤醒阻塞的 accept（Linux 上 close 不唤醒；macOS 无副作用）
-        shutdown(fw->listen_fd, SHUT_RDWR);
-        KP_CLOSESOCK(fw->listen_fd);
-        fw->listen_fd = -1;
+    if (fw->running) {
+        fw->running = 0;
+        if (fw->listen_fd >= 0) {
+            // shutdown 先唤醒阻塞的 accept（Linux 上 close 不唤醒；macOS 无副作用）
+            shutdown(fw->listen_fd, SHUT_RDWR);
+            KP_CLOSESOCK(fw->listen_fd);
+            fw->listen_fd = -1;
+        }
     }
-    pthread_join(fw->thread, NULL);
+    // 先 join 主 accept 线程：确保 accept 循环完全停止，不会再登记新 client fd。
+    // 否则 stop 遍历 client_fds 之后若有新连接被 accept 但尚未登记，其 fd 不会被
+    // shutdown，对应 client 线程永不退出，stop 会死锁。
+    if (fw->thread) {
+        pthread_join(fw->thread, NULL);
+        fw->thread = 0;
+    }
+
+    // shutdown 所有活跃 client fd，让阻塞在 recv/poll 的转发线程返回。
+    pthread_mutex_lock(&fw->client_lock);
+    for (int i = 0; i < fw->client_fd_count; i++) {
+        int fd = fw->client_fds[i];
+        if (fd >= 0) shutdown(fd, SHUT_RDWR);
+    }
+    // 等待所有 client 线程结束，避免 kp_forwarder_free 后线程仍访问 fw（UAF）。
+    while (fw->active_clients > 0) {
+        pthread_cond_wait(&fw->client_cond, &fw->client_lock);
+    }
+    fw->client_fd_count = 0;
+    pthread_mutex_unlock(&fw->client_lock);
 }
 
 void kp_forwarder_free(kp_forwarder *fw) {
@@ -2050,6 +2103,7 @@ void kp_forwarder_free(kp_forwarder *fw) {
     kp_forwarder_stop(fw);
     pthread_mutex_destroy(&fw->cred_mutex);
     pthread_mutex_destroy(&fw->client_lock);
+    pthread_cond_destroy(&fw->client_cond);
     free(fw);
 }
 
