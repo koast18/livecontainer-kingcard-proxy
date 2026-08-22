@@ -17,6 +17,8 @@ static void LCProxyShowBanner(NSDictionary *settings) {
         text = @"LiveProxy 已加载 · 王卡代理";
     } else if ([effectiveMode isEqualToString:@"custom"]) {
         text = @"LiveProxy 已加载 · 自定义代理";
+    } else if ([effectiveMode isEqualToString:@"tailscale"]) {
+        text = @"LiveProxy 已加载 · Tailscale";
     } else {
         text = @"LiveProxy 已加载 · 直连";
     }

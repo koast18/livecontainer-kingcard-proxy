@@ -33,6 +33,12 @@ th:first-child,td:first-child { text-align:left; }
 .badge { display:inline-block; padding:2px 8px; border-radius:10px; font-size:12px; }
 .badge.on { background:#1f6feb33; color:#58a6ff; }
 .badge.off { background:#f8514933; color:#f85149; }
+.tabs { display:flex; gap:8px; padding:10px 16px 0; max-width:760px; margin:0 auto; border-bottom:1px solid #21262d; }
+.tab { padding:8px 14px; border-radius:8px 8px 0 0; color:#8b949e; cursor:pointer; font-size:14px; }
+.tab.active { color:#e6edf3; background:#161b22; border:1px solid #30363d; border-bottom-color:#161b22; }
+.tabpage { display:none; }
+.tabpage.active { display:block; }
+select { background:#0d1117; border:1px solid #30363d; color:#e6edf3; border-radius:8px; padding:8px 10px; width:100%; box-sizing:border-box; }
 </style>
 </head>
 <body>
@@ -40,7 +46,14 @@ th:first-child,td:first-child { text-align:left; }
   <h1>LiveProxy 控制台</h1>
   <div class="sub">LiveContainer 任意 App 走 HTTP 代理 · 10 分钟流量统计</div>
 </header>
+<div class="tabs">
+  <div class="tab active" data-tab="proxy">代理</div>
+  <div class="tab" data-tab="tailscale">Tailscale</div>
+  <div class="tab" data-tab="stats">流量统计</div>
+  <div class="tab" data-tab="about">关于</div>
+</div>
 <main>
+  <div class="tabpage active" id="tab-proxy">
   <div class="card">
     <h2>代理控制</h2>
     <div class="row"><span class="k">启用代理</span>
@@ -61,6 +74,7 @@ th:first-child,td:first-child { text-align:left; }
         <option value="custom">自定义代理</option>
         <option value="direct">直连（无代理）</option>
         <option value="kingcard">王卡代理</option>
+        <option value="tailscale">Tailscale</option>
       </select>
       <div class="row"><span class="k">当前生效</span><span class="v" id="effectiveMode">…</span></div>
       <div id="customFields" style="margin-top:10px">
@@ -111,7 +125,47 @@ th:first-child,td:first-child { text-align:left; }
     </div>
   </div>
 
-  <div class="card">
+  </div>
+
+  <div class="tabpage" id="tab-tailscale">
+    <div class="card">
+      <h2>Tailscale 控制</h2>
+      <div class="row"><span class="k">运行状态</span><span class="v" id="tsRunning">…</span></div>
+      <div class="row"><span class="k">本地 SOCKS5 端口</span><span class="v" id="tsPort">…</span></div>
+      <div class="row"><span class="k">上次错误</span><span class="v" id="tsError">…</span></div>
+      <div class="row" style="display:block;margin-top:10px">
+        <label class="k">节点名称（Hostname）</label>
+        <input type="text" id="tailscaleHostname" placeholder="lc-tailscale">
+        <label class="k">Auth Key</label>
+        <input type="text" id="tailscaleAuthKey" placeholder="tskey-auth-...">
+        <label class="k">Control URL</label>
+        <input type="text" id="tailscaleControlURL" placeholder="https://control.tailscale.com">
+        <label class="k">状态目录（留空自动）</label>
+        <input type="text" id="tailscaleStateDir" placeholder="/path/to/tailscale">
+        <div class="row"><span class="k">临时节点（Ephemeral）</span>
+          <label class="switch"><input type="checkbox" id="tailscaleEphemeral"><span class="slider"></span></label>
+        </div>
+        <p class="msg">DERP-only 已固定开启：关闭 P2P 直连/UDP 打洞，所有 Tailscale 外连（含 DERP）走当前王卡代理。</p>
+      </div>
+      <div style="margin-top:12px"><button id="saveTailscale">保存并应用</button></div>
+      <div class="msg" id="tsCfgMsg"></div>
+    </div>
+    <div class="card">
+      <h2>Exit Node</h2>
+      <div class="row"><span class="k">启用 Exit Node</span>
+        <label class="switch"><input type="checkbox" id="tailscaleExitNodeEnabled"><span class="slider"></span></label>
+      </div>
+      <div class="row" style="display:block;margin-top:10px">
+        <label class="k">选择 Exit Node</label>
+        <select id="tailscaleExitNodeID"></select>
+      </div>
+      <div style="margin-top:12px"><button id="applyExitNode">应用 Exit Node</button></div>
+      <div class="msg" id="tsExitMsg"></div>
+    </div>
+  </div>
+
+  <div class="tabpage" id="tab-stats">
+    <div class="card">
     <h2>流量统计（蜂窝网络）</h2>
     <div class="row"><span class="k">当前网络</span><span class="v" id="net">…</span></div>
     <div class="row"><span class="k">累计上传</span><span class="v" id="totalUp">…</span></div>
@@ -125,6 +179,9 @@ th:first-child,td:first-child { text-align:left; }
     <div class="msg" id="statsMsg"></div>
   </div>
 
+  </div>
+
+  <div class="tabpage" id="tab-about">
   <div class="card">
     <h2>关于</h2>
     <div class="row"><span class="k">版本</span><span class="v" id="version">…</span></div>
@@ -134,6 +191,7 @@ th:first-child,td:first-child { text-align:left; }
     <div class="row"><span class="k">核心代理数</span><span class="v" id="proxyCount">…</span></div>
     <div class="row"><span class="k">控制端口</span><span class="v" id="port">…</span></div>
     <p class="msg">提示：修改代理地址或端口后，建议重启一次被代理 App，确保 WKWebView 等系统组件也使用新配置。</p>
+  </div>
   </div>
 </main>
 <script>
@@ -147,6 +205,13 @@ const api = async (path, opts) => {
 };
 let dirty = false;
 function markDirty() { dirty = true; }
+function showTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
+  document.querySelectorAll('.tabpage').forEach(p => p.classList.toggle('active', p.id === 'tab-' + name));
+}
+document.querySelectorAll('.tab').forEach(t => {
+  t.addEventListener('click', () => showTab(t.dataset.tab));
+});
 const fmt = n => {
   n = Number(n||0);
   if (n >= 1024*1024*1024) return (n/1024/1024/1024).toFixed(2)+' GB';
@@ -163,14 +228,18 @@ function syncModeUI() {
   const mode = $('proxyMode').value;
   $('customFields').style.display = mode === 'custom' ? 'block' : 'none';
   $('kingFields').style.display = mode === 'kingcard' ? 'block' : 'none';
-  const labels = {custom:'自定义代理', direct:'直连（无代理）', kingcard:'王卡代理'};
+  const labels = {custom:'自定义代理', direct:'直连（无代理）', kingcard:'王卡代理', tailscale:'Tailscale'};
   $('effectiveMode').textContent = labels[mode] || mode || '—';
 }
 async function loadStatus() {
   const s = await api('/api/status');
   if (s.error) { $('cfgMsg').textContent = '状态获取失败: '+s.error; return; }
   const king = s.king || {};
+  const ts = s.tailscale || {};
   $('kingRunning').textContent = king.running ? '运行中' : '未运行';
+  $('tsRunning').textContent = ts.starting ? '启动中…' : (ts.running ? '运行中' : '未运行');
+  $('tsPort').textContent = ts.proxyPort ? String(ts.proxyPort) : '—';
+  $('tsError').textContent = ts.lastError || '—';
   $('kingRefresh').textContent = king.lastRefresh || '—';
   $('kingSource').textContent = king.lastSource || '—';
   const fwStats = s.kingAggregate || {};
@@ -191,6 +260,13 @@ async function loadStatus() {
   $('port').textContent = s.serverPort || '—';
   if (dirty) return;
   $('proxyEnabled').checked = !!s.proxyEnabled;
+  $('tailscaleHostname').value = s.tailscaleHostname || 'lc-tailscale';
+  $('tailscaleAuthKey').value = s.tailscaleAuthKey || '';
+  $('tailscaleControlURL').value = s.tailscaleControlURL || '';
+  $('tailscaleStateDir').value = s.tailscaleStateDir || '';
+  $('tailscaleEphemeral').checked = s.tailscaleEphemeral != null ? !!s.tailscaleEphemeral : true;
+  $('tailscaleExitNodeEnabled').checked = !!s.tailscaleExitNodeEnabled;
+  renderExitNodes(ts.exitNodes || [], ts.selectedExitNodeID || '');
   $('blockNonTcp').checked = !!s.blockNonTcp;
   $('debugLogging').checked = !!s.debugLogging;
   $('showProxyBanner').checked = s.showProxyBanner != null ? !!s.showProxyBanner : true;
@@ -209,8 +285,38 @@ async function loadStatus() {
   $('kingAutoDirectOnNonCellular').checked = !!s.kingAutoDirectOnNonCellular;
   syncModeUI();
   const effective = s.effectiveMode || s.proxyMode || 'custom';
-  const labels = {custom:'自定义代理', direct:'直连（无代理）', kingcard:'王卡代理'};
+  const labels = {custom:'自定义代理', direct:'直连（无代理）', kingcard:'王卡代理', tailscale:'Tailscale'};
   $('effectiveMode').textContent = labels[effective] || effective;
+}
+function renderExitNodes(nodes, selectedID) {
+  const sel = $('tailscaleExitNodeID');
+  const prev = sel.value;
+  sel.innerHTML = '';
+  if (!nodes || !nodes.length) {
+    const opt = document.createElement('option');
+    opt.value = '';
+    opt.textContent = '暂无可用 Exit Node';
+    sel.appendChild(opt);
+    return;
+  }
+  nodes.forEach(n => {
+    const opt = document.createElement('option');
+    opt.value = n.ID || n.StableID || '';
+    const name = n.HostName || n.DNSName || n.ID || 'unknown';
+    const ips = (n.TailscaleIPs || []).join(',');
+    opt.textContent = name + (ips ? ' (' + ips + ')' : '');
+    sel.appendChild(opt);
+  });
+  if (selectedID) sel.value = selectedID;
+  else if (prev) sel.value = prev;
+}
+async function loadTailscale() {
+  const r = await api('/api/tailscale/status');
+  if (r.error) return;
+  $('tsRunning').textContent = r.starting ? '启动中…' : (r.running ? '运行中' : '未运行');
+  $('tsPort').textContent = r.proxyPort ? String(r.proxyPort) : '—';
+  renderExitNodes(r.exitNodes || [], r.selectedExitNodeID || '');
+  $('tailscaleExitNodeEnabled').checked = !!r.exitNodeEnabled;
 }
 async function loadStats() {
   const s = await api('/api/stats');
@@ -288,7 +394,14 @@ $('saveConfig').onclick = async () => {
     kingSubtype: parseInt($('kingSubtype').value || '0', 10),
     kingExtraInfo: $('kingExtraInfo').value.trim() || 'UNKNOW',
     kingCardType: parseInt($('kingCardType').value || '1', 10),
-    kingAutoDirectOnNonCellular: $('kingAutoDirectOnNonCellular').checked
+    kingAutoDirectOnNonCellular: $('kingAutoDirectOnNonCellular').checked,
+    tailscaleHostname: $('tailscaleHostname').value.trim() || 'lc-tailscale',
+    tailscaleAuthKey: $('tailscaleAuthKey').value.trim(),
+    tailscaleControlURL: $('tailscaleControlURL').value.trim(),
+    tailscaleStateDir: $('tailscaleStateDir').value.trim(),
+    tailscaleEphemeral: $('tailscaleEphemeral').checked,
+    tailscaleExitNodeID: $('tailscaleExitNodeID').value || '',
+    tailscaleExitNodeEnabled: $('tailscaleExitNodeEnabled').checked
   };
   const r = await api('/api/config', {method:'POST', body:JSON.stringify(body)});
   if (!r.error) dirty = false;
@@ -319,12 +432,35 @@ $('testProxyBtn').onclick = async () => {
     $('proxyTestMsg').textContent = '所有 IP 源均失败，请检查代理/转发器';
   }
 };
+$('saveTailscale').onclick = async () => {
+  const body = {
+    proxyMode: $('proxyMode').value,
+    tailscaleHostname: $('tailscaleHostname').value.trim() || 'lc-tailscale',
+    tailscaleAuthKey: $('tailscaleAuthKey').value.trim(),
+    tailscaleControlURL: $('tailscaleControlURL').value.trim(),
+    tailscaleStateDir: $('tailscaleStateDir').value.trim(),
+    tailscaleEphemeral: $('tailscaleEphemeral').checked,
+    tailscaleExitNodeID: $('tailscaleExitNodeID').value || '',
+    tailscaleExitNodeEnabled: $('tailscaleExitNodeEnabled').checked
+  };
+  const r = await api('/api/config', {method:'POST', body:JSON.stringify(body)});
+  $('tsCfgMsg').textContent = r.error ? ('保存失败: '+r.error) : '已保存并应用';
+  loadStatus();
+};
+$('applyExitNode').onclick = async () => {
+  const id = $('tailscaleExitNodeID').value || '';
+  const enabled = $('tailscaleExitNodeEnabled').checked;
+  const r = await api('/api/tailscale/exit-node', {method:'POST', body: JSON.stringify({id, enabled})});
+  $('tsExitMsg').textContent = r.error ? ('设置失败: '+r.error) : (enabled ? '已启用 Exit Node' : '已关闭 Exit Node');
+  loadTailscale();
+  loadStatus();
+};
 $('resetStats').onclick = async () => {
   const r = await api('/api/reset-stats', {method:'POST', body:'{}'});
   $('statsMsg').textContent = r.error ? ('失败: '+r.error) : '统计已清空';
   loadStats();
 };
-async function refresh() { await loadStatus(); await loadStats(); }
+async function refresh() { await loadStatus(); await loadStats(); await loadTailscale(); }
 setInterval(refresh, 5000);
 refresh();
 </script>

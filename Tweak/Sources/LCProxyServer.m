@@ -5,6 +5,7 @@
 #import "ConsoleHTML.h"
 #import "lcproxy_bridge.h"
 #import "LCProxyKing.h"
+#import "LCTailscaleManager.h"
 #import "KPKIngCore.h"
 #include "webkit_proxy.h"
 #include <arpa/inet.h>
@@ -79,6 +80,15 @@ static const NSUInteger LCProxyDefaultPort = 19092;
     d[@"settingsPath"] = [[LCProxyConfig shared] settingsPath];
     d[@"settingsExists"] = @([[NSFileManager defaultManager] fileExistsAtPath:[[LCProxyConfig shared] settingsPath]]);
     d[@"king"] = [[LCProxyKing shared] status];
+    d[@"tailscale"] = @{
+        @"running": @([[LCTailscaleManager shared] isRunning]),
+        @"starting": @([[LCTailscaleManager shared] isStarting]),
+        @"proxyPort": @([[LCTailscaleManager shared] localProxyPort]),
+        @"exitNodes": [[LCTailscaleManager shared] exitNodes] ?: @[],
+        @"selectedExitNodeID": [[LCTailscaleManager shared] selectedExitNodeID] ?: @"",
+        @"exitNodeEnabled": @([[LCTailscaleManager shared] exitNodeEnabled]),
+        @"lastError": [[LCTailscaleManager shared] lastError] ?: @""
+    };
     NSDictionary *stats = [[LCProxyStats shared] aggregate];
     d[@"kingAggregate"] = stats[@"forwarder"] ?: @{};
     return d;
@@ -302,7 +312,9 @@ static const NSUInteger LCProxyDefaultPort = 19092;
         for (NSString *key in @[@"proxyEnabled", @"blockNonTcp", @"debugLogging", @"showProxyBanner", @"proxyMode", @"proxyType", @"proxyHost", @"proxyPort",
                                  @"kingUpstreamHost", @"kingUpstreamPort", @"kingRefreshURL", @"kingAutoDirectOnNonCellular",
                                  @"kingGuidOverride", @"kingTokenOverride", @"kingKeyOverride", @"kingPhone", @"kingQType",
-                                 @"kingApn", @"kingTypeName", @"kingSubtype", @"kingExtraInfo", @"kingMccmnc", @"kingCardType"]) {
+                                 @"kingApn", @"kingTypeName", @"kingSubtype", @"kingExtraInfo", @"kingMccmnc", @"kingCardType",
+                                 @"tailscaleHostname", @"tailscaleAuthKey", @"tailscaleControlURL", @"tailscaleStateDir",
+                                 @"tailscaleEphemeral", @"tailscaleForceDerpOnly", @"tailscaleExitNodeID", @"tailscaleExitNodeEnabled"]) {
             if (body[key] != nil) merged[key] = body[key];
         }
         if (![[LCProxyConfig shared] saveSettings:merged]) {
@@ -318,6 +330,33 @@ static const NSUInteger LCProxyDefaultPort = 19092;
         BOOL ok = [[LCProxyKing shared] refreshCredentialsForce];
         NSMutableDictionary *resp = [NSMutableDictionary dictionaryWithDictionary:[[LCProxyKing shared] status]];
         resp[@"ok"] = @(ok);
+        return [self json:resp];
+    }];
+
+    [server addHandlerForMethod:@"GET" path:@"/api/tailscale/status" requestClass:[GCDWebServerRequest class]
+                   processBlock:^GCDWebServerResponse *(GCDWebServerRequest *request) {
+        NSMutableDictionary *resp = [NSMutableDictionary dictionary];
+        resp[@"running"] = @([[LCTailscaleManager shared] isRunning]);
+        resp[@"starting"] = @([[LCTailscaleManager shared] isStarting]);
+        resp[@"proxyPort"] = @([[LCTailscaleManager shared] localProxyPort]);
+        resp[@"exitNodes"] = [[LCTailscaleManager shared] exitNodes] ?: @[];
+        resp[@"selectedExitNodeID"] = [[LCTailscaleManager shared] selectedExitNodeID] ?: @"";
+        resp[@"exitNodeEnabled"] = @([[LCTailscaleManager shared] exitNodeEnabled]);
+        resp[@"status"] = [[LCTailscaleManager shared] status] ?: @{};
+        return [self json:resp];
+    }];
+
+    [server addHandlerForMethod:@"POST" path:@"/api/tailscale/exit-node" requestClass:[GCDWebServerDataRequest class]
+                   processBlock:^GCDWebServerResponse *(GCDWebServerRequest *request) {
+        NSDictionary *body = [self jsonBody:request];
+        NSString *exitID = [body[@"id"] isKindOfClass:[NSString class]] ? body[@"id"] : @"";
+        BOOL enabled = [body[@"enabled"] boolValue];
+        BOOL ok = [[LCTailscaleManager shared] setExitNode:exitID enabled:enabled];
+        NSMutableDictionary *resp = [NSMutableDictionary dictionary];
+        resp[@"ok"] = @(ok);
+        resp[@"selectedExitNodeID"] = [[LCTailscaleManager shared] selectedExitNodeID] ?: @"";
+        resp[@"exitNodeEnabled"] = @([[LCTailscaleManager shared] exitNodeEnabled]);
+        if (!ok) resp[@"error"] = @"设置 exit node 失败";
         return [self json:resp];
     }];
 
