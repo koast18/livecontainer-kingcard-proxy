@@ -3,3 +3,4 @@ build/
 *.dylib
 *.ipa
 .DS_Store
+.tmp_research/

@@ -7,7 +7,9 @@
 #import "lcproxy_bridge.h"
 #import <stdlib.h>
 
-static const NSTimeInterval LCProxyKingRefreshInterval = 5 * 60;
+// 周期必须 <= LCProxyKingRefreshLeadTime(2min)，否则续期窗口内可能一次触发都轮不到；
+// 且代理池 TTL 仅 ~9.5min，过长的固定网格会在每次续期后错位出死区。
+static const NSTimeInterval LCProxyKingRefreshInterval = 2 * 60;
 static const NSTimeInterval LCProxyKingRefreshLeeway = 30;
 static const NSTimeInterval LCProxyKingRefreshLeadTime = 2 * 60;
 
@@ -47,6 +49,7 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
 @property (nonatomic, strong) dispatch_source_t refreshTimer;
 @property (nonatomic, assign) BOOL refreshing;
 @property (nonatomic, copy) NSString *lastSettingsSignature;
+@property (nonatomic, strong) NSMutableArray<NSDictionary *> *refreshLog;
 - (void)startRefreshTimer;
 - (void)stopRefreshTimer;
 @end
@@ -66,6 +69,7 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
     self = [super init];
     if (self) {
         _lock = [[NSLock alloc] init];
+        _refreshLog = [[NSMutableArray alloc] init];
         kp_set_debug_logger(LCProxyKingLog);
     }
     return self;
@@ -97,7 +101,11 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
         [self.lock unlock];
         BOOL settingsChanged = ![signature isEqualToString:self.lastSettingsSignature];
         if (settingsChanged) self.lastSettingsSignature = signature;
-        [self startRefreshTimer];
+        // 不要无条件重启定时器：applyToRuntime 会因前后台切换/网络变化被频繁调用，
+        // 每次都 stop+新建 会把 5 分钟→2 分钟的刷新节奏不断清零，永远凑不满一个周期。
+        if (settingsChanged || self.refreshTimer == nil) {
+            [self startRefreshTimer];
+        }
         [self loadCachedStateIntoForwarder];
         if (settingsChanged || ![self hasFreshCachedState]) {
             [self refreshCredentialsAsync];
@@ -218,6 +226,18 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
 
 - (void)loadCachedStateIntoForwarder {
     NSMutableDictionary *state = [self loadState];
+    // 无条件恢复历史取号日志：即便凭证尚不完整提前 return，控制台也能读到历史记录。
+    NSArray *savedLog = [state[@"refreshLog"] isKindOfClass:[NSArray class]] ? state[@"refreshLog"] : nil;
+    if (savedLog.count) {
+        [self.lock lock];
+        if (self.refreshLog.count == 0) {
+            [self.refreshLog addObjectsFromArray:savedLog];
+            while (self.refreshLog.count > LCProxyKingRefreshLogMax) {
+                [self.refreshLog removeLastObject];
+            }
+        }
+        [self.lock unlock];
+    }
     NSString *guid = [state[@"guid"] isKindOfClass:[NSString class]] ? state[@"guid"] : nil;
     NSString *token = [state[@"token"] isKindOfClass:[NSString class]] ? state[@"token"] : nil;
     NSString *qkey = [state[@"key"] isKindOfClass:[NSString class]] ? state[@"key"] : nil;
@@ -416,6 +436,29 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
     return s;
 }
 
+static const NSUInteger LCProxyKingRefreshLogMax = 20;
+
+// 取号日志：内存环形缓冲（新→旧，最多 LCProxyKingRefreshLogMax 条），
+// 同时写入 kingcard-state.json 的 refreshLog 键——控制台与 guest 进程共享该
+// 文件，控制台因此能看到最近发生过的取号记录（含其他 App 触发的）。
+- (void)pushRefreshLog:(BOOL)ok src:(NSString *)src ms:(double)ms msg:(NSString *)msg intoState:(NSMutableDictionary *)state {
+    NSDictionary *entry = @{
+        @"ts": @([[NSDate date] timeIntervalSince1970]),
+        @"ok": @(ok),
+        @"src": src ?: @"",
+        @"ms": @(round(ms)),
+        @"msg": msg ?: @"",
+    };
+    [self.lock lock];
+    [self.refreshLog insertObject:entry atIndex:0];
+    while (self.refreshLog.count > LCProxyKingRefreshLogMax) {
+        [self.refreshLog removeLastObject];
+    }
+    NSArray *snapshot = [self.refreshLog copy];
+    [self.lock unlock];
+    if (state) state[@"refreshLog"] = snapshot;
+}
+
 // ---------------------------------------------------------------------------
 // 新版 Queen/King 刷新流程：
 //   GUID（PBProxy GetGuid，失败本地生成） -> Q-Token/Q-Key（旧 WUP TokenInfoReq）
@@ -430,6 +473,9 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
     }
     self.refreshing = YES;
     [self.lock unlock];
+
+    NSDate *t0 = [NSDate date];
+    NSMutableString *steps = [NSMutableString string];
 
     NSDictionary *settings = [self settingsSnapshot];
     NSMutableDictionary *state = [self loadState];
@@ -459,10 +505,14 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
         if (!guid) {
             guid = [self localRandomGuid];
             self.lastSource = @"guid-local";
+            [steps appendFormat:@"GUID: 本地生成（服务器失败 %@）\n", guidErr.localizedDescription ?: @""];
         } else {
             self.lastSource = @"guid-pbprx";
+            [steps appendString:@"GUID: PBProxy 获取\n"];
         }
         state[@"guid"] = guid;
+    } else {
+        [steps appendString:@"GUID: 复用缓存\n"];
     }
 
     // Q-Token / Q-Key
@@ -486,7 +536,8 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
             NSError *tokErr = nil;
             NSDictionary *tokInfo = [self syncFetchToken:guid qua2:qua2 phone:phone timeout:timeout error:&tokErr];
             if (!tokInfo) {
-                [self finishRefreshWithState:state success:NO error:[NSString stringWithFormat:@"Q-Token 获取失败: %@", tokErr.localizedDescription ?: @"unknown"]];
+                [steps appendFormat:@"Q-Token: 失败 %@\n", tokErr.localizedDescription ?: @"unknown"];
+                [self finishRefreshWithState:state success:NO src:(self.lastSource ?: @"") ms:-[t0 timeIntervalSinceNow] * 1000.0 steps:steps error:[NSString stringWithFormat:@"Q-Token 获取失败: %@", tokErr.localizedDescription ?: @"unknown"]];
                 return NO;
             }
             token = tokInfo[@"token"];
@@ -500,10 +551,15 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
                 state[@"tokenExpireEpoch"] = @(nowEpoch + 7200.0);
             }
             self.lastSource = [NSString stringWithFormat:@"token-%@", tokInfo[@"mode"] ?: @"?"];
+            NSNumber *expireSeconds = tokInfo[@"expire_seconds"];
+            [steps appendFormat:@"Q-Token: mode=%@ 有效期=%@s\n",
+                tokInfo[@"mode"] ?: @"?",
+                expireSeconds ?: @"?"];
         }
     }
     if (!token.length || !qkey.length) {
-        [self finishRefreshWithState:state success:NO error:@"Q-Token/Q-Key 为空"];
+        [steps appendString:@"Q-Token/Q-Key: 为空\n"];
+        [self finishRefreshWithState:state success:NO src:(self.lastSource ?: @"") ms:-[t0 timeIntervalSinceNow] * 1000.0 steps:steps error:@"Q-Token/Q-Key 为空"];
         return NO;
     }
 
@@ -524,7 +580,8 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
         NSError *proxyErr = nil;
         NSDictionary *proxyInfo = [self syncFetchProxies:guid qua2:qua2 params:params timeout:timeout error:&proxyErr];
         if (!proxyInfo) {
-            [self finishRefreshWithState:state success:NO error:[NSString stringWithFormat:@"Queen 代理池获取失败: %@", proxyErr.localizedDescription ?: @"unknown"]];
+            [steps appendFormat:@"代理池: 失败 %@\n", proxyErr.localizedDescription ?: @"unknown"];
+            [self finishRefreshWithState:state success:NO src:(self.lastSource ?: @"") ms:-[t0 timeIntervalSinceNow] * 1000.0 steps:steps error:[NSString stringWithFormat:@"Queen 代理池获取失败: %@", proxyErr.localizedDescription ?: @"unknown"]];
             return NO;
         }
         queenHttp = [self proxiesSortedByLatency:proxyInfo[@"queen_http"]];
@@ -538,10 +595,15 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
         if (proxyLife < 60.0) proxyLife = 60.0;
         state[@"proxyExpireEpoch"] = @(nowEpoch2 + proxyLife - 30.0);
         self.lastSource = [NSString stringWithFormat:@"proxy-oldwup-%@", proxyInfo[@"mode"] ?: @"?"];
+        [steps appendFormat:@"代理池: http=%lu https=%lu lifePeriod=%@s server=%@\n",
+            (unsigned long)queenHttp.count, (unsigned long)queenHttps.count,
+            proxyInfo[@"lifePeriod"] ?: @"?",
+            proxyInfo[@"server"] ?: @"?"];
     }
 
     if (!queenHttp.count && !queenHttps.count) {
-        [self finishRefreshWithState:state success:NO error:@"Queen 代理池为空"];
+        [steps appendString:@"代理池: 为空\n"];
+        [self finishRefreshWithState:state success:NO src:(self.lastSource ?: @"") ms:-[t0 timeIntervalSinceNow] * 1000.0 steps:steps error:@"Queen 代理池为空"];
         return NO;
     }
 
@@ -566,14 +628,31 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
     self.lastRefreshSuccess = YES;
     self.lastRefresh = LCProxyKingNow();
     self.lastError = @"";
+    // refreshing 标志必须在锁内复位：否则存在窗口期，其他线程持锁读到
+    // refreshing==YES 却拿不到"刷新已完成"的事实，误拒新的刷新请求。
+    // saveState 放在锁外，避免磁盘 IO 拖长临界区。
+    self.refreshing = NO;
     [self.lock unlock];
 
+    [steps appendFormat:@"写入转发器: http=%lu https=%lu\n",
+        (unsigned long)queenHttp.count, (unsigned long)queenHttps.count];
+    [self pushRefreshLog:YES src:(self.lastSource ?: @"") ms:-[t0 timeIntervalSinceNow] * 1000.0 msg:steps intoState:state];
     [self saveState:state];
-    self.refreshing = NO;
     return YES;
 }
 
 - (void)finishRefreshWithState:(NSDictionary *)state success:(BOOL)success error:(NSString *)error {
+    // 兼容包装：无步骤明细的失败路径，日志 msg 直接用错误文本。
+    [self finishRefreshWithState:state success:success
+                             src:(self.lastSource ?: @"") ms:0
+                           steps:nil error:error];
+}
+
+- (void)finishRefreshWithState:(NSDictionary *)state success:(BOOL)success
+                           src:(NSString *)src ms:(double)ms
+                         steps:(NSString *)steps error:(NSString *)error {
+    [self pushRefreshLog:success src:src ms:ms
+                     msg:(steps.length ? steps : (error ?: @"")) intoState:state];
     [self saveState:state];
     [self.lock lock];
     self.refreshing = NO;
@@ -624,6 +703,7 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
     d[@"lastSource"] = self.lastSource ?: @"";
     d[@"lastError"] = self.lastError ?: @"";
     d[@"lastDiagnostics"] = self.lastDiagnostics ?: @"";
+    d[@"refreshLog"] = [self.refreshLog copy];
     NSMutableDictionary *state = [self loadState];
     NSString *guid = [state[@"guid"] isKindOfClass:[NSString class]] ? state[@"guid"] : @"";
     if (guid.length > 12) {

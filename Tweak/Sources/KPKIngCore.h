@@ -143,6 +143,24 @@ int kp_login_via_proxy(const char *upstream_host, int upstream_port,
                        const char *login_host, const char *guid, const char *token,
                        int timeout_ms, char *diag_status, size_t diag_cap);
 
+/// 直连（socket 层 bypass，不经本进程代理劫持）发起 HTTP POST。
+/// 仅供凭证取号等基础设施流量使用：这类请求若被劫持回本进程 forwarder，
+/// 会在凭证过期时形成"刷新请求依赖已失效凭证"的循环死锁。
+/// 仅支持 http:// URL；headers 为 "Name: Value" 字符串数组，NULL 结尾。
+/// 返回 0=收到完整响应（out 填充原始响应报文），-1=网络/参数错误，-2=URL 非 http。
+/// 同 kp_http_post_direct，另通过 out_len 回填响应真实字节数（响应体可能含 \0）。
+int kp_http_post_direct_len(const char *url,
+                            const char *const headers[],
+                            const char *body, size_t body_len,
+                            int timeout_ms,
+                            char *out, size_t out_cap,
+                            size_t *out_len);
+int kp_http_post_direct(const char *url,
+                        const char *const headers[],
+                        const char *body, size_t body_len,
+                        int timeout_ms,
+                        char *out, size_t out_cap);
+
 /// 探活：经上游代理 CONNECT www.gstatic.com:80 + GET /generate_204。返回 1 通。
 int kp_probe_generate204(const char *upstream_host, int upstream_port,
                          const char *guid, const char *token, int timeout_ms);

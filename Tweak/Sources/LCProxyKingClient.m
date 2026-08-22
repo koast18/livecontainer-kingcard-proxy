@@ -7,6 +7,7 @@
 #import "LCProxyKingClient.h"
 #import "KPKCrypto.h"
 #import "KPKQueenCore.h"
+#import "KPKIngCore.h"
 
 #import <stdlib.h>
 #import <sys/time.h>
@@ -881,7 +882,7 @@ static NSString *KPKParseGetGuidResponse(NSData *raw) {
     return KPKHexUpper(guid);
 }
 
-static NSData *KPKSyncPost(NSString *urlString, NSDictionary *headers, NSData *body, NSTimeInterval timeout) {
+static NSData *KPKSyncPostNSURLSession(NSString *urlString, NSDictionary *headers, NSData *body, NSTimeInterval timeout) {
     NSURL *url = [NSURL URLWithString:urlString];
     if (!url) return nil;
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
@@ -909,6 +910,60 @@ static NSData *KPKSyncPost(NSString *urlString, NSDictionary *headers, NSData *b
     [session finishTasksAndInvalidate];
     if (resultError) return nil;
     return result;
+}
+
+static NSData *KPKSyncPost(NSString *urlString, NSDictionary *headers, NSData *body, NSTimeInterval timeout) {
+    if ([urlString hasPrefix:@"https://"]) {
+        // HTTPS 无法用裸 socket 直连（无客户端 TLS），退回系统栈；
+        // 当前仅 PBProxy GetGuid 使用 https，其失败有 localRandomGuid 兜底。
+        return KPKSyncPostNSURLSession(urlString, headers, body, timeout);
+    }
+
+    // 组装 C 侧头数组
+    NSMutableArray<NSData *> *kept = [NSMutableArray array];
+    const char **cHeaders = NULL;
+    NSUInteger count = headers.count;
+    if (count > 0) {
+        cHeaders = (const char **)calloc(count + 1, sizeof(char *));
+        NSUInteger i = 0;
+        for (NSString *key in headers) {
+            NSString *line = [NSString stringWithFormat:@"%@: %@", key, headers[key]];
+            NSData *d = [line dataUsingEncoding:NSUTF8StringEncoding];
+            [kept addObject:d];
+            cHeaders[i++] = (const char *)d.bytes;
+        }
+    }
+
+    size_t outCap = 32 * 1024;
+    char *out = (char *)calloc(1, outCap);
+    int rc = -1;
+    NSData *parsed = nil;
+    if (out) {
+        size_t respLen = 0;
+        rc = kp_http_post_direct_len(urlString.UTF8String,
+                                     (const char *const *)cHeaders,
+                                     body.bytes, body.length,
+                                     (int)(timeout * 1000.0),
+                                     out, outCap, &respLen);
+        if (rc == 0 && respLen > 0) {
+            // 提取 body（自动处理 gzip 等，与原 NSURLSession 行为对齐）。
+            // 栈上缓冲：避免 static 缓冲在并发/重入时互相污染。
+            char bodyBuf[24 * 1024];
+            size_t bodyLen = 0;
+            kp_fetch_diag diag;
+            kp_fetch_diag_init(&diag);
+            if (kp_parse_http_response(out, respLen, bodyBuf, sizeof(bodyBuf), &bodyLen, &diag) == 0 && bodyLen > 0) {
+                parsed = [NSData dataWithBytes:bodyBuf length:bodyLen];
+            }
+        }
+        free(out);
+    }
+    if (cHeaders) free(cHeaders);
+    if (rc != 0 || !parsed) {
+        NSLog(@"[LCProxyKingClient] direct post failed: %@ rc=%d", urlString, rc);
+        return nil;
+    }
+    return parsed;
 }
 
 // ---------------------------------------------------------------------------

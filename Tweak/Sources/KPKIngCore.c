@@ -842,6 +842,64 @@ int kp_http_get_direct(const char *target_host, int target_port, const char *pat
     return -1;
 }
 
+int kp_http_post_direct_len(const char *url,
+                            const char *const headers[],
+                            const char *body, size_t body_len,
+                            int timeout_ms,
+                            char *out, size_t out_cap,
+                            size_t *out_len) {
+    if (!url || !out || out_cap == 0) return -1;
+    out[0] = '\0';
+    char host[256];
+    int port = 80;
+    const char *path = NULL;
+    if (kp_parse_url(url, host, sizeof(host), &port, &path) != 0) {
+        kp_dbg("[post-direct] 非 http URL: %s", url);
+        return -2;
+    }
+    int fd = kp_connect_host(host, port, timeout_ms);
+    if (fd < 0) {
+        kp_dbg("[post-direct] 连接失败 %s:%d", host, port);
+        return -1;
+    }
+    // 手拼请求：固定头 + 调用方头 + Content-Length/Body。
+    size_t hdrs_len = 0;
+    for (int i = 0; headers && headers[i]; i++) hdrs_len += strlen(headers[i]) + 2;
+    size_t need = strlen(path) + strlen(host) + hdrs_len + body_len + 256;
+    char *req = (char *)malloc(need);
+    if (!req) { KP_CLOSESOCK(fd); return -1; }
+    size_t off = (size_t)snprintf(req, need,
+                                  "POST %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nContent-Length: %zu\r\n",
+                                  path, host, body_len);
+    for (int i = 0; headers && headers[i]; i++)
+        off += (size_t)snprintf(req + off, need - off, "%s\r\n", headers[i]);
+    off += (size_t)snprintf(req + off, need - off, "\r\n");
+    if (body && body_len) { memcpy(req + off, body, body_len); off += body_len; }
+
+    int rc = -1;
+    if (kp_send_all(fd, req, off) == 0) {
+        size_t got = 0;
+        if (kp_recv_response(fd, out, out_cap, &got) == 0 && got > 0) {
+            rc = 0;
+            // 响应体可能含 \0（protobuf），调用方必须用真实长度而非 strlen。
+            if (out_len) *out_len = got;
+        }
+    }
+    free(req);
+    KP_CLOSESOCK(fd);
+    kp_dbg("[post-direct] %s -> rc=%d len=%zu", url, rc, rc == 0 ? (out_len ? *out_len : 0) : 0);
+    return rc;
+}
+
+int kp_http_post_direct(const char *url,
+                        const char *const headers[],
+                        const char *body, size_t body_len,
+                        int timeout_ms,
+                        char *out, size_t out_cap) {
+    return kp_http_post_direct_len(url, headers, body, body_len,
+                                   timeout_ms, out, out_cap, NULL);
+}
+
 int kp_fetch_guid_token_best(const char *refresh_url,
                              const char *upstream_host, int upstream_port,
                              const char *guid_hint, const char *token_hint,
@@ -1633,7 +1691,7 @@ static void kp_handle_client(kp_forwarder *fw, int client) {
             KP_CLOSESOCK(up);
             continue;
         }
-        if (!http_refreshed && kp_forwarder_refresh(fw) == 0) {
+        if (!http_refreshed && kp_forwarder_refresh_retry(fw, 3, 500) == 0) {
             http_refreshed = 1;
             pthread_mutex_lock(&fw->cred_mutex);
             http_pool_count = fw->http_pool.count;
@@ -1776,7 +1834,7 @@ https_retry:
         KP_CLOSESOCK(up);
         continue;
     }
-    if (!https_refreshed && kp_forwarder_refresh(fw) == 0) {
+    if (!https_refreshed && kp_forwarder_refresh_retry(fw, 3, 500) == 0) {
         https_refreshed = 1;
         pthread_mutex_lock(&fw->cred_mutex);
         https_pool_count = fw->https_pool.count;
@@ -1792,6 +1850,20 @@ static int kp_forwarder_refresh(kp_forwarder *fw) {
     if (!fw || !fw->refresh_fn) return -1;
     fw->stat_refresh_calls++;
     return fw->refresh_fn(fw->refresh_ctx);
+}
+
+// 带有限重试的被动刷新：瞬时失败（取号接口抖动等）不应直接判死回 502。
+// 共尝试 attempts 次，间隔 backoff_ms。任一次成功立即返回 0。
+static int kp_forwarder_refresh_retry(kp_forwarder *fw, int attempts, int backoff_ms) {
+    if (!fw) return -1;
+    for (int i = 0; i < attempts; i++) {
+        if (i > 0) {
+            struct timespec ts = { backoff_ms / 1000, (backoff_ms % 1000) * 1000000L };
+            nanosleep(&ts, NULL);
+        }
+        if (kp_forwarder_refresh(fw) == 0) return 0;
+    }
+    return -1;
 }
 
 static void *kp_client_thread(void *arg) {
