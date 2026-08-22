@@ -104,3 +104,17 @@ https://raw.githubusercontent.com/koast18/livecontainer-kingcard-proxy/master/Al
 ## License
 
 GPLv2（proxychains-ng 与派生代码），GCDWebServer 为 Apache-2.0。
+
+## Tailscale 集成（实验性）
+
+当前 `feature/tailscale-integration` 分支增加了嵌入式 Tailscale 支持：
+
+- 在控制台「代理」页选择 **Tailscale** 模式，并在「Tailscale」页配置节点与 Exit Node。
+- 整体链路：
+  `用户 App -> LCProxyControl SOCKS5 -> 嵌入式 Tailscale -> DERP -> 王卡代理 -> 公网`
+- Tailscale 强制 `TS_DEBUG_ALWAYS_USE_DERP=1` / `TS_DEBUG_NEVER_DIRECT_UDP=1`，关闭 P2P 直连和 UDP 打洞。
+- Tailscale 的 control plane 和 DERP 外连都通过本进程的 KingCard 本地转发器 HTTP 代理。
+- 可在 Tailscale 页面选择/启用 Exit Node，通过 `/api/tailscale/exit-node` 动态切换。
+
+构建时会从 `tailscale-ios-dylib` Release 自动下载 `libtailscale_ios.a`（当前默认 `v0.2.0`），
+与现有 proxychains 核心一起链接进 `LCProxyControl.dylib`。

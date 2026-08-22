@@ -89,8 +89,10 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
 
 - (void)applyConfig:(NSDictionary *)settings {
     NSString *mode = [settings[@"proxyMode"] isKindOfClass:[NSString class]] ? settings[@"proxyMode"] : @"custom";
-    BOOL shouldRun = [mode isEqualToString:@"kingcard"] && [settings[@"proxyEnabled"] boolValue];
-    if (shouldRun && [settings[@"kingAutoDirectOnNonCellular"] boolValue] && !lcproxy_stats_is_cellular()) {
+    // Tailscale mode also needs the local KingCard forwarder: Tailscale's
+    // control-plane and DERP connections are forced through this HTTP proxy.
+    BOOL shouldRun = ([mode isEqualToString:@"kingcard"] || [mode isEqualToString:@"tailscale"]) && [settings[@"proxyEnabled"] boolValue];
+    if (shouldRun && [mode isEqualToString:@"kingcard"] && [settings[@"kingAutoDirectOnNonCellular"] boolValue] && !lcproxy_stats_is_cellular()) {
         shouldRun = NO;
     }
     NSString *signature = [self settingsSignature:settings];

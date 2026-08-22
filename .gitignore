@@ -4,3 +4,6 @@ build/
 *.ipa
 .DS_Store
 .tmp_research/
+
+# Downloaded Tailscale static library (fetched by build_ios.sh)
+Tweak/Tailscale/libtailscale_ios.a

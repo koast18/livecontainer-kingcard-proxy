@@ -2,6 +2,7 @@
 #import "LCProxyPaths.h"
 #import "lcproxy_bridge.h"
 #import "LCProxyKing.h"
+#import "LCTailscaleManager.h"
 #import "KPKIngCore.h"
 #import <Network/Network.h>
 #include "webkit_proxy.h"
@@ -53,6 +54,14 @@ static const NSTimeInterval LCProxyNetworkMonitorInterval = 2.0;
         @"proxyType": @"http",
         @"proxyHost": @"127.0.0.1",
         @"proxyPort": @8080,
+        @"tailscaleHostname": @"lc-tailscale",
+        @"tailscaleAuthKey": @"",
+        @"tailscaleControlURL": @"",
+        @"tailscaleStateDir": @"",
+        @"tailscaleEphemeral": @YES,
+        @"tailscaleForceDerpOnly": @YES,
+        @"tailscaleExitNodeID": @"",
+        @"tailscaleExitNodeEnabled": @NO,
         @"kingUpstreamHost": @"157.148.54.212",
         @"kingUpstreamPort": @8091,
         @"kingRefreshURL": @"http://kc.iikira.com/kingcard",
@@ -166,6 +175,18 @@ static const NSTimeInterval LCProxyNetworkMonitorInterval = 2.0;
     [conf appendString:@"localnet 10.0.0.0/255.0.0.0\n"];
     if ([effectiveMode isEqualToString:@"direct"]) {
         [conf appendString:@"# Direct mode: no upstream proxy, proxychains core will bypass traffic.\n"];
+    } else if ([effectiveMode isEqualToString:@"tailscale"]) {
+        int tsPort = [[LCTailscaleManager shared] localProxyPort];
+        NSString *tsUser = [[LCTailscaleManager shared] proxyUser];
+        NSString *tsPass = [[LCTailscaleManager shared] proxyPassword] ?: @"";
+        if (tsPort > 0 && tsUser.length && tsPass.length) {
+            [conf appendString:@"[ProxyList]\n"];
+            [conf appendFormat:@"socks5 127.0.0.1 %d %@ %@\n", tsPort, tsUser, tsPass];
+        } else {
+            [conf appendString:@"# Tailscale not ready yet; proxychains stays disabled.\n"];
+            [conf appendString:@"[ProxyList]\n"];
+            [conf appendString:@"http 127.0.0.1 1\n"];
+        }
     } else {
         [conf appendString:@"[ProxyList]\n"];
         [conf appendFormat:@"%@ %@ %ld\n", type, host, (long)port];
@@ -180,7 +201,10 @@ static const NSTimeInterval LCProxyNetworkMonitorInterval = 2.0;
         @"blockNonTcp", @"debugLogging", @"kingAutoDirectOnNonCellular",
         @"kingGuidOverride", @"kingTokenOverride", @"kingKeyOverride",
         @"kingPhone", @"kingQType", @"kingApn", @"kingTypeName", @"kingSubtype",
-        @"kingExtraInfo", @"kingMccmnc", @"kingCardType"
+        @"kingExtraInfo", @"kingMccmnc", @"kingCardType",
+        @"tailscaleHostname", @"tailscaleAuthKey", @"tailscaleControlURL",
+        @"tailscaleStateDir", @"tailscaleEphemeral", @"tailscaleForceDerpOnly",
+        @"tailscaleExitNodeID", @"tailscaleExitNodeEnabled"
     ];
     NSMutableString *signature = [NSMutableString string];
     for (NSString *key in keys) {
@@ -206,11 +230,16 @@ static const NSTimeInterval LCProxyNetworkMonitorInterval = 2.0;
     // override. Multiple LiveContainer processes each own an ephemeral port, so
     // they no longer contend for the fixed 127.0.0.1:18080 listener.
     [[LCProxyKing shared] applyConfig:s];
+    // Tailscale uses the KingCard local forwarder for all of its outbound
+    // traffic (control plane + DERP), so start it after King is configured.
+    [[LCTailscaleManager shared] applyConfig:s];
 
     NSString *effectiveMode = [self effectiveProxyModeForSettings:s];
     int desiredForwarderPort = 0;
     if ([effectiveMode isEqualToString:@"kingcard"]) {
         desiredForwarderPort = [[LCProxyKing shared] localForwarderPort];
+    } else if ([effectiveMode isEqualToString:@"tailscale"]) {
+        desiredForwarderPort = [[LCTailscaleManager shared] localProxyPort];
     }
     BOOL forwarderPortChanged = self.lastAppliedForwarderPort != desiredForwarderPort;
     if (desiredForwarderPort > 0) {

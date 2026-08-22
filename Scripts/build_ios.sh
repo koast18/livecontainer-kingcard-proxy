@@ -17,6 +17,19 @@ mkdir -p "$OBJDIR"
 # Generate embedded console HTML
 node Scripts/gen_console_asset.js Resources/console.html Tweak/Sources/ConsoleHTML.h
 
+# Tailscale static library is fetched from the tailscale-ios-dylib release.
+# It already contains the friendly C wrapper (tailscale_new, tailscale_set_proxy, ...).
+TAILSCALE_LIB="$ROOT/Tweak/Tailscale/libtailscale_ios.a"
+TAILSCALE_VER="${TAILSCALE_VER:-v0.2.0}"
+if [ ! -f "$TAILSCALE_LIB" ]; then
+  echo ">> downloading Tailscale iOS static library ${TAILSCALE_VER}"
+  mkdir -p build/tailscale-dl
+  curl -fL -o build/tailscale-dl/tailscale.tar.gz     "https://github.com/koast18/tailscale-ios-dylib/releases/download/${TAILSCALE_VER}/tailscale-ios-dylib-${TAILSCALE_VER}.tar.gz"
+  tar -xzf build/tailscale-dl/tailscale.tar.gz -C build/tailscale-dl
+  cp build/tailscale-dl/ios/libtailscale_ios.a "$TAILSCALE_LIB"
+  cp build/tailscale-dl/ios/tailscale.h Tweak/Tailscale/tailscale.h
+fi
+
 SRCS="$(find Tweak/ProxyCore/vendor/proxychains-ng/src -maxdepth 1 -name '*.c' ! -name 'main.c' | sort) \
 Tweak/ProxyCore/fishhook/fishhook.c \
 Tweak/ProxyCore/src/webkit_proxy.m Tweak/ProxyCore/src/async_proxy.c Tweak/ProxyCore/src/proxy_override.c \
@@ -28,7 +41,7 @@ CFLAGS="-target ${ARCH}-apple-ios${MIN} -isysroot ${SDK} \
   -D_GNU_SOURCE -D_DARWIN_C_SOURCE -DIS_MAC=1 -DMONTEREY_HOOKING -DSUPER_SECURE \
   -DGN_NODELEN_T=socklen_t -DGN_SERVLEN_T=socklen_t -DGN_FLAGS_T=int -DHAVE_CLOCK_GETTIME \
   -Wall -Wextra -Wno-unused-parameter -Wno-deprecated-declarations \
-  -I${ROOT}/Tweak/Sources \
+  -I${ROOT}/Tweak/Sources   -I${ROOT}/Tweak/Tailscale \
   -I${ROOT}/Tweak/ProxyCore/src \
   -I${ROOT}/Tweak/ProxyCore/vendor/proxychains-ng/src \
   -I${ROOT}/Tweak/ProxyCore/fishhook \
@@ -52,6 +65,7 @@ echo ">> link $OUT"
 clang -dynamiclib -arch $ARCH -mios-version-min=$MIN -isysroot "$SDK" \
   -fobjc-arc -O2 \
   $OBJS \
+  "$TAILSCALE_LIB" \
   -framework Foundation \
   -framework UIKit \
   -framework WebKit \
@@ -59,6 +73,7 @@ clang -dynamiclib -arch $ARCH -mios-version-min=$MIN -isysroot "$SDK" \
   -framework SystemConfiguration \
   -framework CFNetwork \
   -framework Security \
+  -framework CoreFoundation \
   -framework CoreServices \
   -lz \
   -o "$OUT"
