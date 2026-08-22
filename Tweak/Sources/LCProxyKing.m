@@ -588,16 +588,19 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
         queenHttps = [self proxiesSortedByLatency:proxyInfo[@"queen_https"]];
         state[@"queen_http"] = queenHttp ?: @[];
         state[@"queen_https"] = queenHttps ?: @[];
-        double proxyLife = 600.0;
+        // 服务端 iLifePeriod 单位为「小时」（反编译官方 App：m.java 中
+        // System.currentTimeMillis() + iLifePeriod * 3600000）。不能当作秒，
+        // 否则 8（=8小时）会被当成 8 秒导致代理池立即过期、疯狂重新取号。
+        double proxyLifeHours = 1.0;
         if ([proxyInfo[@"lifePeriod"] isKindOfClass:[NSNumber class]] && [proxyInfo[@"lifePeriod"] doubleValue] > 0) {
-            proxyLife = [proxyInfo[@"lifePeriod"] doubleValue];
+            proxyLifeHours = [proxyInfo[@"lifePeriod"] doubleValue];
         }
-        if (proxyLife < 60.0) proxyLife = 60.0;
-        state[@"proxyExpireEpoch"] = @(nowEpoch2 + proxyLife - 30.0);
+        if (proxyLifeHours < 1.0) proxyLifeHours = 1.0;
+        state[@"proxyExpireEpoch"] = @(nowEpoch2 + proxyLifeHours * 3600.0);
         self.lastSource = [NSString stringWithFormat:@"proxy-oldwup-%@", proxyInfo[@"mode"] ?: @"?"];
-        [steps appendFormat:@"代理池: http=%lu https=%lu lifePeriod=%@s server=%@\n",
+        [steps appendFormat:@"代理池: http=%lu https=%lu lifePeriod=%.0fh server=%@\n",
             (unsigned long)queenHttp.count, (unsigned long)queenHttps.count,
-            proxyInfo[@"lifePeriod"] ?: @"?",
+            proxyLifeHours,
             proxyInfo[@"server"] ?: @"?"];
     }
 
