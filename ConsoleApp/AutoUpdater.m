@@ -315,7 +315,9 @@ static BOOL LCProxyCodeSignatureValid(NSString *path) {
                 if (sharedExists) [[NSFileManager defaultManager] removeItemAtPath:sharedDst error:&err];
                 if ([[NSFileManager defaultManager] copyItemAtPath:normalDst toPath:sharedDst error:&err]) {
                     [self diag:@"[复制] 已签名 dylib -> 共享 App: %@", sharedDst];
-                    gDownloadedNew = YES;
+                    // 复制到共享目录是给其它 guest App 用的，不影响控制台进程自身
+                    // 的 dylib 注入；不要置 gDownloadedNew，否则用户签名后还要
+                    // 重复打开两次才能进入控制台。
                 } else {
                     [self diag:@"[复制] 到共享 App 失败: %@", err.localizedDescription ?: @"?"];
                 }

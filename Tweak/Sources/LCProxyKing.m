@@ -466,6 +466,14 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
 //   -> 写入 kp_forwarder
 // ---------------------------------------------------------------------------
 - (BOOL)refreshCredentials {
+    return [self refreshCredentialsWithForce:NO];
+}
+
+- (BOOL)refreshCredentialsForce {
+    return [self refreshCredentialsWithForce:YES];
+}
+
+- (BOOL)refreshCredentialsWithForce:(BOOL)force {
     [self.lock lock];
     if (self.refreshing) {
         [self.lock unlock];
@@ -476,6 +484,8 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
 
     NSDate *t0 = [NSDate date];
     NSMutableString *steps = [NSMutableString string];
+    // 记录是否真的向上游发起了取号/取代理池请求；纯缓存命中时不写取号日志。
+    BOOL actuallyFetchedUpstream = NO;
 
     NSDictionary *settings = [self settingsSnapshot];
     NSMutableDictionary *state = [self loadState];
@@ -499,7 +509,7 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
         NSString *stored = [state[@"guid"] isKindOfClass:[NSString class]] ? state[@"guid"] : nil;
         if (LCProxyKingHexStringValid(stored)) guid = stored;
     }
-    if (!guid) {
+    if (force || !guid) {
         NSError *guidErr = nil;
         guid = [self syncFetchGuid:qua2 timeout:timeout error:&guidErr];
         if (!guid) {
@@ -508,6 +518,7 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
             [steps appendFormat:@"GUID: 本地生成（服务器失败 %@）\n", guidErr.localizedDescription ?: @""];
         } else {
             self.lastSource = @"guid-pbprx";
+            actuallyFetchedUpstream = YES;
             [steps appendString:@"GUID: PBProxy 获取\n"];
         }
         state[@"guid"] = guid;
@@ -529,7 +540,7 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
         NSString *storedToken = [state[@"token"] isKindOfClass:[NSString class]] ? state[@"token"] : nil;
         NSString *storedKey = [state[@"key"] isKindOfClass:[NSString class]] ? state[@"key"] : nil;
         double nowEpoch = [[NSDate date] timeIntervalSince1970];
-        if (storedToken.length && storedKey.length && tokenExpireEpoch && tokenExpireEpoch.doubleValue > nowEpoch + LCProxyKingRefreshLeadTime) {
+        if (!force && storedToken.length && storedKey.length && tokenExpireEpoch && tokenExpireEpoch.doubleValue > nowEpoch + LCProxyKingRefreshLeadTime) {
             token = storedToken;
             qkey = storedKey;
         } else {
@@ -540,6 +551,7 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
                 [self finishRefreshWithState:state success:NO src:(self.lastSource ?: @"") ms:-[t0 timeIntervalSinceNow] * 1000.0 steps:steps error:[NSString stringWithFormat:@"Q-Token 获取失败: %@", tokErr.localizedDescription ?: @"unknown"]];
                 return NO;
             }
+            actuallyFetchedUpstream = YES;
             token = tokInfo[@"token"];
             qkey = tokInfo[@"qkey"];
             state[@"token"] = token;
@@ -552,7 +564,8 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
             }
             self.lastSource = [NSString stringWithFormat:@"token-%@", tokInfo[@"mode"] ?: @"?"];
             NSNumber *expireSeconds = tokInfo[@"expire_seconds"];
-            [steps appendFormat:@"Q-Token: mode=%@ 有效期=%@s\n",
+            [steps appendFormat:@"Q-Token: %@\nQ-Key: %@\nQ-Token mode=%@ 有效期=%@s\n",
+                token, qkey,
                 tokInfo[@"mode"] ?: @"?",
                 expireSeconds ?: @"?"];
         }
@@ -568,7 +581,7 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
     NSArray *queenHttps = [state[@"queen_https"] isKindOfClass:[NSArray class]] ? state[@"queen_https"] : nil;
     NSNumber *proxyExpireEpoch = [state[@"proxyExpireEpoch"] isKindOfClass:[NSNumber class]] ? state[@"proxyExpireEpoch"] : nil;
     double nowEpoch2 = [[NSDate date] timeIntervalSince1970];
-    if (!queenHttp.count || !queenHttps.count || !proxyExpireEpoch || proxyExpireEpoch.doubleValue <= nowEpoch2 + LCProxyKingRefreshLeadTime) {
+    if (force || !queenHttp.count || !queenHttps.count || !proxyExpireEpoch || proxyExpireEpoch.doubleValue <= nowEpoch2 + LCProxyKingRefreshLeadTime) {
         NSDictionary *params = @{
             @"apn": [settings[@"kingApn"] isKindOfClass:[NSString class]] ? settings[@"kingApn"] : @"UNKNOW",
             @"typeName": [settings[@"kingTypeName"] isKindOfClass:[NSString class]] ? settings[@"kingTypeName"] : @"UNKNOW",
@@ -584,6 +597,7 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
             [self finishRefreshWithState:state success:NO src:(self.lastSource ?: @"") ms:-[t0 timeIntervalSinceNow] * 1000.0 steps:steps error:[NSString stringWithFormat:@"Queen 代理池获取失败: %@", proxyErr.localizedDescription ?: @"unknown"]];
             return NO;
         }
+        actuallyFetchedUpstream = YES;
         queenHttp = [self proxiesSortedByLatency:proxyInfo[@"queen_http"]];
         queenHttps = [self proxiesSortedByLatency:proxyInfo[@"queen_https"]];
         state[@"queen_http"] = queenHttp ?: @[];
@@ -598,10 +612,14 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
         if (proxyLifeHours < 1.0) proxyLifeHours = 1.0;
         state[@"proxyExpireEpoch"] = @(nowEpoch2 + proxyLifeHours * 3600.0);
         self.lastSource = [NSString stringWithFormat:@"proxy-oldwup-%@", proxyInfo[@"mode"] ?: @"?"];
-        [steps appendFormat:@"代理池: http=%lu https=%lu lifePeriod=%.0fh server=%@\n",
+        [steps appendFormat:@"代理池: http=%lu https=%lu lifePeriod=%.0fh server=%@\nsApn=%@ bProxy=%@\n",
             (unsigned long)queenHttp.count, (unsigned long)queenHttps.count,
             proxyLifeHours,
-            proxyInfo[@"server"] ?: @"?"];
+            proxyInfo[@"server"] ?: @"?",
+            proxyInfo[@"sApn"] ?: @"?",
+            proxyInfo[@"bProxy"] ?: @"?"];
+        [steps appendFormat:@"  HTTP: %@\n", [queenHttp componentsJoinedByString:@", "]];
+        [steps appendFormat:@"  HTTPS: %@\n", [queenHttps componentsJoinedByString:@", "]];
     }
 
     if (!queenHttp.count && !queenHttps.count) {
@@ -639,7 +657,10 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
 
     [steps appendFormat:@"写入转发器: http=%lu https=%lu\n",
         (unsigned long)queenHttp.count, (unsigned long)queenHttps.count];
-    [self pushRefreshLog:YES src:(self.lastSource ?: @"") ms:-[t0 timeIntervalSinceNow] * 1000.0 msg:steps intoState:state];
+    // 只有真正请求了上游（或强制刷新）才记录取号日志；纯缓存命中不刷日志。
+    if (force || actuallyFetchedUpstream) {
+        [self pushRefreshLog:YES src:(self.lastSource ?: @"") ms:-[t0 timeIntervalSinceNow] * 1000.0 msg:steps intoState:state];
+    }
     [self saveState:state];
     return YES;
 }

@@ -314,7 +314,8 @@ static const NSUInteger LCProxyDefaultPort = 19092;
 
     [server addHandlerForMethod:@"POST" path:@"/api/king/refresh" requestClass:[GCDWebServerDataRequest class]
                    processBlock:^GCDWebServerResponse *(GCDWebServerRequest *request) {
-        BOOL ok = [[LCProxyKing shared] refreshCredentials];
+        // 手动“立即刷新凭证”：强制真实请求上游，不走本地缓存。
+        BOOL ok = [[LCProxyKing shared] refreshCredentialsForce];
         NSMutableDictionary *resp = [NSMutableDictionary dictionaryWithDictionary:[[LCProxyKing shared] status]];
         resp[@"ok"] = @(ok);
         return [self json:resp];
