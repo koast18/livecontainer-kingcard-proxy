@@ -1118,6 +1118,7 @@ static void kp_forwarder_snapshot(kp_forwarder *fw,
                                   char *qkey, size_t qkc,
                                   char *qtype, size_t qtc);
 static int kp_forwarder_refresh(kp_forwarder *fw);
+static int kp_forwarder_refresh_retry(kp_forwarder *fw, int attempts, int backoff_ms);
 
 // 解析 HTTP 代理绝对 URI 请求行："GET http://host[:port]/path HTTP/1.1"。成功返回 0。
 int kp_parse_absolute_uri(const char *line, size_t len,
