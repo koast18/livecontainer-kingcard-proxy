@@ -25,6 +25,10 @@ extern void proxychains_write_log(char *str, ...);
 // 王卡网关/代理期望的 UA（参考 https://ss.y4cc.cc/txwk 的 wanka 配置）
 #define KP_KING_UA "okhttp/3.11.0 Dalvik/2.1.0 (Linux; U; Android 13; Redmi K50 5G Build/RKQ1.200826.002)"
 
+// 转发器活跃客户端/线程上限：防止高速下载并发连接风暴创建过量线程
+// （iOS 对线程数/栈内存有硬限制，超限会整个 App 闪退）。
+#define KP_FORWARDER_MAX_CLIENTS 64
+
 // ---------- 调试日志（宿主注册回调，真机可逐行定位） ----------
 static void (*g_kp_dbg_log)(const char *line) = NULL;
 static char g_kp_dbg_recent[8][512];   // 近期诊断环形缓冲（API 失败时回传）
@@ -1095,6 +1099,10 @@ struct kp_forwarder {
     int listen_fd;
     int running;
     pthread_t thread;
+    // 活跃客户端/转发线程计数：防止高速下载并发连接风暴瞬间创建过量线程，
+    // 耗尽系统线程/栈内存导致整个 App 闪退。达到上限时拒绝新连接（503）。
+    pthread_mutex_t client_lock;
+    int active_clients;
 };
 
 struct client_arg {
@@ -1869,8 +1877,12 @@ static int kp_forwarder_refresh_retry(kp_forwarder *fw, int attempts, int backof
 
 static void *kp_client_thread(void *arg) {
     struct client_arg *ca = arg;
-    kp_handle_client(ca->fw, ca->fd);
+    kp_forwarder *fw = ca->fw;
+    kp_handle_client(fw, ca->fd);
     free(ca);
+    pthread_mutex_lock(&fw->client_lock);
+    if (fw->active_clients > 0) fw->active_clients--;
+    pthread_mutex_unlock(&fw->client_lock);
     return NULL;
 }
 
@@ -1884,12 +1896,36 @@ static void *kp_forwarder_run(void *arg) {
             if (!fw->running) break;
             continue;
         }
+        // 高速下载并发上限：超出则立即拒绝，避免线程风暴耗尽进程资源。
+        pthread_mutex_lock(&fw->client_lock);
+        int over = fw->active_clients >= KP_FORWARDER_MAX_CLIENTS;
+        if (!over) fw->active_clients++;
+        pthread_mutex_unlock(&fw->client_lock);
+        if (over) {
+            char *msg = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
+            (void)send(client, msg, (int)strlen(msg), 0);
+            KP_CLOSESOCK(client);
+            continue;
+        }
         struct client_arg *ca = malloc(sizeof(*ca));
-        if (!ca) { KP_CLOSESOCK(client); continue; }
+        if (!ca) {
+            pthread_mutex_lock(&fw->client_lock);
+            if (fw->active_clients > 0) fw->active_clients--;
+            pthread_mutex_unlock(&fw->client_lock);
+            KP_CLOSESOCK(client);
+            continue;
+        }
         ca->fw = fw;
         ca->fd = client;
         pthread_t t;
-        pthread_create(&t, NULL, kp_client_thread, ca);
+        if (pthread_create(&t, NULL, kp_client_thread, ca) != 0) {
+            pthread_mutex_lock(&fw->client_lock);
+            if (fw->active_clients > 0) fw->active_clients--;
+            pthread_mutex_unlock(&fw->client_lock);
+            free(ca);
+            KP_CLOSESOCK(client);
+            continue;
+        }
         pthread_detach(t);
     }
     return NULL;
@@ -1908,7 +1944,9 @@ kp_forwarder *kp_forwarder_new(const char *listen_host, int listen_port,
     fw->token[0] = '\0';
     fw->refresh_fn = NULL;
     fw->refresh_ctx = NULL;
+    fw->active_clients = 0;
     pthread_mutex_init(&fw->cred_mutex, NULL);
+    pthread_mutex_init(&fw->client_lock, NULL);
     return fw;
 }
 
@@ -2011,6 +2049,7 @@ void kp_forwarder_free(kp_forwarder *fw) {
     if (!fw) return;
     kp_forwarder_stop(fw);
     pthread_mutex_destroy(&fw->cred_mutex);
+    pthread_mutex_destroy(&fw->client_lock);
     free(fw);
 }
 
