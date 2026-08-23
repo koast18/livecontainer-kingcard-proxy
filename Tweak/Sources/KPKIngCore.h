@@ -201,8 +201,11 @@ void kp_forwarder_stop(kp_forwarder *fw);
 /// 释放。
 void kp_forwarder_free(kp_forwarder *fw);
 
-/// 当前是否在监听。
+/// 当前是否在监听（线程安全状态 + 底层 socket 仍处于 listen 状态）。
 int kp_forwarder_is_running(kp_forwarder *fw);
+
+/// 底层 listen socket 是否仍然健康可用（进程被挂起/后台可能使 fd 失效）。
+int kp_forwarder_is_listening(kp_forwarder *fw);
 
 /// 监听端口。
 int kp_forwarder_port(kp_forwarder *fw);

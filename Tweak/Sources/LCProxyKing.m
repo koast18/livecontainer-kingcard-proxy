@@ -87,7 +87,9 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
 }
 
 - (BOOL)isRunning {
-    return self.forwarder != NULL && kp_forwarder_is_running(self.forwarder) == 1;
+    return self.forwarder != NULL &&
+           kp_forwarder_is_running(self.forwarder) == 1 &&
+           kp_forwarder_is_listening(self.forwarder) == 1;
 }
 
 - (void)applyConfig:(NSDictionary *)settings {
@@ -101,7 +103,13 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
     kp_forwarder *newForwarder = NULL;
 
     [self.lock lock];
-    BOOL alreadyRunning = shouldRun && self.forwarder != NULL && kp_forwarder_is_running(self.forwarder) == 1;
+    // 后台/熄屏期间底层 listen socket 可能被系统失效，但 C 层 running 标志仍为 1。
+    // 如果只看 kp_forwarder_is_running，切回前台时不会重建转发器，流量会继续打向
+    // 一个已死的本地端口，表现为“只能杀 App 重进才能恢复网络”。因此必须同时确认
+    // listen socket 仍真正处于 listen 状态。
+    BOOL alreadyRunning = shouldRun && self.forwarder != NULL &&
+                           kp_forwarder_is_running(self.forwarder) == 1 &&
+                           kp_forwarder_is_listening(self.forwarder) == 1;
     if (alreadyRunning) {
         [self.lock unlock];
         BOOL settingsChanged = ![signature isEqualToString:self.lastSettingsSignature];
@@ -329,7 +337,9 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
 
 - (BOOL)isReady {
     [self.lock lock];
-    BOOL running = self.forwarder != NULL && kp_forwarder_is_running(self.forwarder) == 1;
+    BOOL running = self.forwarder != NULL &&
+                   kp_forwarder_is_running(self.forwarder) == 1 &&
+                   kp_forwarder_is_listening(self.forwarder) == 1;
     BOOL success = self.lastRefreshSuccess;
     BOOL refreshing = self.refreshing;
     [self.lock unlock];
@@ -348,7 +358,9 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
     while ([[NSDate date] timeIntervalSinceDate:deadline] < 0) {
         [self.lock lock];
         BOOL refreshing = self.refreshing;
-        BOOL running = self.forwarder != NULL && kp_forwarder_is_running(self.forwarder) == 1;
+        BOOL running = self.forwarder != NULL &&
+                       kp_forwarder_is_running(self.forwarder) == 1 &&
+                       kp_forwarder_is_listening(self.forwarder) == 1;
         BOOL success = self.lastRefreshSuccess;
         [self.lock unlock];
 

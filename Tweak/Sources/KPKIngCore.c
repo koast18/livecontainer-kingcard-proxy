@@ -100,6 +100,7 @@ void kp_dbg(const char *fmt, ...) {
 
 #if defined(__APPLE__) || defined(__unix__)
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -2133,6 +2134,22 @@ void kp_forwarder_free(kp_forwarder *fw) {
 }
 
 int kp_forwarder_is_running(kp_forwarder *fw) { return fw ? fw->running : 0; }
+
+int kp_forwarder_is_listening(kp_forwarder *fw) {
+    if (!fw || !fw->running || fw->listen_fd < 0 || fw->listen_port <= 0)
+        return 0;
+#ifdef SO_ACCEPTCONN
+    int accept_conn = 0;
+    socklen_t len = sizeof(accept_conn);
+    if (getsockopt(fw->listen_fd, SOL_SOCKET, SO_ACCEPTCONN,
+                   &accept_conn, &len) != 0)
+        return 0;
+    return accept_conn ? 1 : 0;
+#else
+    return fcntl(fw->listen_fd, F_GETFD) >= 0 ? 1 : 0;
+#endif
+}
+
 int kp_forwarder_port(kp_forwarder *fw) { return fw ? fw->listen_port : 0; }
 
 void kp_forwarder_get_stats(kp_forwarder *fw, kp_forwarder_stats *stats) {

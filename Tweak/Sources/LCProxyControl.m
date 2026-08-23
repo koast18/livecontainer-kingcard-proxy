@@ -6,6 +6,8 @@
 #import "LCProxyPaths.h"
 #import "lcproxy_bridge.h"
 
+static id<NSObject> g_lcDidBecomeActiveObserver;
+
 static void LCProxyShowBanner(NSDictionary *settings) {
     if (![settings[@"showProxyBanner"] boolValue]) return;
     BOOL enabled = [settings[@"proxyEnabled"] boolValue];
@@ -59,6 +61,7 @@ static void LCProxyControlConstructor(void) {
         LCProxyShowBanner(initialSettings);
         [[LCProxyConfig shared] startNetworkMonitor];
 
+        g_lcDidBecomeActiveObserver =
         [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
                                                           object:nil
                                                            queue:[NSOperationQueue mainQueue]

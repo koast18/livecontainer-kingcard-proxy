@@ -11,9 +11,11 @@ fi
 from pathlib import Path
 
 config = Path('Tweak/Sources/LCProxyConfig.m').read_text(encoding='utf-8')
+control = Path('Tweak/Sources/LCProxyControl.m').read_text(encoding='utf-8')
 king = Path('Tweak/Sources/LCProxyKing.m').read_text(encoding='utf-8')
 king_h = Path('Tweak/Sources/LCProxyKing.h').read_text(encoding='utf-8')
 core = Path('Tweak/Sources/KPKIngCore.c').read_text(encoding='utf-8')
+core_h = Path('Tweak/Sources/KPKIngCore.h').read_text(encoding='utf-8')
 server = Path('Tweak/Sources/LCProxyServer.m').read_text(encoding='utf-8')
 lib = Path('Tweak/ProxyCore/vendor/proxychains-ng/src/libproxychains.c').read_text(encoding='utf-8')
 webkit = Path('Tweak/ProxyCore/src/webkit_proxy.m').read_text(encoding='utf-8')
@@ -25,12 +27,16 @@ assert 'lastAppliedRuntimeSignature' in config, 'missing last applied signature 
 assert 'lastAppliedForwarderPort' in config, 'missing last applied forwarder port state'
 assert 'needsRuntimeReload' in config, 'missing needsRuntimeReload decision'
 assert 'lcproxy_control_set_proxy_override' in config, 'missing per-process proxy override hookup'
+assert 'g_lcDidBecomeActiveObserver' in control, 'foreground observer token is not retained'
 
 # KingCard forwarder should use an ephemeral port and expose it.
 assert 'kp_forwarder_new("127.0.0.1", 0' in king, 'KingCard forwarder does not use ephemeral port'
 assert 'localForwarderPort' in king, 'missing localForwarderPort implementation'
 assert 'kp_forwarder_port(self.forwarder) : 0' in king, 'status should read port without recursive lock'
 assert 'localForwarderPort' in king_h, 'missing localForwarderPort declaration'
+assert 'kp_forwarder_is_listening' in king, 'foreground recovery does not check listen socket health'
+assert 'kp_forwarder_is_listening' in core, 'C core missing forwarder listen-socket health API'
+assert 'kp_forwarder_is_listening' in core_h, 'missing kp_forwarder_is_listening declaration'
 
 # kp_forwarder_start must record the actual bound port after bind/listen.
 assert 'getsockname(fd' in core, 'kp_forwarder_start does not query bound port'
