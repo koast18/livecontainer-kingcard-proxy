@@ -1345,11 +1345,9 @@ static int kp_parse_status_code(const char *buf, size_t len) {
 }
 
 // 这些状态码通常表示 Q-Token/Q-Key 失效或代理池需要刷新。
-// 800/801 是 HTTPS/HTTP 代理常见的凭证失效类非标状态码；820/821/823 也是现有刷新码。
+// 820/821/823 是现有刷新码；800/801 经确认不是凭证失效信号，不在这里处理。
 static int kp_code_needs_credential_refresh(int code) {
     switch (code) {
-        case 800:
-        case 801:
         case 820:
         case 821:
         case 823:
@@ -1861,6 +1859,13 @@ https_retry:
             kp_pipe_bidirectional_counted(up, client, &up_to_client, &client_to_up);
             kp_dbg("[fw] CONNECT conn done host=%s:%d client_to_up=%llu up_to_client=%llu",
                    host, port, (unsigned long long)client_to_up, (unsigned long long)up_to_client);
+            // 隧道已建立但客户端发了数据后上游一个字节都没回就关闭，常见于：
+            // Q-Token 已失效/代理节点异常导致 TLS handshake 被对端直接终止。
+            // 这里主动触发一次强制刷新，让后续连接有机会用新凭证恢复。
+            if (up_to_client == 0 && client_to_up > 0) {
+                kp_dbg("[fw] CONNECT closed before upstream data (likely handshake failure), refreshing credentials");
+                kp_forwarder_refresh_retry(fw, 2, 300);
+            }
             KP_CLOSESOCK(up);
             KP_CLOSESOCK(client);
             return;
