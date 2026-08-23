@@ -43,6 +43,7 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
 
 @interface LCProxyKing ()
 @property (nonatomic, strong) NSLock *lock;
+@property (nonatomic, strong) NSLock *lifecycleLock;
 @property (nonatomic, assign) void *forwarderPtr;
 @property (nonatomic, copy) NSString *lastRefresh;
 @property (nonatomic, copy) NSString *lastSource;
@@ -72,6 +73,7 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
     self = [super init];
     if (self) {
         _lock = [[NSLock alloc] init];
+        _lifecycleLock = [[NSLock alloc] init];
         _refreshLog = [[NSMutableArray alloc] init];
         kp_set_debug_logger(LCProxyKingLog);
     }
@@ -91,6 +93,11 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
 }
 
 - (void)applyConfig:(NSDictionary *)settings {
+    // 转发器生命周期（stop/free/new/start/install）必须整体串行化，否则多个线程
+    // 同时走到“重建转发器”分支会互相竞争，导致闪退。不能用 self.lock 包住 stop，
+    // 因为 stop 要等 client 线程退出，client 线程失败时可能等 self.lock 做取号刷新。
+    [self.lifecycleLock lock];
+    @try {
     NSString *mode = [settings[@"proxyMode"] isKindOfClass:[NSString class]] ? settings[@"proxyMode"] : @"custom";
     BOOL shouldRun = [mode isEqualToString:@"kingcard"] && [settings[@"proxyEnabled"] boolValue];
     if (shouldRun && [settings[@"kingAutoDirectOnNonCellular"] boolValue] && !lcproxy_stats_is_cellular()) {
@@ -181,6 +188,9 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
     [self.lock unlock];
     kp_forwarder_stop(newForwarder);
     kp_forwarder_free(newForwarder);
+    } @finally {
+        [self.lifecycleLock unlock];
+    }
 }
 
 - (NSString *)settingsSignature:(NSDictionary *)settings {

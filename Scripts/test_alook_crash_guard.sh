@@ -55,4 +55,8 @@ grep -q "lc_async_relay_try_acquire" "$ASYNC" \
 grep -q "不要在持有 self.lock 时 stop/free" "$KING" \
     || fail "LCProxyKing.m lost the no-stop-under-lock comment/guard marker"
 
+# --- LCProxyKing lifecycle serialization guard ---
+grep -q "lifecycleLock" "$KING"     || fail "LCProxyKing.m lost the forwarder lifecycle serialization lock"
+grep -q "@finally" "$KING"     || fail "LCProxyKing.m applyConfig no longer releases lifecycleLock on all exits"
+
 echo "Alook crash guard static checks OK"
