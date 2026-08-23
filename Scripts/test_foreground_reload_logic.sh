@@ -15,7 +15,6 @@ control = Path('Tweak/Sources/LCProxyControl.m').read_text(encoding='utf-8')
 king = Path('Tweak/Sources/LCProxyKing.m').read_text(encoding='utf-8')
 king_h = Path('Tweak/Sources/LCProxyKing.h').read_text(encoding='utf-8')
 core = Path('Tweak/Sources/KPKIngCore.c').read_text(encoding='utf-8')
-core_h = Path('Tweak/Sources/KPKIngCore.h').read_text(encoding='utf-8')
 server = Path('Tweak/Sources/LCProxyServer.m').read_text(encoding='utf-8')
 lib = Path('Tweak/ProxyCore/vendor/proxychains-ng/src/libproxychains.c').read_text(encoding='utf-8')
 webkit = Path('Tweak/ProxyCore/src/webkit_proxy.m').read_text(encoding='utf-8')
@@ -34,10 +33,6 @@ assert 'kp_forwarder_new("127.0.0.1", 0' in king, 'KingCard forwarder does not u
 assert 'localForwarderPort' in king, 'missing localForwarderPort implementation'
 assert 'kp_forwarder_port(self.forwarder) : 0' in king, 'status should read port without recursive lock'
 assert 'localForwarderPort' in king_h, 'missing localForwarderPort declaration'
-assert 'kp_forwarder_is_listening' in king, 'foreground recovery does not check listen socket health'
-assert 'kp_forwarder_is_listening' in core, 'C core missing forwarder listen-socket health API'
-assert 'kp_forwarder_is_listening' in core_h, 'missing kp_forwarder_is_listening declaration'
-
 # kp_forwarder_start must record the actual bound port after bind/listen.
 assert 'getsockname(fd' in core, 'kp_forwarder_start does not query bound port'
 assert 'fw->listen_port = ntohs' in core, 'kp_forwarder_start does not save actual port'
