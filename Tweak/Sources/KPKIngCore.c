@@ -2142,12 +2142,12 @@ int kp_forwarder_is_listening(kp_forwarder *fw) {
     int accept_conn = 0;
     socklen_t len = sizeof(accept_conn);
     if (getsockopt(fw->listen_fd, SOL_SOCKET, SO_ACCEPTCONN,
-                   &accept_conn, &len) != 0)
-        return 0;
-    return accept_conn ? 1 : 0;
-#else
-    return fcntl(fw->listen_fd, F_GETFD) >= 0 ? 1 : 0;
+                   &accept_conn, &len) == 0)
+        return accept_conn ? 1 : 0;
+    // 某些平台/内核可能不支持 SO_ACCEPTCONN。此时退回到 fd 有效性检查，
+    // 避免把健康转发器误判为“已死”而触发无谓重建/并发重启。
 #endif
+    return fcntl(fw->listen_fd, F_GETFD) >= 0 ? 1 : 0;
 }
 
 int kp_forwarder_port(kp_forwarder *fw) { return fw ? fw->listen_port : 0; }

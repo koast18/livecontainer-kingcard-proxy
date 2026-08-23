@@ -18,6 +18,7 @@ static const NSUInteger LCProxyDefaultPort = 19092;
 
 @interface LCProxyServer ()
 @property (nonatomic, strong) GCDWebServer *server;
+@property (nonatomic, strong) NSLock *proxyTestLock;
 @end
 
 @implementation LCProxyServer
@@ -29,6 +30,14 @@ static const NSUInteger LCProxyDefaultPort = 19092;
         instance = [[LCProxyServer alloc] init];
     });
     return instance;
+}
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        _proxyTestLock = [[NSLock alloc] init];
+    }
+    return self;
 }
 
 - (BOOL)isRunning {
@@ -325,12 +334,21 @@ static const NSUInteger LCProxyDefaultPort = 19092;
                    processBlock:^GCDWebServerResponse *(GCDWebServerRequest *request) {
         NSDictionary *body = [self jsonBody:request];
         NSString *url = [body[@"url"] isKindOfClass:[NSString class]] ? body[@"url"] : @"";
-        return [self json:[self proxyTestOne:url]];
+        // GCDWebServer 会在并发全局队列上调用 handler；出口 IP 测试内部会访问
+        // LCProxyKing/转发器，多个并发测试同时触发 applyConfig/refresh 容易造成
+        // 线程竞争甚至闪退（和高速下载并发连接问题同源）。这里串行化。
+        [self.proxyTestLock lock];
+        NSDictionary *result = [self proxyTestOne:url];
+        [self.proxyTestLock unlock];
+        return [self json:result];
     }];
 
     [server addHandlerForMethod:@"POST" path:@"/api/proxy-test" requestClass:[GCDWebServerDataRequest class]
                    processBlock:^GCDWebServerResponse *(GCDWebServerRequest *request) {
-        return [self json:[self proxyTestResult]];
+        [self.proxyTestLock lock];
+        NSDictionary *result = [self proxyTestResult];
+        [self.proxyTestLock unlock];
+        return [self json:result];
     }];
 
     [server addHandlerForMethod:@"POST" path:@"/api/reset-stats" requestClass:[GCDWebServerDataRequest class]
