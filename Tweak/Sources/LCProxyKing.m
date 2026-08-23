@@ -15,7 +15,10 @@ static const NSTimeInterval LCProxyKingRefreshLeadTime = 2 * 60;
 
 static int LCProxyKingRefreshHook(void *ctx) {
     LCProxyKing *king = (__bridge LCProxyKing *)ctx;
-    return [king refreshCredentials] ? 0 : -1;
+    // 被动刷新是由实际转发失败触发的，不能信任本地缓存的 tokenExpireEpoch：
+    // 服务器宣称的有效期可能比真实有效期更长，普通 refreshCredentials 会误以为
+    // 凭证仍新鲜而继续复用已失效的 Q-Token。这里强制重新取号。
+    return [king refreshCredentialsForce] ? 0 : -1;
 }
 
 static void LCProxyKingLog(const char *line) {
@@ -586,11 +589,12 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
             state[@"token"] = token;
             state[@"key"] = qkey;
             NSNumber *expire = tokInfo[@"expire_seconds"];
-            if ([expire isKindOfClass:[NSNumber class]] && expire.integerValue > 0) {
-                state[@"tokenExpireEpoch"] = @(nowEpoch + expire.doubleValue);
-            } else {
-                state[@"tokenExpireEpoch"] = @(nowEpoch + 7200.0);
-            }
+            // 服务器宣称的有效期可能偏长，Q-Token 实际会更早失效。
+            // 按 80% 有效期设置本地过期时间，并至少保留 60 秒，提前触发主动刷新。
+            double rawExpire = ([expire isKindOfClass:[NSNumber class]] && expire.integerValue > 0) ? expire.doubleValue : 7200.0;
+            double effectiveExpire = rawExpire * 0.8;
+            if (effectiveExpire < 60.0) effectiveExpire = 60.0;
+            state[@"tokenExpireEpoch"] = @(nowEpoch + effectiveExpire);
             self.lastSource = [NSString stringWithFormat:@"token-%@", tokInfo[@"mode"] ?: @"?"];
             NSNumber *expireSeconds = tokInfo[@"expire_seconds"];
             [steps appendFormat:@"Q-Token: %@\nQ-Key: %@\nQ-Token mode=%@ 有效期=%@s\n",
