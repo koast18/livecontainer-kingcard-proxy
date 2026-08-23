@@ -31,6 +31,12 @@ VER="$(cat "$ROOT/version.txt" | tr -d ' \r\n')"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VER" "$APP/Info.plist" || true
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VER" "$APP/Info.plist" || true
 
+# 可覆盖 dylib 下载来源仓库（例如 Tailscale 分支使用独立公开仓库）。
+if [[ -n "${LC_PROXY_UPDATE_REPO:-}" ]]; then
+  /usr/libexec/PlistBuddy -c "Delete :LCProxyUpdateRepo" "$APP/Info.plist" 2>/dev/null || true
+  /usr/libexec/PlistBuddy -c "Add :LCProxyUpdateRepo string ${LC_PROXY_UPDATE_REPO}" "$APP/Info.plist"
+fi
+
 # 测试版构建：可指定 dylib 下载 pin 到的 GitHub Release tag，并可换 bundle id 以便与正式版共存。
 if [[ -n "${LC_PROXY_UPDATE_TAG:-}" ]]; then
   BETA_VER="${LC_PROXY_UPDATE_TAG#v}"

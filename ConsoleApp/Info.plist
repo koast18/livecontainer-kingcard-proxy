@@ -43,6 +43,8 @@
 		<true/>
 	</dict>
 	<key>LCProxyUpdateRepo</key>
-	<string>koast18/livecontainer-kingcard-proxy</string>
+	<string>koast18/livecontainer-kingcard-proxy-tailscale</string>
+	<key>LCProxyUpdateTag</key>
+	<string>v0.6.0</string>
 </dict>
 </plist>
