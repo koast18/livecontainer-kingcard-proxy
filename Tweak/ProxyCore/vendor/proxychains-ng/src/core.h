@@ -25,6 +25,18 @@
 #ifndef __CORE_HEADER
 #define __CORE_HEADER
 
+/* Host-test compatibility fallbacks. The iOS build still passes these in
+ * CFLAGS; host scripts compile core.h with no extra -D flags now. */
+#ifndef GN_NODELEN_T
+#define GN_NODELEN_T socklen_t
+#endif
+#ifndef GN_SERVLEN_T
+#define GN_SERVLEN_T socklen_t
+#endif
+#ifndef GN_FLAGS_T
+#define GN_FLAGS_T int
+#endif
+
 /* Linux/macOS test-host compatibility: Darwin defines these socket-extension
  * types in <sys/socket.h>; non-Apple hosts only need the names for the
  * connectx_t function pointer typedef. */
