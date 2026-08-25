@@ -717,14 +717,14 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
     return YES;
 }
 
-- (void)finishRefreshWithState:(NSDictionary *)state success:(BOOL)success error:(NSString *)error {
+- (void)finishRefreshWithState:(NSMutableDictionary *)state success:(BOOL)success error:(NSString *)error {
     // 兼容包装：无步骤明细的失败路径，日志 msg 直接用错误文本。
     [self finishRefreshWithState:state success:success
                              src:(self.lastSource ?: @"") ms:0
                            steps:nil error:error];
 }
 
-- (void)finishRefreshWithState:(NSDictionary *)state success:(BOOL)success
+- (void)finishRefreshWithState:(NSMutableDictionary *)state success:(BOOL)success
                            src:(NSString *)src ms:(double)ms
                          steps:(NSString *)steps error:(NSString *)error {
     [self pushRefreshLog:success src:src ms:ms
