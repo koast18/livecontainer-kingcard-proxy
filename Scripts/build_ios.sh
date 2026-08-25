@@ -6,6 +6,21 @@ ROOT="$PWD"
 OUT="build/LCProxyControl.dylib"
 VER="$(cat "$ROOT/version.txt" | tr -d ' \r\n' )"
 OBJDIR="build/obj"
+
+# Generate a single source of truth for version reporting.  This keeps the
+# dylib version and the AltStore source version in sync instead of relying on
+# the manually maintained hardcoded fallback in Version.h.
+GIT_COMMIT="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+mkdir -p "$ROOT/Tweak/Sources"
+cat > "$ROOT/Tweak/Sources/Version.h" <<VERSION_HEREDOC
+#ifndef LCProxy_Version_h
+#define LCProxy_Version_h
+#define KPTWEAK_VERSION "${VER}"
+#define KPTWEAK_UA "LCProxy/${VER}"
+#define KPTWEAK_GIT_COMMIT "${GIT_COMMIT}"
+#endif
+VERSION_HEREDOC
+
 SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
 MIN=15.0
 ARCH=arm64

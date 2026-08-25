@@ -15,7 +15,7 @@ EOF
 
 clang -fobjc-arc -O0 -g \
   -framework Foundation -lz \
-  -ITweak/Sources -ITweak/ProxyCore/src \
+  -ITweak/Sources -ITweak/ProxyCore/src -ITweak/ProxyCore/vendor/proxychains-ng/src \
   Tweak/Sources/LCProxyKingClient.m \
   Tweak/Sources/KPKCrypto.c \
   Tweak/Sources/KPKQueenCore.c \

@@ -7,6 +7,8 @@
 #import "lcproxy_bridge.h"
 
 static id<NSObject> g_lcDidBecomeActiveObserver;
+static id<NSObject> g_lcDidEnterBackgroundObserver;
+static id<NSObject> g_lcWillEnterForegroundObserver;
 
 static void LCProxyShowBanner(NSDictionary *settings) {
     if (![settings[@"showProxyBanner"] boolValue]) return;
@@ -66,11 +68,23 @@ static void LCProxyControlConstructor(void) {
                                                           object:nil
                                                            queue:[NSOperationQueue mainQueue]
                                                       usingBlock:^(NSNotification * _Nonnull note) {
-            [[LCProxyConfig shared] applyToRuntime];
-            // applyToRuntime already schedules a Wangka refresh when the cached
-            // credentials/proxies are missing or stale. Do not force a network
-            // refresh here: at launch we want to use the cache immediately and
-            // avoid blocking the main thread.
+            [[LCProxyConfig shared] notifyDidBecomeActive];
+        }];
+
+        g_lcWillEnterForegroundObserver =
+        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationWillEnterForegroundNotification
+                                                          object:nil
+                                                           queue:[NSOperationQueue mainQueue]
+                                                      usingBlock:^(NSNotification * _Nonnull note) {
+            [[LCProxyConfig shared] notifyWillEnterForeground];
+        }];
+
+        g_lcDidEnterBackgroundObserver =
+        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidEnterBackgroundNotification
+                                                          object:nil
+                                                           queue:[NSOperationQueue mainQueue]
+                                                      usingBlock:^(NSNotification * _Nonnull note) {
+            [[LCProxyConfig shared] notifyDidEnterBackground];
         }];
 
         // Persist this process's cellular traffic in 10-minute buckets.

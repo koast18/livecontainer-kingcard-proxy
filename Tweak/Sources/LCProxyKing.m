@@ -5,7 +5,10 @@
 #import "LCProxyConfig.h"
 #import "LCProxyKingClient.h"
 #import "lcproxy_bridge.h"
+#import <errno.h>
+#import <fcntl.h>
 #import <stdlib.h>
+#import <unistd.h>
 
 // 周期必须 <= LCProxyKingRefreshLeadTime(2min)，否则续期窗口内可能一次触发都轮不到；
 // 且代理池 TTL 仅 ~9.5min，过长的固定网格会在每次续期后错位出死区。
@@ -54,6 +57,8 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
 @property (nonatomic, assign) BOOL refreshing;
 @property (nonatomic, copy) NSString *lastSettingsSignature;
 @property (nonatomic, strong) NSMutableArray<NSDictionary *> *refreshLog;
+@property (nonatomic, assign) BOOL lastHealthCheckOk;
+@property (nonatomic, assign) NSTimeInterval lastHealthCheckAt;
 - (void)startRefreshTimer;
 - (void)stopRefreshTimer;
 @end
@@ -75,6 +80,8 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
         _lock = [[NSLock alloc] init];
         _lifecycleLock = [[NSLock alloc] init];
         _refreshLog = [[NSMutableArray alloc] init];
+        _lastHealthCheckOk = NO;
+        _lastHealthCheckAt = 0;
         kp_set_debug_logger(LCProxyKingLog);
     }
     return self;
@@ -93,22 +100,27 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
 }
 
 - (void)applyConfig:(NSDictionary *)settings {
+    NSString *effectiveMode = [[LCProxyConfig shared] effectiveProxyModeForSettings:settings];
+    [self applyConfig:settings effectiveMode:effectiveMode forceRestart:NO];
+}
+
+- (void)forceRestartForwarderWithSettings:(NSDictionary *)settings effectiveMode:(NSString *)effectiveMode {
+    [self applyConfig:settings effectiveMode:effectiveMode forceRestart:YES];
+}
+
+- (void)applyConfig:(NSDictionary *)settings effectiveMode:(NSString *)effectiveMode forceRestart:(BOOL)forceRestart {
     // 转发器生命周期（stop/free/new/start/install）必须整体串行化，否则多个线程
     // 同时走到“重建转发器”分支会互相竞争，导致闪退。不能用 self.lock 包住 stop，
     // 因为 stop 要等 client 线程退出，client 线程失败时可能等 self.lock 做取号刷新。
     [self.lifecycleLock lock];
     @try {
-    NSString *mode = [settings[@"proxyMode"] isKindOfClass:[NSString class]] ? settings[@"proxyMode"] : @"custom";
-    BOOL shouldRun = [mode isEqualToString:@"kingcard"] && [settings[@"proxyEnabled"] boolValue];
-    if (shouldRun && [settings[@"kingAutoDirectOnNonCellular"] boolValue] && !lcproxy_stats_is_cellular()) {
-        shouldRun = NO;
-    }
+    BOOL shouldRun = [effectiveMode isEqualToString:@"kingcard"] && [settings[@"proxyEnabled"] boolValue];
     NSString *signature = [self settingsSignature:settings];
     kp_forwarder *oldForwarder = NULL;
     kp_forwarder *newForwarder = NULL;
 
     [self.lock lock];
-    BOOL alreadyRunning = shouldRun && self.forwarder != NULL && kp_forwarder_is_running(self.forwarder) == 1;
+    BOOL alreadyRunning = !forceRestart && shouldRun && self.forwarder != NULL && kp_forwarder_is_running(self.forwarder) == 1;
     if (alreadyRunning) {
         [self.lock unlock];
         BOOL settingsChanged = ![signature isEqualToString:self.lastSettingsSignature];
@@ -378,8 +390,46 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
 // ---------------------------------------------------------------------------
 // 状态持久化与同步取号辅助
 // ---------------------------------------------------------------------------
-- (NSString *)statePath {
-    return [LCProxyDataDirectory() stringByAppendingPathComponent:@"kingcard-state.json"];
+- (NSString *)stateLockPath {
+    return [LCProxyDataDirectory() stringByAppendingPathComponent:@"kingcard-state.lock"];
+}
+
+// 跨进程状态锁：多个 LiveContainer Guest 共享同一个 kingcard-state.json，
+// 取号/代理池刷新必须是“读-改-写”原子操作，否则两个进程会基于旧副本互相覆盖。
+// 这里用 fcntl 记录锁 + 有限等待；如果另一个实例刷新中途被 iOS 挂起，
+// 本进程不会无限阻塞，8 秒后放弃并使用已有缓存。
+- (int)acquireStateLock {
+    NSString *path = [self stateLockPath];
+    [[NSFileManager defaultManager] createDirectoryAtPath:[path stringByDeletingLastPathComponent]
+                              withIntermediateDirectories:YES attributes:nil error:nil];
+    int fd = open(path.UTF8String, O_CREAT | O_RDWR, 0644);
+    if (fd < 0) return -1;
+    struct flock fl = {0};
+    fl.l_type = F_WRLCK;
+    fl.l_whence = SEEK_SET;
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:8.0];
+    while (YES) {
+        if (fcntl(fd, F_SETLK, &fl) == 0) return fd;
+        int err = errno;
+        if (err != EACCES && err != EAGAIN) {
+            close(fd);
+            return -1;
+        }
+        if ([[NSDate date] timeIntervalSinceDate:deadline] >= 0) {
+            close(fd);
+            return -1;
+        }
+        [NSThread sleepForTimeInterval:0.1];
+    }
+}
+
+- (void)releaseStateLock:(int)fd {
+    if (fd < 0) return;
+    struct flock fl = {0};
+    fl.l_type = F_UNLCK;
+    fl.l_whence = SEEK_SET;
+    (void)fcntl(fd, F_SETLK, &fl);
+    close(fd);
 }
 
 - (NSMutableDictionary *)loadState {
@@ -524,6 +574,18 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
     self.refreshing = YES;
     [self.lock unlock];
 
+    int stateLockFd = [self acquireStateLock];
+    if (stateLockFd < 0) {
+        [self.lock lock];
+        self.refreshing = NO;
+        self.lastRefreshSuccess = NO;
+        self.lastRefresh = LCProxyKingNow();
+        self.lastError = @"kingcard-state.json 正被其他实例锁定，稍后自动重试";
+        [self.lock unlock];
+        return NO;
+    }
+
+    @try {
     NSDate *t0 = [NSDate date];
     NSMutableString *steps = [NSMutableString string];
     // 记录是否真的向上游发起了取号/取代理池请求；纯缓存命中时不写取号日志。
@@ -706,16 +768,19 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
     }
     [self saveState:state];
     return YES;
+    } @finally {
+        [self releaseStateLock:stateLockFd];
+    }
 }
 
-- (void)finishRefreshWithState:(NSDictionary *)state success:(BOOL)success error:(NSString *)error {
+- (void)finishRefreshWithState:(NSMutableDictionary *)state success:(BOOL)success error:(NSString *)error {
     // 兼容包装：无步骤明细的失败路径，日志 msg 直接用错误文本。
     [self finishRefreshWithState:state success:success
                              src:(self.lastSource ?: @"") ms:0
                            steps:nil error:error];
 }
 
-- (void)finishRefreshWithState:(NSDictionary *)state success:(BOOL)success
+- (void)finishRefreshWithState:(NSMutableDictionary *)state success:(BOOL)success
                            src:(NSString *)src ms:(double)ms
                          steps:(NSString *)steps error:(NSString *)error {
     [self pushRefreshLog:success src:src ms:ms
@@ -727,6 +792,58 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
     self.lastRefresh = LCProxyKingNow();
     self.lastError = error ?: @"";
     [self.lock unlock];
+}
+
+- (BOOL)performHealthCheck {
+    [self.lifecycleLock lock];
+    @try {
+        [self.lock lock];
+        kp_forwarder *fw = self.forwarder;
+        int port = fw ? kp_forwarder_port(fw) : 0;
+        [self.lock unlock];
+
+        if (!fw || port <= 0 || kp_forwarder_listen_fd_valid(fw) != 1) {
+            [self.lock lock];
+            self.lastHealthCheckOk = NO;
+            self.lastHealthCheckAt = [[NSDate date] timeIntervalSince1970];
+            [self.lock unlock];
+            return NO;
+        }
+
+        BOOL listenOk = kp_forwarder_probe_local(fw, 800) == 1;
+        BOOL proxyOk = NO;
+        if (listenOk) {
+            // The local forwarder builds Queen headers from its own cached
+            // credentials, so the probe credentials below can be arbitrary.
+            proxyOk = kp_probe_generate204("127.0.0.1", port, "probe", "probe", 4000) == 1;
+        }
+
+        [self.lock lock];
+        self.lastHealthCheckOk = listenOk && proxyOk;
+        self.lastHealthCheckAt = [[NSDate date] timeIntervalSince1970];
+        [self.lock unlock];
+        return self.lastHealthCheckOk;
+    } @finally {
+        [self.lifecycleLock unlock];
+    }
+}
+
+- (void)shutdownActiveClients {
+    [self.lifecycleLock lock];
+    @try {
+        [self.lock lock];
+        if (self.forwarder) kp_forwarder_shutdown_clients(self.forwarder);
+        [self.lock unlock];
+    } @finally {
+        [self.lifecycleLock unlock];
+    }
+}
+
+- (NSUInteger)activeClientCount {
+    [self.lock lock];
+    int count = self.forwarder ? kp_forwarder_active_clients(self.forwarder) : 0;
+    [self.lock unlock];
+    return count > 0 ? (NSUInteger)count : 0;
 }
 
 - (NSDictionary *)forwarderStats {
@@ -765,6 +882,10 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
     NSMutableDictionary *d = [NSMutableDictionary dictionary];
     d[@"running"] = @([self isRunning]);
     d[@"forwarderPort"] = @(self.forwarder ? kp_forwarder_port(self.forwarder) : 0);
+    d[@"activeForwarderClients"] = @(self.forwarder ? kp_forwarder_active_clients(self.forwarder) : 0);
+    d[@"listenFdValid"] = @(self.forwarder ? kp_forwarder_listen_fd_valid(self.forwarder) : 0);
+    d[@"lastHealthCheckOk"] = @(self.lastHealthCheckOk);
+    d[@"lastHealthCheckAt"] = @(self.lastHealthCheckAt);
     d[@"lastRefreshSuccess"] = @(self.lastRefreshSuccess);
     d[@"lastRefresh"] = self.lastRefresh ?: @"";
     d[@"lastSource"] = self.lastSource ?: @"";

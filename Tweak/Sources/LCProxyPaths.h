@@ -4,6 +4,7 @@ NS_ASSUME_NONNULL_BEGIN
 
 NSString * _Nullable LCProxySharedRootFromDylibPath(NSString *dylibPath);
 NSString *LCProxySharedRootDirectory(void);
+NSString *LCProxyDylibPath(void);
 NSString *LCProxyDataDirectory(void);
 NSString * _Nullable LCProxySharedDataDirectory(void);
 NSArray<NSString *> *LCProxyAllDataDirectories(void);

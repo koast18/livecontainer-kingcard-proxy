@@ -6,6 +6,10 @@ NS_ASSUME_NONNULL_BEGIN
 
 + (instancetype)shared;
 - (void)applyConfig:(NSDictionary *)settings;
+- (void)forceRestartForwarderWithSettings:(NSDictionary *)settings effectiveMode:(NSString *)effectiveMode;
+- (void)shutdownActiveClients;
+- (NSUInteger)activeClientCount;
+- (BOOL)performHealthCheck;
 - (BOOL)refreshCredentials;
 - (BOOL)refreshCredentialsForce;
 - (BOOL)isReady;

@@ -43,6 +43,15 @@ void lcproxy_socket_set_bypass(int on) {
     (void)on;
 }
 
+void lcproxy_control_copy_proxy_chain(proxy_data *dst, unsigned int dst_cap,
+                                      unsigned int *out_count,
+                                      chain_type *out_chain_type) {
+    unsigned int n = proxychains_proxy_count < dst_cap ? proxychains_proxy_count : dst_cap;
+    if (dst && n > 0) memcpy(dst, proxychains_pd, sizeof(proxy_data) * n);
+    if (out_count) *out_count = n;
+    if (out_chain_type) *out_chain_type = proxychains_ct;
+}
+
 /* Stub connect_proxy_chain(): instead of a real HTTP proxy it either connects
  * to the loopback echo server or simulates an upstream failure. */
 int connect_proxy_chain(int sock, ip_type target_ip, unsigned short target_port,
@@ -138,6 +147,15 @@ static int wait_for_port(void) {
         nanosleep(&ts, NULL);
     }
     return g_upstream_port != 0 ? 0 : -1;
+}
+
+static int wait_for_active_count(int expected, int timeout_ms) {
+    for (int i = 0; i < timeout_ms; i++) {
+        if (lcproxy_async_active_count() == expected) return 0;
+        struct timespec ts = {0, 1000000};
+        nanosleep(&ts, NULL);
+    }
+    return lcproxy_async_active_count() == expected ? 0 : -1;
 }
 
 static int make_nonblocking_socket(void) {
@@ -329,6 +347,38 @@ static int test_upstream_failure(void) {
     return 0;
 }
 
+static int test_close_all(void) {
+    g_fail_connect = 1;
+    int sock = make_nonblocking_socket();
+    if (sock < 0) return 1;
+    int flags = fcntl(sock, F_GETFL, 0);
+    ip_type target;
+    memset(&target, 0, sizeof(target));
+    target.is_v6 = 0;
+    target.addr.v4.as_int = htonl(0x01020304u);
+    if (lcproxy_async_connect_start(sock, target, 443, flags | O_NONBLOCK) != 0) {
+        close(sock);
+        g_fail_connect = 0;
+        return 1;
+    }
+    if (wait_for_active_count(1, 1000) != 0) {
+        close(sock);
+        g_fail_connect = 0;
+        return 1;
+    }
+    lcproxy_async_close_all();
+    if (wait_event(sock, POLLIN, 2000) != 0 || wait_for_active_count(0, 2000) != 0) {
+        fprintf(stderr, "close_all test: relay was not collected\n");
+        close(sock);
+        g_fail_connect = 0;
+        return 1;
+    }
+    close(sock);
+    g_fail_connect = 0;
+    puts("close_all test OK: active relay peer shutdown and collected");
+    return 0;
+}
+
 int main(void) {
     alarm(30);
     int failed = 0;
@@ -336,6 +386,7 @@ int main(void) {
     if (test_echo(32, "small relay roundtrip") != 0) failed = 1;
     if (test_echo(256 * 1024, "large relay roundtrip (256 KiB)") != 0) failed = 1;
     if (test_upstream_failure() != 0) failed = 1;
+    if (test_close_all() != 0) failed = 1;
 
     if (failed) {
         fprintf(stderr, "async proxy tests FAILED\n");

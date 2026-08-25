@@ -10,14 +10,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "../vendor/proxychains-ng/src/core.h"
 #include "lcproxy_bridge.h"
 
-extern proxy_data proxychains_pd[];
-extern unsigned int proxychains_proxy_count;
-extern chain_type proxychains_ct;
 extern unsigned int proxychains_max_chain;
 
 #ifndef MSG_NOSIGNAL
@@ -28,7 +26,52 @@ extern unsigned int proxychains_max_chain;
 // 创建一个 detached relay 线程。这里加一个全局活跃上限，超过后让调用方回退到
 // 同步代理路径，避免无限创建线程耗尽 iOS 进程资源。
 #define LC_ASYNC_MAX_RELAY_THREADS 64
+#define LC_ASYNC_PROXY_CHAIN_MAX 64
 static int g_lc_async_relay_count = 0;
+static pthread_mutex_t g_lc_async_peer_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_lc_async_peer_fds[LC_ASYNC_MAX_RELAY_THREADS];
+static int g_lc_async_peer_count = 0;
+
+static int lc_async_peer_register(int fd) {
+    int registered = 0;
+    pthread_mutex_lock(&g_lc_async_peer_lock);
+    if (g_lc_async_peer_count < LC_ASYNC_MAX_RELAY_THREADS) {
+        g_lc_async_peer_fds[g_lc_async_peer_count++] = fd;
+        registered = 1;
+    }
+    pthread_mutex_unlock(&g_lc_async_peer_lock);
+    return registered;
+}
+
+static void lc_async_peer_unregister(int fd) {
+    pthread_mutex_lock(&g_lc_async_peer_lock);
+    for (int i = 0; i < g_lc_async_peer_count; i++) {
+        if (g_lc_async_peer_fds[i] == fd) {
+            g_lc_async_peer_fds[i] = g_lc_async_peer_fds[g_lc_async_peer_count - 1];
+            g_lc_async_peer_count--;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_lc_async_peer_lock);
+}
+
+void lcproxy_async_close_all(void) {
+    pthread_mutex_lock(&g_lc_async_peer_lock);
+    for (int i = 0; i < g_lc_async_peer_count; i++) {
+        /* The worker owns close(). Holding the registry lock across shutdown
+         * prevents it from unregistering and closing this fd until shutdown
+         * returns, so an unrelated reused descriptor cannot be affected. */
+        shutdown(g_lc_async_peer_fds[i], SHUT_RDWR);
+    }
+    pthread_mutex_unlock(&g_lc_async_peer_lock);
+}
+
+int lcproxy_async_active_count(void) {
+    pthread_mutex_lock(&g_lc_async_peer_lock);
+    int count = g_lc_async_peer_count;
+    pthread_mutex_unlock(&g_lc_async_peer_lock);
+    return count;
+}
 
 static int lc_async_relay_try_acquire(void) {
     int cur = __atomic_load_n(&g_lc_async_relay_count, __ATOMIC_RELAXED);
@@ -79,6 +122,9 @@ static void pump_bidirectional(int up, int peer) {
     struct pollfd pfds[2];
     int up_open = 1;
     int peer_open = 1;
+    const int poll_timeout_ms = 15 * 1000;
+    const time_t max_idle_sec = 120;
+    time_t last_activity = time(NULL);
 
     disable_sigpipe(up);
     disable_sigpipe(peer);
@@ -91,16 +137,20 @@ static void pump_bidirectional(int up, int peer) {
         pfds[1].events = POLLIN;
         pfds[1].revents = 0;
 
-        int n = poll(pfds, 2, -1);
+        int n = poll(pfds, 2, poll_timeout_ms);
         if (n < 0) {
             if (errno == EINTR) continue;
             break;
         }
-        if (n == 0) continue;
+        if (n == 0) {
+            if (time(NULL) - last_activity >= max_idle_sec) break;
+            continue;
+        }
 
         if (up_open && (pfds[0].revents & (POLLIN | POLLHUP | POLLERR))) {
             ssize_t r = recv(up, buf, sizeof(buf), 0);
             if (r > 0) {
+                last_activity = time(NULL);
                 if (write_all(peer, buf, (size_t)r) != 0) {
                     up_open = 0;
                     peer_open = 0;
@@ -115,6 +165,7 @@ static void pump_bidirectional(int up, int peer) {
         if (peer_open && (pfds[1].revents & (POLLIN | POLLHUP | POLLERR))) {
             ssize_t r = recv(peer, buf, sizeof(buf), 0);
             if (r > 0) {
+                last_activity = time(NULL);
                 if (write_all(up, buf, (size_t)r) != 0) {
                     up_open = 0;
                     peer_open = 0;
@@ -140,9 +191,16 @@ static void *relay_worker(void *arg) {
         /* The relay thread is allowed to block; keep the proxychains hooks from
          * turning this internal connect into another async relay. */
         lcproxy_socket_set_bypass(1);
+        // Copy the current chain under the global chain lock. The relay may
+        // run for a long time and must not race with config reloads.
+        proxy_data chain_pd[LC_ASYNC_PROXY_CHAIN_MAX];
+        unsigned int chain_count = 0;
+        chain_type chain_ct = STRICT_TYPE;
+        lcproxy_control_copy_proxy_chain(chain_pd, LC_ASYNC_PROXY_CHAIN_MAX,
+                                         &chain_count, &chain_ct);
         int rc = connect_proxy_chain(
             up, job->target_ip, htons(job->target_port),
-            proxychains_pd, proxychains_proxy_count, proxychains_ct,
+            chain_pd, chain_count, chain_ct,
             proxychains_max_chain);
         lcproxy_socket_set_bypass(0);
 
@@ -152,6 +210,7 @@ static void *relay_worker(void *arg) {
     }
 
     if (up >= 0) close(up);
+    lc_async_peer_unregister(job->peer_fd);
     close(job->peer_fd);
     free(job);
     lc_async_relay_release();
@@ -262,8 +321,16 @@ int lcproxy_async_connect_start(int sock, ip_type target_ip,
     job->target_ip = target_ip;
     job->target_port = target_port;
 
+    if (!lc_async_peer_register(peer_fd)) {
+        free(job);
+        close(peer_fd);
+        lc_async_relay_release();
+        return -1;
+    }
+
     pthread_t thread;
     if (pthread_create(&thread, NULL, relay_worker, job) != 0) {
+        lc_async_peer_unregister(peer_fd);
         free(job);
         close(peer_fd);
         lc_async_relay_release();

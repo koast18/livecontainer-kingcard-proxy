@@ -55,6 +55,14 @@ assert 'void lcproxy_control_apply_proxy_override' in override_c
 
 # Fail-closed network monitoring.
 assert 'lcproxy_network_monitor_update' in config, 'missing network monitor update call'
+assert 'lcproxy_async_close_all' in config, 'foreground recovery does not close async relays'
+assert 'notifyWillEnterForeground' in control, 'missing WillEnterForeground observer'
+assert 'notifyDidEnterBackground' in control, 'missing DidEnterBackground observer'
+assert 'performHealthCheck' in king, 'missing post-recovery health check'
+assert 'kp_forwarder_shutdown_clients' in core, 'missing forwarder client shutdown'
+assert 'kp_forwarder_listen_fd_valid' in core, 'missing listen fd health'
+assert 'poll_timeout_ms' in core, 'forwarder pump still uses infinite poll'
+assert 'lcproxy_control_copy_proxy_chain' in lib, 'missing chain snapshot API'
 assert 'lcproxy_network_should_direct' in config, 'effective mode does not use fail-closed direct decision'
 assert 'nw_path_monitor_create' in config, 'missing NWPathMonitor integration'
 assert 'handleNetworkPath' in config, 'missing path handler'
