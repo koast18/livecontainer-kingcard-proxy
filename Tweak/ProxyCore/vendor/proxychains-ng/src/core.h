@@ -24,6 +24,16 @@
 
 #ifndef __CORE_HEADER
 #define __CORE_HEADER
+
+/* Linux/macOS test-host compatibility: Darwin defines these socket-extension
+ * types in <sys/socket.h>; non-Apple hosts only need the names for the
+ * connectx_t function pointer typedef. */
+#ifndef __APPLE__
+typedef unsigned int sae_associd_t;
+typedef unsigned int sae_connid_t;
+struct sa_endpoints;
+typedef struct sa_endpoints sa_endpoints_t;
+#endif
 #define     MAX_LOCALNET 64
 #define     MAX_DNAT 64
 

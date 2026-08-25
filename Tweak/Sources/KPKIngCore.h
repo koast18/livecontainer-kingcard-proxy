@@ -198,6 +198,22 @@ int kp_forwarder_start(kp_forwarder *fw);
 /// 停止并关闭。
 void kp_forwarder_stop(kp_forwarder *fw);
 
+/// Stop and close all active client sockets, but do not close descriptors here;
+/// worker threads remain the sole close owner to avoid fd reuse races.
+void kp_forwarder_shutdown_clients(kp_forwarder *fw);
+
+/// Number of currently registered client workers.
+int kp_forwarder_active_clients(kp_forwarder *fw);
+
+/// Cheap liveness check for the listening socket. Returns 1 when the
+/// forwarder is running and its listen fd is still open.
+int kp_forwarder_listen_fd_valid(kp_forwarder *fw);
+
+/// Connect once to 127.0.0.1:listen_port using a bypass socket. Returns 1 when
+/// the local forwarder accepts a new connection (proves accept thread + listen
+/// fd are still alive).
+int kp_forwarder_probe_local(kp_forwarder *fw, int timeout_ms);
+
 /// 释放。
 void kp_forwarder_free(kp_forwarder *fw);
 

@@ -6,14 +6,16 @@
 #import "lcproxy_bridge.h"
 #import "LCProxyKing.h"
 #import "KPKIngCore.h"
+#import "Version.h"
 #include "webkit_proxy.h"
+#include "async_proxy.h"
 #include <arpa/inet.h>
+#include <unistd.h>
 #import "GCDWebServer.h"
 #import "GCDWebServerDataRequest.h"
 #import "GCDWebServerDataResponse.h"
 #import "GCDWebServerRequest.h"
 
-static NSString *const LCProxyVersion = @"0.5.22";
 static const NSUInteger LCProxyDefaultPort = 19092;
 
 @interface LCProxyServer ()
@@ -65,6 +67,18 @@ static const NSUInteger LCProxyDefaultPort = 19092;
     return [obj isKindOfClass:[NSDictionary class]] ? obj : @{};
 }
 
+- (NSString *)currentBundleId {
+    NSString *bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"unknown";
+    return bid;
+}
+
+- (int)proxyOverridePort {
+    char host[256];
+    int port = 0;
+    if (lcproxy_control_get_proxy_override(host, sizeof(host), &port)) return port;
+    return 0;
+}
+
 - (NSDictionary *)configPayload {
     NSDictionary *cfg = [[LCProxyConfig shared] load];
     NSMutableDictionary *d = [NSMutableDictionary dictionaryWithDictionary:cfg];
@@ -72,13 +86,25 @@ static const NSUInteger LCProxyDefaultPort = 19092;
     d[@"effectiveMode"] = [[LCProxyConfig shared] effectiveProxyModeForSettings:cfg];
     d[@"proxyCount"] = @(lcproxy_control_get_proxy_count());
     d[@"serverPort"] = @(self.port);
-    d[@"version"] = LCProxyVersion;
+    d[@"version"] = [NSString stringWithUTF8String:KPTWEAK_VERSION];
+    d[@"dylibVersion"] = [NSString stringWithUTF8String:KPTWEAK_VERSION];
+    d[@"gitCommit"] = [NSString stringWithUTF8String:KPTWEAK_GIT_COMMIT];
+    d[@"pid"] = @(getpid());
+    d[@"bundleId"] = [self currentBundleId];
+    d[@"dylibPath"] = LCProxyDylibPath();
     d[@"dataDirectory"] = LCProxyDataDirectory();
+    d[@"forwarderPort"] = @([[LCProxyKing shared] localForwarderPort]);
+    d[@"proxyOverridePort"] = @([self proxyOverridePort]);
+    d[@"asyncRelayCount"] = @(lcproxy_async_active_count());
     d[@"proxychainsConfPath"] = [[LCProxyConfig shared] proxychainsConfPath];
     d[@"proxychainsConfExists"] = @([[NSFileManager defaultManager] fileExistsAtPath:[[LCProxyConfig shared] proxychainsConfPath]]);
     d[@"settingsPath"] = [[LCProxyConfig shared] settingsPath];
     d[@"settingsExists"] = @([[NSFileManager defaultManager] fileExistsAtPath:[[LCProxyConfig shared] settingsPath]]);
     d[@"king"] = [[LCProxyKing shared] status];
+    NSDictionary *runtimeDiag = [[LCProxyConfig shared] runtimeDiagnostics];
+    if ([runtimeDiag isKindOfClass:[NSDictionary class]]) {
+        d[@"runtime"] = runtimeDiag;
+    }
     NSDictionary *stats = [[LCProxyStats shared] aggregate];
     d[@"kingAggregate"] = stats[@"forwarder"] ?: @{};
     return d;

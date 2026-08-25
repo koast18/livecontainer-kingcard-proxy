@@ -19,6 +19,8 @@ assert 'LCProxyKingRefreshLeadTime = 2 * 60;' in king, \
     'missing LCProxyKingRefreshLeadTime constant'
 
 # `hasFreshCachedState` must gate the startup/foreground refresh decision.
+assert 'lcproxy_stats_is_cellular' not in king, 'LCProxyKing must not use the old cellular stats judge'
+assert 'effectiveProxyModeForSettings' in king, 'LCProxyKing must use effective mode'
 assert 'hasFreshCachedState' in king, 'missing hasFreshCachedState'
 assert re.search(r'if\s*\(!\s*\[self\s+hasFreshCachedState\]\s*\)', king), \
     'applyConfig does not skip refresh when fresh cache exists'

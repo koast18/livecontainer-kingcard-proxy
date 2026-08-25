@@ -55,6 +55,10 @@
 #define     SOCKPORT(x)     (satosin(x)->sin_port)
 #define     SOCKFAMILY(x)     (satosin(x)->sin_family)
 #define     MAX_CHAIN 512
+/* Stack-friendly snapshot cap for the connect hook. LiveContainer writes a
+ * single-hop chain, so 64 entries is far more than needed while keeping the
+ * hook stack below ~34 KB. */
+#define     LC_CONNECT_CHAIN_SNAPSHOT_MAX 64
 
 #ifdef IS_SOLARIS
 #undef connect
@@ -204,8 +208,27 @@ void lcproxy_control_set_block_non_tcp(int enabled) {
 int lcproxy_control_get_block_non_tcp(void) {
     return proxychains_block_non_tcp;
 }
+static pthread_mutex_t lc_proxy_chain_lock = PTHREAD_MUTEX_INITIALIZER;
+
 int lcproxy_control_get_proxy_count(void) {
-    return (int)proxychains_proxy_count;
+    pthread_mutex_lock(&lc_proxy_chain_lock);
+    int count = (int)proxychains_proxy_count;
+    pthread_mutex_unlock(&lc_proxy_chain_lock);
+    return count;
+}
+
+void lcproxy_control_copy_proxy_chain(proxy_data *dst, unsigned int dst_cap,
+                                      unsigned int *out_count,
+                                      chain_type *out_chain_type) {
+    pthread_mutex_lock(&lc_proxy_chain_lock);
+    unsigned int count = proxychains_proxy_count;
+    if (count > dst_cap) count = dst_cap;
+    if (dst && count > 0) {
+        memcpy(dst, proxychains_pd, sizeof(proxy_data) * count);
+    }
+    if (out_count) *out_count = count;
+    if (out_chain_type) *out_chain_type = proxychains_ct;
+    pthread_mutex_unlock(&lc_proxy_chain_lock);
 }
 
 int lcproxy_stats_is_cellular(void) {
@@ -994,17 +1017,22 @@ no_proxy:
 }
 
 void lcproxy_control_reload_config(void) {
+	pthread_mutex_lock(&lc_proxy_chain_lock);
 	unsigned int old_proxy_count = proxychains_proxy_count;
 	proxychains_got_chain_data = 0;
 	proxychains_proxy_count = 0;
 	get_chain_data(proxychains_pd, &proxychains_proxy_count, &proxychains_ct);
 	lcproxy_control_apply_proxy_override(proxychains_pd, proxychains_proxy_count);
+	int close_old_direct = (!lc_proxy_disabled && old_proxy_count == 0 && proxychains_proxy_count > 0);
+	unsigned int new_count = proxychains_proxy_count;
+	pthread_mutex_unlock(&lc_proxy_chain_lock);
 	// If a direct-mode config (no proxy list) is replaced by a proxy config
 	// while proxy mode is already enabled, close old direct sockets too.
-	if (!lc_proxy_disabled && old_proxy_count == 0 && proxychains_proxy_count > 0)
+	if (close_old_direct)
 		lc_direct_track_close_all();
-	proxychains_write_log(LOG_PREFIX "config reloaded, proxy_count=%u\n", proxychains_proxy_count);
+	proxychains_write_log(LOG_PREFIX "config reloaded, proxy_count=%u\n", new_count);
 }
+
 
 /*******  HOOK FUNCTIONS  *******/
 
@@ -1126,7 +1154,7 @@ HOOKFUNC(int, connect, int sock, const struct sockaddr *addr, unsigned int len) 
 
 	if(lc_bypass_get())
 		return true_connect(sock, addr, len);
-	if(!proxychains_proxy_count || lc_proxy_disabled) {
+	if(!lcproxy_control_get_proxy_count() || lc_proxy_disabled) {
 		lc_direct_track_add_if_remote(sock, addr, len);
 		return true_connect(sock, addr, len);
 	}
@@ -1221,6 +1249,18 @@ HOOKFUNC(int, connect, int sock, const struct sockaddr *addr, unsigned int len) 
 
 	memcpy(dest_ip.addr.v6, v6 ? (void*)p_addr_in6 : (void*)p_addr_in, v6?16:4);
 
+	// Snapshot the active chain so a concurrent config reload (which mutates
+	// proxychains_pd/proxychains_proxy_count in place) cannot race with this
+	// connect. The snapshot stays valid for the whole proxied connect call.
+	proxy_data chain_pd[LC_CONNECT_CHAIN_SNAPSHOT_MAX];
+	unsigned int chain_count = 0;
+	chain_type chain_ct = STRICT_TYPE;
+	lcproxy_control_copy_proxy_chain(chain_pd, LC_CONNECT_CHAIN_SNAPSHOT_MAX, &chain_count, &chain_ct);
+	if (chain_count == 0) {
+		lc_direct_track_add_if_remote(sock, addr, len);
+		return true_connect(sock, addr, len);
+	}
+
 	if((flags & O_NONBLOCK) && lcproxy_async_connect_start(sock, dest_ip, port, flags) == 0) {
 		lc_fd_class_set(sock, LC_FD_CLASS_NOCOUNT);
 		errno = EINPROGRESS;
@@ -1234,7 +1274,7 @@ HOOKFUNC(int, connect, int sock, const struct sockaddr *addr, unsigned int len) 
 	ret = connect_proxy_chain(sock,
 				  dest_ip,
 				  htons(port),
-				  proxychains_pd, proxychains_proxy_count, proxychains_ct, proxychains_max_chain);
+				  chain_pd, chain_count, chain_ct, proxychains_max_chain);
 	lc_bypass_set(0);
 
 	fcntl(sock, F_SETFL, flags);
@@ -1265,11 +1305,11 @@ HOOKFUNC(int, connectx, int sock, const sa_endpoints_t *endpoints,
 	(void)connid;
 	if(lc_bypass_get())
 		return true_connectx(sock, endpoints, associd, flags, ext, extlen, pcid, connid);
-	if(!proxychains_proxy_count || !endpoints || !endpoints->sae_dstaddr ||
+	if(!lcproxy_control_get_proxy_count() || !endpoints || !endpoints->sae_dstaddr ||
 	   endpoints->sae_dstaddrlen < sizeof(struct sockaddr) || flags != 0 ||
 	   ext != NULL || extlen != 0 || pcid != NULL || connid != NULL) {
 		PDEBUG("connectx bypassed: proxy_count=%u endpoints=%p dst=%p flags=%u ext=%p extlen=%u pcid=%p connid=%p\n",
-		       proxychains_proxy_count, (void*)endpoints,
+		       (unsigned int)lcproxy_control_get_proxy_count(), (void*)endpoints,
 		       endpoints ? (void*)endpoints->sae_dstaddr : 0,
 		       flags, (void*)ext, extlen, (void*)pcid, (void*)connid);
 		return true_connectx(sock, endpoints, associd, flags, ext, extlen, pcid, connid);

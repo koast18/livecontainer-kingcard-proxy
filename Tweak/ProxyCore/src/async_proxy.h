@@ -17,4 +17,12 @@
 int lcproxy_async_connect_start(int sock, ip_type target_ip,
                                 unsigned short target_port, int orig_flags);
 
+/* Shutdown every active relay peer without closing its descriptor. The relay
+ * worker remains the sole close() owner, preventing shutdown/close fd reuse
+ * races while lifecycle recovery is in progress. */
+void lcproxy_async_close_all(void);
+
+/* Number of relay peers currently owned by workers. */
+int lcproxy_async_active_count(void);
+
 #endif /* LCPROXY_ASYNC_PROXY_H */

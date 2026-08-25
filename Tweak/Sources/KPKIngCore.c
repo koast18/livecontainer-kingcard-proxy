@@ -1248,18 +1248,31 @@ static void kp_pipe_bidirectional_counted(int a, int b,
     char buf[16384];
     struct pollfd pfds[2];
     int a_open = 1, b_open = 1;
+    const int poll_timeout_ms = 15 * 1000;
+    const time_t max_idle_sec = 120;
+    time_t last_activity = time(NULL);
 
     while (a_open || b_open) {
         pfds[0].fd = a_open ? a : -1;
         pfds[0].events = POLLIN;
+        pfds[0].revents = 0;
         pfds[1].fd = b_open ? b : -1;
         pfds[1].events = POLLIN;
-        int n = poll(pfds, 2, -1);
-        if (n <= 0) break;
+        pfds[1].revents = 0;
+        int n = poll(pfds, 2, poll_timeout_ms);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (n == 0) {
+            if (time(NULL) - last_activity >= max_idle_sec) break;
+            continue;
+        }
 
         if (pfds[0].fd >= 0 && (pfds[0].revents & (POLLIN | POLLHUP | POLLERR))) {
             ssize_t r = recv(a, buf, sizeof(buf), 0);
             if (r > 0) {
+                last_activity = time(NULL);
                 if (kp_send_all(b, buf, (size_t)r) != 0) {
                     a_open = 0;
                     b_open = 0;
@@ -1274,6 +1287,7 @@ static void kp_pipe_bidirectional_counted(int a, int b,
         if (pfds[1].fd >= 0 && (pfds[1].revents & (POLLIN | POLLHUP | POLLERR))) {
             ssize_t r = recv(b, buf, sizeof(buf), 0);
             if (r > 0) {
+                last_activity = time(NULL);
                 if (kp_send_all(a, buf, (size_t)r) != 0) {
                     a_open = 0;
                     b_open = 0;
@@ -2088,6 +2102,36 @@ int kp_forwarder_start(kp_forwarder *fw) {
     }
     kp_dbg("[fw] forwarder listening on %s:%d", fw->listen_host, fw->listen_port);
     return 0;
+}
+
+void kp_forwarder_shutdown_clients(kp_forwarder *fw) {
+    if (!fw) return;
+    pthread_mutex_lock(&fw->client_lock);
+    for (int i = 0; i < fw->client_fd_count; i++) {
+        int fd = fw->client_fds[i];
+        if (fd >= 0) shutdown(fd, SHUT_RDWR);
+    }
+    pthread_mutex_unlock(&fw->client_lock);
+}
+
+int kp_forwarder_active_clients(kp_forwarder *fw) {
+    if (!fw) return 0;
+    pthread_mutex_lock(&fw->client_lock);
+    int count = fw->active_clients;
+    pthread_mutex_unlock(&fw->client_lock);
+    return count;
+}
+
+int kp_forwarder_listen_fd_valid(kp_forwarder *fw) {
+    return fw && fw->running && fw->listen_fd >= 0;
+}
+
+int kp_forwarder_probe_local(kp_forwarder *fw, int timeout_ms) {
+    if (!fw || !fw->running || fw->listen_port <= 0) return 0;
+    int fd = kp_connect_host("127.0.0.1", fw->listen_port, timeout_ms);
+    if (fd < 0) return 0;
+    KP_CLOSESOCK(fd);
+    return 1;
 }
 
 void kp_forwarder_stop(kp_forwarder *fw) {

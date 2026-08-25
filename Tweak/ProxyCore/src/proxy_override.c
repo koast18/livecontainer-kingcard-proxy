@@ -3,34 +3,39 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 
 static char lc_proxy_override_host[256];
 static int lc_proxy_override_port = 0;
 static int lc_proxy_override_valid = 0;
+static pthread_mutex_t lc_proxy_override_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 void lcproxy_control_set_proxy_override(const char *host, int port) {
+    pthread_mutex_lock(&lc_proxy_override_mutex);
     if (!host || !host[0] || port <= 0 || port > 65535) {
         lc_proxy_override_valid = 0;
         lc_proxy_override_host[0] = '\0';
         lc_proxy_override_port = 0;
+        pthread_mutex_unlock(&lc_proxy_override_mutex);
         return;
     }
     snprintf(lc_proxy_override_host, sizeof(lc_proxy_override_host), "%s", host);
     lc_proxy_override_port = port;
     lc_proxy_override_valid = 1;
+    pthread_mutex_unlock(&lc_proxy_override_mutex);
 }
 
 int lcproxy_control_get_proxy_override(char *host, size_t hostlen, int *port) {
-    if (!lc_proxy_override_valid)
-        return 0;
-    if (host && hostlen > 0) {
+    pthread_mutex_lock(&lc_proxy_override_mutex);
+    int valid = lc_proxy_override_valid;
+    if (valid && host && hostlen > 0) {
         snprintf(host, hostlen, "%s", lc_proxy_override_host);
     }
-    if (port)
-        *port = lc_proxy_override_port;
-    return 1;
+    if (valid && port) *port = lc_proxy_override_port;
+    pthread_mutex_unlock(&lc_proxy_override_mutex);
+    return valid;
 }
 
 void lcproxy_control_apply_proxy_override(void *proxy_list, unsigned int proxy_count) {
@@ -38,7 +43,7 @@ void lcproxy_control_apply_proxy_override(void *proxy_list, unsigned int proxy_c
     char host[256];
     int port = 0;
 
-    if (!lc_proxy_override_valid || !pd || proxy_count == 0)
+    if (!pd || proxy_count == 0)
         return;
     if (!lcproxy_control_get_proxy_override(host, sizeof(host), &port))
         return;

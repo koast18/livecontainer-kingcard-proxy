@@ -2,6 +2,7 @@
 #define LCPROXY_BRIDGE_H
 
 #include <stdint.h>
+#include "core.h"
 #include "proxy_override.h"
 
 #ifdef __cplusplus
@@ -16,6 +17,14 @@ int  lcproxy_control_get_proxy_count(void);
 int  lcproxy_control_get_enabled(void);
 void lcproxy_control_set_block_non_tcp(int enabled);
 int  lcproxy_control_get_block_non_tcp(void);
+
+// Thread-safe snapshot of the active proxychains chain. The snapshot is copied
+// under the chain lock so connect/relay workers never observe a half-reloaded
+// proxy array.
+#define LC_PROXY_CHAIN_MAX 512
+void lcproxy_control_copy_proxy_chain(proxy_data *dst, unsigned int dst_cap,
+                                      unsigned int *out_count,
+                                      chain_type *out_chain_type);
 
 // Real-time network path hints (NWPathMonitor updates routing fail-closed)
 void     lcproxy_network_monitor_update(int known, int non_cellular);

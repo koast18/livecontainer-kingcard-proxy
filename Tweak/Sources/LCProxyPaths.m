@@ -38,6 +38,15 @@ NSString *LCProxyDataDirectory(void) {
     return [LCProxySharedRootDirectory() stringByAppendingPathComponent:@"LCProxy"];
 }
 
+NSString *LCProxyDylibPath(void) {
+    Dl_info info;
+    if (dladdr((const void *)&LCProxySharedRootDirectory, &info) &&
+        info.dli_fname && info.dli_fname[0]) {
+        return [NSString stringWithUTF8String:info.dli_fname] ?: @"";
+    }
+    return @"";
+}
+
 NSString * _Nullable LCProxySharedDataDirectory(void) {
     Class cls = NSClassFromString(@"LCSharedUtils");
     if (!cls) return nil;

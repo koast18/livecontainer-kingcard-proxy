@@ -54,6 +54,8 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
 @property (nonatomic, assign) BOOL refreshing;
 @property (nonatomic, copy) NSString *lastSettingsSignature;
 @property (nonatomic, strong) NSMutableArray<NSDictionary *> *refreshLog;
+@property (nonatomic, assign) BOOL lastHealthCheckOk;
+@property (nonatomic, assign) NSTimeInterval lastHealthCheckAt;
 - (void)startRefreshTimer;
 - (void)stopRefreshTimer;
 @end
@@ -75,6 +77,8 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
         _lock = [[NSLock alloc] init];
         _lifecycleLock = [[NSLock alloc] init];
         _refreshLog = [[NSMutableArray alloc] init];
+        _lastHealthCheckOk = NO;
+        _lastHealthCheckAt = 0;
         kp_set_debug_logger(LCProxyKingLog);
     }
     return self;
@@ -93,22 +97,27 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
 }
 
 - (void)applyConfig:(NSDictionary *)settings {
+    NSString *effectiveMode = [[LCProxyConfig shared] effectiveProxyModeForSettings:settings];
+    [self applyConfig:settings effectiveMode:effectiveMode forceRestart:NO];
+}
+
+- (void)forceRestartForwarderWithSettings:(NSDictionary *)settings effectiveMode:(NSString *)effectiveMode {
+    [self applyConfig:settings effectiveMode:effectiveMode forceRestart:YES];
+}
+
+- (void)applyConfig:(NSDictionary *)settings effectiveMode:(NSString *)effectiveMode forceRestart:(BOOL)forceRestart {
     // 转发器生命周期（stop/free/new/start/install）必须整体串行化，否则多个线程
     // 同时走到“重建转发器”分支会互相竞争，导致闪退。不能用 self.lock 包住 stop，
     // 因为 stop 要等 client 线程退出，client 线程失败时可能等 self.lock 做取号刷新。
     [self.lifecycleLock lock];
     @try {
-    NSString *mode = [settings[@"proxyMode"] isKindOfClass:[NSString class]] ? settings[@"proxyMode"] : @"custom";
-    BOOL shouldRun = [mode isEqualToString:@"kingcard"] && [settings[@"proxyEnabled"] boolValue];
-    if (shouldRun && [settings[@"kingAutoDirectOnNonCellular"] boolValue] && !lcproxy_stats_is_cellular()) {
-        shouldRun = NO;
-    }
+    BOOL shouldRun = [effectiveMode isEqualToString:@"kingcard"] && [settings[@"proxyEnabled"] boolValue];
     NSString *signature = [self settingsSignature:settings];
     kp_forwarder *oldForwarder = NULL;
     kp_forwarder *newForwarder = NULL;
 
     [self.lock lock];
-    BOOL alreadyRunning = shouldRun && self.forwarder != NULL && kp_forwarder_is_running(self.forwarder) == 1;
+    BOOL alreadyRunning = !forceRestart && shouldRun && self.forwarder != NULL && kp_forwarder_is_running(self.forwarder) == 1;
     if (alreadyRunning) {
         [self.lock unlock];
         BOOL settingsChanged = ![signature isEqualToString:self.lastSettingsSignature];
@@ -729,6 +738,58 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
     [self.lock unlock];
 }
 
+- (BOOL)performHealthCheck {
+    [self.lifecycleLock lock];
+    @try {
+        [self.lock lock];
+        kp_forwarder *fw = self.forwarder;
+        int port = fw ? kp_forwarder_port(fw) : 0;
+        [self.lock unlock];
+
+        if (!fw || port <= 0 || kp_forwarder_listen_fd_valid(fw) != 1) {
+            [self.lock lock];
+            self.lastHealthCheckOk = NO;
+            self.lastHealthCheckAt = [[NSDate date] timeIntervalSince1970];
+            [self.lock unlock];
+            return NO;
+        }
+
+        BOOL listenOk = kp_forwarder_probe_local(fw, 800) == 1;
+        BOOL proxyOk = NO;
+        if (listenOk) {
+            // The local forwarder builds Queen headers from its own cached
+            // credentials, so the probe credentials below can be arbitrary.
+            proxyOk = kp_probe_generate204("127.0.0.1", port, "probe", "probe", 4000) == 1;
+        }
+
+        [self.lock lock];
+        self.lastHealthCheckOk = listenOk && proxyOk;
+        self.lastHealthCheckAt = [[NSDate date] timeIntervalSince1970];
+        [self.lock unlock];
+        return self.lastHealthCheckOk;
+    } @finally {
+        [self.lifecycleLock unlock];
+    }
+}
+
+- (void)shutdownActiveClients {
+    [self.lifecycleLock lock];
+    @try {
+        [self.lock lock];
+        if (self.forwarder) kp_forwarder_shutdown_clients(self.forwarder);
+        [self.lock unlock];
+    } @finally {
+        [self.lifecycleLock unlock];
+    }
+}
+
+- (NSUInteger)activeClientCount {
+    [self.lock lock];
+    int count = self.forwarder ? kp_forwarder_active_clients(self.forwarder) : 0;
+    [self.lock unlock];
+    return count > 0 ? (NSUInteger)count : 0;
+}
+
 - (NSDictionary *)forwarderStats {
     [self.lock lock];
     NSMutableDictionary *d = [NSMutableDictionary dictionary];
@@ -765,6 +826,10 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
     NSMutableDictionary *d = [NSMutableDictionary dictionary];
     d[@"running"] = @([self isRunning]);
     d[@"forwarderPort"] = @(self.forwarder ? kp_forwarder_port(self.forwarder) : 0);
+    d[@"activeForwarderClients"] = @(self.forwarder ? kp_forwarder_active_clients(self.forwarder) : 0);
+    d[@"listenFdValid"] = @(self.forwarder ? kp_forwarder_listen_fd_valid(self.forwarder) : 0);
+    d[@"lastHealthCheckOk"] = @(self.lastHealthCheckOk);
+    d[@"lastHealthCheckAt"] = @(self.lastHealthCheckAt);
     d[@"lastRefreshSuccess"] = @(self.lastRefreshSuccess);
     d[@"lastRefresh"] = self.lastRefresh ?: @"";
     d[@"lastSource"] = self.lastSource ?: @"";
