@@ -5,7 +5,10 @@
 #import "LCProxyConfig.h"
 #import "LCProxyKingClient.h"
 #import "lcproxy_bridge.h"
+#import <errno.h>
+#import <fcntl.h>
 #import <stdlib.h>
+#import <unistd.h>
 
 // 周期必须 <= LCProxyKingRefreshLeadTime(2min)，否则续期窗口内可能一次触发都轮不到；
 // 且代理池 TTL 仅 ~9.5min，过长的固定网格会在每次续期后错位出死区。
@@ -387,8 +390,46 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
 // ---------------------------------------------------------------------------
 // 状态持久化与同步取号辅助
 // ---------------------------------------------------------------------------
-- (NSString *)statePath {
-    return [LCProxyDataDirectory() stringByAppendingPathComponent:@"kingcard-state.json"];
+- (NSString *)stateLockPath {
+    return [LCProxyDataDirectory() stringByAppendingPathComponent:@"kingcard-state.lock"];
+}
+
+// 跨进程状态锁：多个 LiveContainer Guest 共享同一个 kingcard-state.json，
+// 取号/代理池刷新必须是“读-改-写”原子操作，否则两个进程会基于旧副本互相覆盖。
+// 这里用 fcntl 记录锁 + 有限等待；如果另一个实例刷新中途被 iOS 挂起，
+// 本进程不会无限阻塞，8 秒后放弃并使用已有缓存。
+- (int)acquireStateLock {
+    NSString *path = [self stateLockPath];
+    [[NSFileManager defaultManager] createDirectoryAtPath:[path stringByDeletingLastPathComponent]
+                              withIntermediateDirectories:YES attributes:nil error:nil];
+    int fd = open(path.UTF8String, O_CREAT | O_RDWR, 0644);
+    if (fd < 0) return -1;
+    struct flock fl = {0};
+    fl.l_type = F_WRLCK;
+    fl.l_whence = SEEK_SET;
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:8.0];
+    while (YES) {
+        if (fcntl(fd, F_SETLK, &fl) == 0) return fd;
+        int err = errno;
+        if (err != EACCES && err != EAGAIN) {
+            close(fd);
+            return -1;
+        }
+        if ([[NSDate date] timeIntervalSinceDate:deadline] >= 0) {
+            close(fd);
+            return -1;
+        }
+        [NSThread sleepForTimeInterval:0.1];
+    }
+}
+
+- (void)releaseStateLock:(int)fd {
+    if (fd < 0) return;
+    struct flock fl = {0};
+    fl.l_type = F_UNLCK;
+    fl.l_whence = SEEK_SET;
+    (void)fcntl(fd, F_SETLK, &fl);
+    close(fd);
 }
 
 - (NSMutableDictionary *)loadState {
@@ -533,6 +574,18 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
     self.refreshing = YES;
     [self.lock unlock];
 
+    int stateLockFd = [self acquireStateLock];
+    if (stateLockFd < 0) {
+        [self.lock lock];
+        self.refreshing = NO;
+        self.lastRefreshSuccess = NO;
+        self.lastRefresh = LCProxyKingNow();
+        self.lastError = @"kingcard-state.json 正被其他实例锁定，稍后自动重试";
+        [self.lock unlock];
+        return NO;
+    }
+
+    @try {
     NSDate *t0 = [NSDate date];
     NSMutableString *steps = [NSMutableString string];
     // 记录是否真的向上游发起了取号/取代理池请求；纯缓存命中时不写取号日志。
@@ -715,6 +768,9 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
     }
     [self saveState:state];
     return YES;
+    } @finally {
+        [self releaseStateLock:stateLockFd];
+    }
 }
 
 - (void)finishRefreshWithState:(NSMutableDictionary *)state success:(BOOL)success error:(NSString *)error {
