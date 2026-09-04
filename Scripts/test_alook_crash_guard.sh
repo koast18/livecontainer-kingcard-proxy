@@ -53,6 +53,10 @@ grep -q "define KP_FORWARDER_STOP_GRACE_MS" "$CORE" \
     || fail "KPKIngCore.c lost the stop grace deadline"
 grep -q "kp_forwarder_shutdown_upstreams" "$CORE" \
     || fail "KPKIngCore.c no longer wakes relays blocked on upstream sockets"
+grep -q "kp_forwarder_shutdown_upstreams_locked" "$CORE" \
+    || fail "KPKIngCore.c lost the lock-held upstream wakeup helper"
+grep -q "kp_forwarder_shutdown_upstreams_locked(fw);" "$CORE" \
+    || fail "KPKIngCore.c kp_forwarder_stop no longer calls the upstream wakeup helper"
 grep -q "kp_upstream_close" "$CORE" \
     || fail "KPKIngCore.c lost the close-under-registry-lock upstream helper"
 grep -q "forwarder leaked intentionally" "$CORE" \
