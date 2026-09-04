@@ -1108,12 +1108,65 @@ struct kp_forwarder {
     int active_clients;
     int client_fds[KP_FORWARDER_MAX_CLIENTS];
     int client_fd_count;
+    // 上游 socket 登记（与 client_fds 同锁）：转发线程可能阻塞在上游 recv/send
+    // （挂起后上游半开连接永远不会回包），stop/恢复流程必须同时 shutdown 上游 fd
+    // 才能把这些线程唤醒。close 仍由所属转发线程在锁内完成，避免 stop 期间
+    // fd 号被复用后误伤无关连接（与 async_proxy 的 peer 登记同模式）。
+    int upstream_fds[KP_FORWARDER_MAX_CLIENTS];
+    int upstream_fd_count;
 };
+
+// kp_forwarder_stop 等待转发线程退出的最长时限：socket 已被 shutdown 的线程毫秒
+// 级返回；卡在取号 hook 网络等待的线程可能数十秒，超时后按僵尸泄漏而非死等。
+#define KP_FORWARDER_STOP_GRACE_MS 10000
 
 struct client_arg {
     kp_forwarder *fw;
     int fd;
 };
+
+static void kp_forwarder_track_upstream(kp_forwarder *fw, int fd) {
+    if (!fw || fd < 0) return;
+    pthread_mutex_lock(&fw->client_lock);
+    if (fw->upstream_fd_count < KP_FORWARDER_MAX_CLIENTS) {
+        fw->upstream_fds[fw->upstream_fd_count++] = fd;
+    }
+    pthread_mutex_unlock(&fw->client_lock);
+}
+
+// 登记簿内移除并关闭一个上游 fd。必须在锁内 close：否则 close 后 fd 号被
+// 新 socket 复用时，并发的 shutdown_upstreams 可能误伤复用者。
+static void kp_upstream_close(kp_forwarder *fw, int *fd) {
+    if (!fw || !fd || *fd < 0) return;
+    int closing = *fd;
+    *fd = -1;
+    pthread_mutex_lock(&fw->client_lock);
+    for (int i = 0; i < fw->upstream_fd_count; i++) {
+        if (fw->upstream_fds[i] == closing) {
+            fw->upstream_fds[i] = fw->upstream_fds[fw->upstream_fd_count - 1];
+            fw->upstream_fd_count--;
+            break;
+        }
+    }
+    KP_CLOSESOCK(closing);
+    pthread_mutex_unlock(&fw->client_lock);
+}
+
+static int kp_up_open(kp_forwarder *fw, const char *host, int port, int timeout_ms) {
+    int fd = kp_connect_host(host, port, timeout_ms);
+    if (fd >= 0) kp_forwarder_track_upstream(fw, fd);
+    return fd;
+}
+
+void kp_forwarder_shutdown_upstreams(kp_forwarder *fw) {
+    if (!fw) return;
+    pthread_mutex_lock(&fw->client_lock);
+    for (int i = 0; i < fw->upstream_fd_count; i++) {
+        int fd = fw->upstream_fds[i];
+        if (fd >= 0) shutdown(fd, SHUT_RDWR);
+    }
+    pthread_mutex_unlock(&fw->client_lock);
+}
 
 static void kp_forwarder_creds(kp_forwarder *fw, char *guid, size_t gc, char *token, size_t tc);
 static void kp_forwarder_record_direct_host(kp_forwarder *fw, const char *host) {
@@ -1230,14 +1283,46 @@ int kp_rebuild_proxy_request(const char *reqbuf, size_t reqlen,
     return n;
 }
 
-// 隧道内转发重建请求并泵响应
+// 单向泵（up → client）：HTTP 响应流式转发。上游在返回响应头后可能长期静默
+// （App 挂起后的半开连接、死亡节点），裸 recv 会无限阻塞转发线程，进而把
+// kp_forwarder_stop 卡死。这里清掉 kp_connect_host 设置的收发超时，改用
+// poll + 120s 空闲上限，保证转发线程总能退出。
+static void kp_relay_upstream_to_client(int up, int client, uint64_t *up_recv) {
+    char buf[16384];
+    struct timeval zero = {0, 0};
+    setsockopt(up, SOL_SOCKET, SO_RCVTIMEO, &zero, sizeof(zero));
+    setsockopt(up, SOL_SOCKET, SO_SNDTIMEO, &zero, sizeof(zero));
+    struct pollfd pfd;
+    const int poll_timeout_ms = 15 * 1000;
+    const time_t max_idle_sec = 120;
+    time_t last_activity = time(NULL);
+
+    for (;;) {
+        pfd.fd = up;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        int n = poll(&pfd, 1, poll_timeout_ms);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (n == 0) {
+            if (time(NULL) - last_activity >= max_idle_sec) break;
+            continue;
+        }
+        if (!(pfd.revents & (POLLIN | POLLHUP | POLLERR))) break;
+        ssize_t r = recv(up, buf, sizeof(buf), 0);
+        if (r <= 0) break;
+        last_activity = time(NULL);
+        if (kp_send_all(client, buf, (size_t)r) != 0) break;
+        if (up_recv) *up_recv += (uint64_t)r;
+    }
+}
+
+// 隧道内转发重建请求并泵响应（单向、带空闲上限）
 static void kp_http_forward(int up, int client, const char *req, size_t reqlen) {
     if (kp_send_all(up, req, reqlen) != 0) return;
-    char buf[16384];
-    ssize_t r;
-    while ((r = recv(up, buf, sizeof(buf), 0)) > 0) {
-        if (kp_send_all(client, buf, (size_t)r) != 0) break;
-    }
+    kp_relay_upstream_to_client(up, client, NULL);
 }
 
 // 单线程双向泵：用 poll 同时监听两个方向，避免每条 CONNECT 隧道创建 2 个线程。
@@ -1639,10 +1724,10 @@ static void kp_handle_client(kp_forwarder *fw, int client) {
             int rn = kp_rebuild_proxy_request(reqbuf, off, method, host, port, path,
                                               rebuilt, sizeof(rebuilt));
             if (rn <= 0) { kp_send_simple_response(client, 400, "Bad Request"); KP_CLOSESOCK(client); return; }
-            int up = kp_connect_host(host, port, 8000);
+            int up = kp_up_open(fw, host, port, 8000);
             if (up < 0) { kp_send_simple_response(client, 502, "Bad Gateway"); KP_CLOSESOCK(client); return; }
             kp_http_forward(up, client, rebuilt, (size_t)rn);
-            KP_CLOSESOCK(up);
+            kp_upstream_close(fw, &up);
             KP_CLOSESOCK(client);
             return;
         }
@@ -1665,7 +1750,7 @@ static void kp_handle_client(kp_forwarder *fw, int client) {
                 continue;
             }
 
-            int up = kp_connect_host(proxy_host, proxy_port, 10000);
+            int up = kp_up_open(fw, proxy_host, proxy_port, 10000);
             if (up < 0) {
                 continue;
             }
@@ -1676,62 +1761,55 @@ static void kp_handle_client(kp_forwarder *fw, int client) {
                                                  reqbuf, off, qreq, sizeof(qreq),
                                                  qkey_val, sizeof(qkey_val));
             if (qn <= 0 || kp_send_all(up, qreq, (size_t)qn) != 0) {
-                KP_CLOSESOCK(up);
+                kp_upstream_close(fw, &up);
                 continue;
             }
 
             char resp[4096];
             size_t rgot = 0;
             if (kp_recv_until(up, resp, sizeof(resp), &rgot, 10000) != 0) {
-                KP_CLOSESOCK(up);
+                kp_upstream_close(fw, &up);
                 continue;
             }
             int code = kp_parse_status_code(resp, rgot);
             kp_dbg("[fw] queen_http %s:%d -> code=%d", proxy_host, proxy_port, code);
 
             if (kp_code_needs_credential_refresh(code)) {
-                KP_CLOSESOCK(up);
+                kp_upstream_close(fw, &up);
                 continue;
             }
             if (code == 822 || code == 824) {
-                KP_CLOSESOCK(up);
+                kp_upstream_close(fw, &up);
                 fw->stat_direct_fallbacks++;
                 kp_forwarder_record_direct_host(fw, host);
                 char rebuilt[4096];
                 int rn = kp_rebuild_proxy_request(reqbuf, off, method, host, port, path,
                                                   rebuilt, sizeof(rebuilt));
-                int dup = kp_connect_host(host, port, 8000);
+                int dup = kp_up_open(fw, host, port, 8000);
                 if (rn <= 0 || dup < 0) {
-                    if (dup >= 0) KP_CLOSESOCK(dup);
+                    if (dup >= 0) kp_upstream_close(fw, &dup);
                     kp_send_simple_response(client, 502, "Bad Gateway");
                     KP_CLOSESOCK(client);
                     return;
                 }
                 kp_http_forward(dup, client, rebuilt, (size_t)rn);
-                KP_CLOSESOCK(dup);
+                kp_upstream_close(fw, &dup);
                 KP_CLOSESOCK(client);
                 return;
             }
             if (code >= 200 && code < 600) {
-                struct timeval zero = {0, 0};
-                setsockopt(up, SOL_SOCKET, SO_RCVTIMEO, &zero, sizeof(zero));
-                setsockopt(up, SOL_SOCKET, SO_SNDTIMEO, &zero, sizeof(zero));
+                // 响应头之后的 body 流式转发必须带空闲上限（半开上游会永久静默）。
                 uint64_t up_recv = (uint64_t)rgot;
                 if (kp_send_all(client, resp, rgot) == 0) {
-                    char buf[16384];
-                    ssize_t r;
-                    while ((r = recv(up, buf, sizeof(buf), 0)) > 0) {
-                        if (kp_send_all(client, buf, (size_t)r) != 0) break;
-                        up_recv += (uint64_t)r;
-                    }
+                    kp_relay_upstream_to_client(up, client, &up_recv);
                 }
                 kp_dbg("[fw] HTTP conn done host=%s:%d client_bytes=%zu up_sent=%zu up_recv=%llu",
                        host, port, off, (size_t)qn, (unsigned long long)up_recv);
-                KP_CLOSESOCK(up);
+                kp_upstream_close(fw, &up);
                 KP_CLOSESOCK(client);
                 return;
             }
-            KP_CLOSESOCK(up);
+            kp_upstream_close(fw, &up);
             continue;
         }
         if (!http_refreshed && kp_forwarder_refresh_retry(fw, 3, 500) == 0) {
@@ -1758,7 +1836,7 @@ static void kp_handle_client(kp_forwarder *fw, int client) {
 
     if (strncmp(host, "127.", 4) == 0 || strcmp(host, "localhost") == 0 ||
         strcmp(host, "::1") == 0 || strcmp(host, "[::1]") == 0) {
-        int up = kp_connect_host(host, port, 8000);
+        int up = kp_up_open(fw, host, port, 8000);
         if (up < 0) { kp_send_simple_response(client, 502, "Bad Gateway"); KP_CLOSESOCK(client); return; }
         const char *ok = "HTTP/1.1 200 Connection Established\r\n\r\n";
         if (kp_send_all(client, ok, strlen(ok)) == 0) {
@@ -1766,7 +1844,7 @@ static void kp_handle_client(kp_forwarder *fw, int client) {
                 kp_pipe_bidirectional_counted(up, client, NULL, NULL);
             }
         }
-        KP_CLOSESOCK(up);
+        kp_upstream_close(fw, &up);
         KP_CLOSESOCK(client);
         return;
     }
@@ -1789,7 +1867,7 @@ https_retry:
             continue;
         }
 
-        int up = kp_connect_host(proxy_host, proxy_port, 10000);
+        int up = kp_up_open(fw, proxy_host, proxy_port, 10000);
         if (up < 0) {
             continue;
         }
@@ -1799,42 +1877,42 @@ https_retry:
         int cn = kp_build_queen_connect_request(fw, host, port, creq, sizeof(creq),
                                                 qkey_val, sizeof(qkey_val));
         if (cn <= 0 || kp_send_all(up, creq, (size_t)cn) != 0) {
-            KP_CLOSESOCK(up);
+            kp_upstream_close(fw, &up);
             continue;
         }
 
         char resp[2048];
         size_t rgot = 0;
         if (kp_recv_until(up, resp, sizeof(resp), &rgot, 10000) != 0) {
-            KP_CLOSESOCK(up);
+            kp_upstream_close(fw, &up);
             continue;
         }
         int code = kp_parse_status_code(resp, rgot);
         kp_dbg("[fw] queen_https %s:%d CONNECT -> code=%d", proxy_host, proxy_port, code);
 
         if (kp_code_needs_credential_refresh(code)) {
-            KP_CLOSESOCK(up);
+            kp_upstream_close(fw, &up);
             continue;
         }
         if (code == 822 || code == 824) {
-            KP_CLOSESOCK(up);
+            kp_upstream_close(fw, &up);
             fw->stat_direct_fallbacks++;
             kp_forwarder_record_direct_host(fw, host);
-            int dup = kp_connect_host(host, port, 10000);
+            int dup = kp_up_open(fw, host, port, 10000);
             if (dup < 0) { kp_send_simple_response(client, 502, "Bad Gateway"); KP_CLOSESOCK(client); return; }
             const char *ok = "HTTP/1.1 200 Connection Established\r\n\r\n";
             if (kp_send_all(client, ok, strlen(ok)) != 0) {
-                KP_CLOSESOCK(dup);
+                kp_upstream_close(fw, &dup);
                 KP_CLOSESOCK(client);
                 return;
             }
             if (kp_reader_send_available(&reader, dup, NULL) != 0) {
-                KP_CLOSESOCK(dup);
+                kp_upstream_close(fw, &dup);
                 KP_CLOSESOCK(client);
                 return;
             }
             kp_pipe_bidirectional_counted(dup, client, NULL, NULL);
-            KP_CLOSESOCK(dup);
+            kp_upstream_close(fw, &dup);
             KP_CLOSESOCK(client);
             return;
         }
@@ -1846,7 +1924,7 @@ https_retry:
             // 而不是 TLS 数据。这里在把 200 转发给客户端之前先识别这种伪成功。
             if (extra_len > 0 && kp_extra_is_http_error(resp + consumed, extra_len)) {
                 kp_dbg("[fw] queen_https CONNECT 200 but extra data is HTTP error (likely token invalid)");
-                KP_CLOSESOCK(up);
+                kp_upstream_close(fw, &up);
                 continue;
             }
             struct timeval zero = {0, 0};
@@ -1854,7 +1932,7 @@ https_retry:
             setsockopt(up, SOL_SOCKET, SO_SNDTIMEO, &zero, sizeof(zero));
             const char *ok = "HTTP/1.1 200 Connection Established\r\n\r\n";
             if (kp_send_all(client, ok, strlen(ok)) != 0) {
-                KP_CLOSESOCK(up);
+                kp_upstream_close(fw, &up);
                 KP_CLOSESOCK(client);
                 return;
             }
@@ -1866,7 +1944,7 @@ https_retry:
             uint64_t client_to_up = 0;
             uint64_t up_to_client = up_recv_extra;
             if (kp_reader_send_available(&reader, up, &client_to_up) != 0) {
-                KP_CLOSESOCK(up);
+                kp_upstream_close(fw, &up);
                 KP_CLOSESOCK(client);
                 return;
             }
@@ -1880,11 +1958,11 @@ https_retry:
                 kp_dbg("[fw] CONNECT closed before upstream data (likely handshake failure), refreshing credentials");
                 kp_forwarder_refresh_retry(fw, 2, 300);
             }
-            KP_CLOSESOCK(up);
+            kp_upstream_close(fw, &up);
             KP_CLOSESOCK(client);
             return;
         }
-        KP_CLOSESOCK(up);
+        kp_upstream_close(fw, &up);
         continue;
     }
     if (!https_refreshed && kp_forwarder_refresh_retry(fw, 3, 500) == 0) {
@@ -2111,6 +2189,11 @@ void kp_forwarder_shutdown_clients(kp_forwarder *fw) {
         int fd = fw->client_fds[i];
         if (fd >= 0) shutdown(fd, SHUT_RDWR);
     }
+    // 同时唤醒阻塞在上游 recv/send 的转发线程（挂起后的半开上游连接不会自己回包）。
+    for (int i = 0; i < fw->upstream_fd_count; i++) {
+        int fd = fw->upstream_fds[i];
+        if (fd >= 0) shutdown(fd, SHUT_RDWR);
+    }
     pthread_mutex_unlock(&fw->client_lock);
 }
 
@@ -2134,8 +2217,11 @@ int kp_forwarder_probe_local(kp_forwarder *fw, int timeout_ms) {
     return 1;
 }
 
-void kp_forwarder_stop(kp_forwarder *fw) {
-    if (!fw) return;
+// 返回 0 = 所有转发线程已退出，可安全 free；
+// 返回 -1 = 超过 KP_FORWARDER_STOP_GRACE_MS 仍有线程存活（典型：卡在取号 hook
+// 的网络等待）。此时调用方绝不能 free（use-after-free），应把 fw 当僵尸泄漏。
+int kp_forwarder_stop(kp_forwarder *fw) {
+    if (!fw) return 0;
     if (fw->running) {
         fw->running = 0;
         if (fw->listen_fd >= 0) {
@@ -2153,23 +2239,55 @@ void kp_forwarder_stop(kp_forwarder *fw) {
         fw->thread = 0;
     }
 
-    // shutdown 所有活跃 client fd，让阻塞在 recv/poll 的转发线程返回。
     pthread_mutex_lock(&fw->client_lock);
+    // shutdown 所有活跃 client fd，让阻塞在 recv/poll 的转发线程返回。
     for (int i = 0; i < fw->client_fd_count; i++) {
         int fd = fw->client_fds[i];
         if (fd >= 0) shutdown(fd, SHUT_RDWR);
     }
-    // 等待所有 client 线程结束，避免 kp_forwarder_free 后线程仍访问 fw（UAF）。
-    while (fw->active_clients > 0) {
-        pthread_cond_wait(&fw->client_cond, &fw->client_lock);
+    // 同时 shutdown 所有登记的上游 fd：转发线程可能阻塞在上游 recv（HTTP body
+    // 流式转发）而不是 client fd，只关 client 侧无法唤醒它们——这正是
+    // “回前台后整个 App 无网、只能划掉重进”的根源。
+    for (int i = 0; i < fw->upstream_fd_count; i++) {
+        int fd = fw->upstream_fds[i];
+        if (fd >= 0) shutdown(fd, SHUT_RDWR);
     }
+    // 有限等待替代无限 cond_wait：socket 已被 shutdown 的线程毫秒级退出，
+    // 但取号 hook 内的网络等待可达数十秒。无限等会把生命周期锁永久占住，
+    // 之后所有前台恢复/网络恢复全部卡死。
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += KP_FORWARDER_STOP_GRACE_MS / 1000;
+    deadline.tv_nsec += (KP_FORWARDER_STOP_GRACE_MS % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec += 1;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    while (fw->active_clients > 0) {
+        int rc = pthread_cond_timedwait(&fw->client_cond, &fw->client_lock, &deadline);
+        if (rc == ETIMEDOUT) break;
+    }
+    int remaining = fw->active_clients;
     fw->client_fd_count = 0;
+    fw->upstream_fd_count = 0;
     pthread_mutex_unlock(&fw->client_lock);
+    if (remaining > 0) {
+        kp_dbg("[fw] stop grace expired, %d client thread(s) still alive", remaining);
+        return -1;
+    }
+    return 0;
 }
 
 void kp_forwarder_free(kp_forwarder *fw) {
     if (!fw) return;
-    kp_forwarder_stop(fw);
+    if (kp_forwarder_stop(fw) != 0) {
+        // 仍有转发线程在使用 fw（最典型：卡在取号 hook 的网络等待）。
+        // 释放会造成 use-after-free 闪退；宁可泄漏这个 forwarder，
+        // 线程结束后它只是一块几 KB 的僵尸内存。监听 fd 已关闭，
+        // 新转发器可立即重建，App 网络不受影响。
+        kp_dbg("[fw] forwarder leaked intentionally: client threads still active");
+        return;
+    }
     pthread_mutex_destroy(&fw->cred_mutex);
     pthread_mutex_destroy(&fw->client_lock);
     pthread_cond_destroy(&fw->client_cond);

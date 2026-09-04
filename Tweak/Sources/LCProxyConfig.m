@@ -12,6 +12,7 @@ static NSString *const LCProxyConfFile = @"proxychains.conf";
 static const NSTimeInterval LCProxyNetworkMonitorInterval = 2.0;
 static const NSTimeInterval LCProxyNetworkMonitorMaxAge = 10.0;
 static const NSTimeInterval LCProxyPostRecoveryHealthDelay = 1.0;
+static const NSUInteger LCProxyMaxRecoveryRetries = 3;
 
 static nw_path_monitor_t g_networkMonitor;
 
@@ -28,6 +29,10 @@ static nw_path_monitor_t g_networkMonitor;
 @property (nonatomic, assign) int lastPathState;
 @property (nonatomic, assign) int lastPathEffectiveDirect;
 @property (nonatomic, assign) NSTimeInterval lastPathUpdateAt;
+// 前台恢复自愈：恢复后的健康检查失败时再补一轮强制恢复（有上限，
+// 防止上游真不可用时无限重启转发器）。
+@property (nonatomic, assign) NSUInteger recoveryRetryCount;
+@property (nonatomic, assign) NSTimeInterval lastForegroundingAt;
 - (void)checkNetworkAndApplyIfNeeded;
 - (void)handleNetworkPath:(nw_path_t)path;
 - (NSString *)runtimeSignatureForSettings:(NSDictionary *)settings effectiveMode:(NSString *)effectiveMode;
@@ -246,8 +251,15 @@ static nw_path_monitor_t g_networkMonitor;
 
 - (void)requestForegroundRecoveryAsync {
     dispatch_async(self.runtimeQueue, ^{
-        if ([self.lifecycleState isEqualToString:@"foregrounding"]) return;
+        // “foregrounding” 只用于去重 willEnterForeground+didBecomeActive 这对通知。
+        // 若上一轮恢复卡住（老版本 stop 死锁时该状态会永远停在这里），
+        // 15 秒后必须视为陈旧并允许新一轮恢复，否则状态机永久闭锁。
+        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+        if ([self.lifecycleState isEqualToString:@"foregrounding"] &&
+            now - self.lastForegroundingAt < 15.0) return;
         self.lifecycleState = @"foregrounding";
+        self.lastForegroundingAt = now;
+        self.recoveryRetryCount = 0;
         [self enqueueRuntimeApplyForceRecovery:YES reason:@"foreground"];
     });
 }
@@ -264,12 +276,18 @@ static nw_path_monitor_t g_networkMonitor;
 
 - (void)notifyDidBecomeActive {
     dispatch_async(self.runtimeQueue, ^{
-        BOOL wasForegrounding = [self.lifecycleState isEqualToString:@"foregrounding"];
-        BOOL wasBackground = [self.lifecycleState isEqualToString:@"background"];
+        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+        // 陈旧的 foregrounding（上一轮恢复卡死）必须按 background 处理，
+        // 否则 didBecomeActive 永远不会再触发恢复。
+        BOOL wasForegrounding = [self.lifecycleState isEqualToString:@"foregrounding"] &&
+                                (now - self.lastForegroundingAt < 15.0);
+        BOOL wasBackground = [self.lifecycleState isEqualToString:@"background"] ||
+                             ([self.lifecycleState isEqualToString:@"foregrounding"] && !wasForegrounding);
         self.lifecycleState = @"active";
         if (wasBackground) {
-            // WillEnterForeground may have been missed during a fast resume.
-            // Rebuild the network resources instead of reusing stale ones.
+            // WillEnterForeground 可能被错过（快速恢复）；也可能是上一轮恢复
+            // 卡死后的自愈入口。重建网络资源而不是复用陈旧资源。
+            self.recoveryRetryCount = 0;
             [self enqueueRuntimeApplyForceRecovery:YES reason:@"active recovery"];
         } else if (!wasForegrounding) {
             // Cold start.
@@ -346,6 +364,12 @@ static nw_path_monitor_t g_networkMonitor;
 
     BOOL enabled = [s[@"proxyEnabled"] boolValue];
     BOOL proxyActive = enabled && ![effectiveMode isEqualToString:@"direct"];
+    // 王卡模式下转发器没能起来（端口为 0）时，绝不能让进程继续用 conf 里的
+    // 18080 占位端口 —— 那会让所有连接立刻 ECONNREFUSED（“整个 App 无网”）。
+    // 先临时直连保住可用性，健康检查自愈重试会把代理拉回来。
+    if (proxyActive && [effectiveMode isEqualToString:@"kingcard"] && desiredForwarderPort <= 0) {
+        proxyActive = NO;
+    }
     BOOL block = [s[@"blockNonTcp"] boolValue] && proxyActive;
     kp_set_debug_enabled([s[@"debugLogging"] boolValue] ? 1 : 0);
 
@@ -384,11 +408,29 @@ static nw_path_monitor_t g_networkMonitor;
 
 - (void)schedulePostRecoveryHealthCheck {
     NSString *mode = self.lastAppliedEffectiveMode ?: @"";
-    int port = self.lastAppliedForwarderPort;
-    if (![mode isEqualToString:@"kingcard"] || port <= 0) return;
+    if (![mode isEqualToString:@"kingcard"]) return;
+    // 端口为 0（转发器没起来）也要做检查：那本身就是故障，需要触发自愈重试。
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(LCProxyPostRecoveryHealthDelay * NSEC_PER_SEC)),
                    dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        [[LCProxyKing shared] performHealthCheck];
+        BOOL ok = [[LCProxyKing shared] performHealthCheck];
+        if (ok) {
+            dispatch_async(self.runtimeQueue, ^{
+                self.recoveryRetryCount = 0;
+            });
+            return;
+        }
+        // 恢复后健康检查失败（转发器没起来/凭证不可用）：自动再补一轮强制恢复，
+        // 有上限——上游真不可用时不无限重启，等下一个前台/网络事件重新计数。
+        __block BOOL shouldRetry = NO;
+        dispatch_sync(self.runtimeQueue, ^{
+            if (self.recoveryRetryCount < LCProxyMaxRecoveryRetries) {
+                self.recoveryRetryCount++;
+                shouldRetry = YES;
+            }
+        });
+        if (shouldRetry) {
+            [self enqueueRuntimeApplyForceRecovery:YES reason:@"health check failed"];
+        }
     });
 }
 
@@ -464,6 +506,7 @@ static nw_path_monitor_t g_networkMonitor;
         lcproxy_network_monitor_update(satisfied ? 1 : 0, direct ? 1 : 0);
 
         if (changed) {
+            self.recoveryRetryCount = 0;
             [self enqueueRuntimeApplyForceRecovery:YES reason:@"NWPath changed"];
         }
     });
