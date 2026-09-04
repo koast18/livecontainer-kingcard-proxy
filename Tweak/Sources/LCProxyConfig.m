@@ -14,6 +14,8 @@ static const NSTimeInterval LCProxyNetworkMonitorMaxAge = 10.0;
 static const NSTimeInterval LCProxyPostRecoveryHealthDelay = 1.0;
 static const NSUInteger LCProxyMaxRecoveryRetries = 3;
 
+NSString *const LCProxyForwarderUnavailableNotification = @"LCProxyForwarderUnavailableNotification";
+
 static nw_path_monitor_t g_networkMonitor;
 
 @interface LCProxyConfig ()
@@ -33,6 +35,11 @@ static nw_path_monitor_t g_networkMonitor;
 // 防止上游真不可用时无限重启转发器）。
 @property (nonatomic, assign) NSUInteger recoveryRetryCount;
 @property (nonatomic, assign) NSTimeInterval lastForegroundingAt;
+// 王卡转发器缺失时的持续重启状态：fail-closed 丢包期间按退避不断尝试重建，
+// 并在进入该状态时通知用户（绝不直连——直连会消耗通用流量）。
+@property (nonatomic, assign) BOOL forwarderUnavailable;
+@property (nonatomic, assign) NSUInteger forwarderRetryCount;
+@property (nonatomic, assign) BOOL forwarderRetryScheduled;
 - (void)checkNetworkAndApplyIfNeeded;
 - (void)handleNetworkPath:(nw_path_t)path;
 - (NSString *)runtimeSignatureForSettings:(NSDictionary *)settings effectiveMode:(NSString *)effectiveMode;
@@ -41,6 +48,9 @@ static nw_path_monitor_t g_networkMonitor;
 - (void)createPathMonitorOnQueue:(dispatch_queue_t)queue;
 - (void)restartNetworkMonitorOnRuntimeQueue;
 - (void)schedulePostRecoveryHealthCheck;
+- (void)noteForwarderAvailability:(BOOL)available;
+- (void)scheduleForwarderRecoveryRetry;
+- (void)resetRecoveryBudgets;
 @end
 
 @implementation LCProxyConfig
@@ -259,7 +269,7 @@ static nw_path_monitor_t g_networkMonitor;
             now - self.lastForegroundingAt < 15.0) return;
         self.lifecycleState = @"foregrounding";
         self.lastForegroundingAt = now;
-        self.recoveryRetryCount = 0;
+        [self resetRecoveryBudgets];
         [self enqueueRuntimeApplyForceRecovery:YES reason:@"foreground"];
     });
 }
@@ -287,7 +297,7 @@ static nw_path_monitor_t g_networkMonitor;
         if (wasBackground) {
             // WillEnterForeground 可能被错过（快速恢复）；也可能是上一轮恢复
             // 卡死后的自愈入口。重建网络资源而不是复用陈旧资源。
-            self.recoveryRetryCount = 0;
+            [self resetRecoveryBudgets];
             [self enqueueRuntimeApplyForceRecovery:YES reason:@"active recovery"];
         } else if (!wasForegrounding) {
             // Cold start.
@@ -320,6 +330,8 @@ static nw_path_monitor_t g_networkMonitor;
             @"lastPathState": @(_lastPathState),
             @"lastPathEffectiveDirect": @(_lastPathEffectiveDirect),
             @"lastPathUpdateAt": @(_lastPathUpdateAt),
+            @"forwarderUnavailable": @(_forwarderUnavailable),
+            @"forwarderRetryCount": @(_forwarderRetryCount),
         };
     }
 }
@@ -364,12 +376,11 @@ static nw_path_monitor_t g_networkMonitor;
 
     BOOL enabled = [s[@"proxyEnabled"] boolValue];
     BOOL proxyActive = enabled && ![effectiveMode isEqualToString:@"direct"];
-    // 王卡模式下转发器没能起来（端口为 0）时，绝不能让进程继续用 conf 里的
-    // 18080 占位端口 —— 那会让所有连接立刻 ECONNREFUSED（“整个 App 无网”）。
-    // 先临时直连保住可用性，健康检查自愈重试会把代理拉回来。
-    if (proxyActive && [effectiveMode isEqualToString:@"kingcard"] && desiredForwarderPort <= 0) {
-        proxyActive = NO;
-    }
+    // 王卡模式下转发器没起来（端口为 0）时必须 fail-closed：保持代理启用并清空
+    // override，让链路指向 conf 的 18080 占位端口 —— 所有连接被立刻拒绝丢弃。
+    // 绝不允许退化为直连：直连会绕过王卡通道、消耗通用流量。
+    BOOL forwarderUnavailable = [effectiveMode isEqualToString:@"kingcard"] &&
+                                enabled && desiredForwarderPort <= 0;
     BOOL block = [s[@"blockNonTcp"] boolValue] && proxyActive;
     kp_set_debug_enabled([s[@"debugLogging"] boolValue] ? 1 : 0);
 
@@ -401,6 +412,12 @@ static nw_path_monitor_t g_networkMonitor;
 
     self.lastAppliedShouldDirect = lcproxy_network_should_direct() ? 1 : 0;
 
+    [self noteForwarderAvailability:!forwarderUnavailable];
+    if (forwarderUnavailable) {
+        // 持续尽力重建转发器（纯本地 bind，不碰上游），期间保持丢包。
+        [self scheduleForwarderRecoveryRetry];
+    }
+
     if (forceRecovery) {
         [self schedulePostRecoveryHealthCheck];
     }
@@ -408,8 +425,10 @@ static nw_path_monitor_t g_networkMonitor;
 
 - (void)schedulePostRecoveryHealthCheck {
     NSString *mode = self.lastAppliedEffectiveMode ?: @"";
-    if (![mode isEqualToString:@"kingcard"]) return;
-    // 端口为 0（转发器没起来）也要做检查：那本身就是故障，需要触发自愈重试。
+    int port = self.lastAppliedForwarderPort;
+    if (![mode isEqualToString:@"kingcard"] || port <= 0) return;
+    // 转发器缺失（端口 0）由 scheduleForwarderRecoveryRetry 的持续重建负责，
+    // 这里只处理“转发器在跑但不健康（凭证/上游）”的情况。
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(LCProxyPostRecoveryHealthDelay * NSEC_PER_SEC)),
                    dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         BOOL ok = [[LCProxyKing shared] performHealthCheck];
@@ -419,7 +438,7 @@ static nw_path_monitor_t g_networkMonitor;
             });
             return;
         }
-        // 恢复后健康检查失败（转发器没起来/凭证不可用）：自动再补一轮强制恢复，
+        // 恢复后健康检查失败（凭证不可用/上游异常）：自动再补一轮强制恢复，
         // 有上限——上游真不可用时不无限重启，等下一个前台/网络事件重新计数。
         __block BOOL shouldRetry = NO;
         dispatch_sync(self.runtimeQueue, ^{
@@ -432,6 +451,56 @@ static nw_path_monitor_t g_networkMonitor;
             [self enqueueRuntimeApplyForceRecovery:YES reason:@"health check failed"];
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// 转发器缺失：fail-closed + 用户提示 + 持续重建
+// ---------------------------------------------------------------------------
+
+// 仅在“可用 → 不可用”的跳变上提示一次；恢复后复位，再次故障会重新提示。
+// 外部恢复事件（回前台/网络变化）会重置该状态，故障仍在时用户会再次看到提示。
+- (void)noteForwarderAvailability:(BOOL)available {
+    if (available) {
+        if (self.forwarderUnavailable) {
+            self.forwarderUnavailable = NO;
+            self.forwarderRetryCount = 0;
+        }
+        return;
+    }
+    if (self.forwarderUnavailable) return;
+    self.forwarderUnavailable = YES;
+    [[NSNotificationCenter defaultCenter]
+        postNotificationName:LCProxyForwarderUnavailableNotification
+                      object:nil
+                    userInfo:@{
+        @"message": @"王卡转发器不可用：已阻断联网以防直连消耗通用流量，正在自动恢复…",
+    }];
+}
+
+// 转发器重启是纯本地操作（bind 127.0.0.1 临时端口，不请求上游），可以也应该
+// 持续重试：1s 起按退避加大间隔，30s 后保持 60s 一杆，直到重建成功或用户/
+// 系统事件再次触发恢复。期间连接全部被丢弃，绝不直连。
+- (void)scheduleForwarderRecoveryRetry {
+    if (self.forwarderRetryScheduled) return;
+    self.forwarderRetryScheduled = YES;
+    static const NSTimeInterval steps[] = {1.0, 2.0, 2.0, 4.0, 8.0, 15.0, 30.0};
+    static const NSUInteger stepCount = sizeof(steps) / sizeof(steps[0]);
+    NSTimeInterval delay = (self.forwarderRetryCount < stepCount)
+                               ? steps[self.forwarderRetryCount]
+                               : 60.0;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
+                   self.runtimeQueue, ^{
+        self.forwarderRetryScheduled = NO;
+        self.forwarderRetryCount++;
+        [self enqueueRuntimeApplyForceRecovery:YES reason:@"forwarder restart retry"];
+    });
+}
+
+- (void)resetRecoveryBudgets {
+    self.recoveryRetryCount = 0;
+    self.forwarderRetryCount = 0;
+    // 重置跳变标记：故障仍在时，本轮事件会再次向用户提示。
+    self.forwarderUnavailable = NO;
 }
 
 // ---------------------------------------------------------------------------
@@ -506,7 +575,7 @@ static nw_path_monitor_t g_networkMonitor;
         lcproxy_network_monitor_update(satisfied ? 1 : 0, direct ? 1 : 0);
 
         if (changed) {
-            self.recoveryRetryCount = 0;
+            [self resetRecoveryBudgets];
             [self enqueueRuntimeApplyForceRecovery:YES reason:@"NWPath changed"];
         }
     });

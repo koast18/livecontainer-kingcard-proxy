@@ -78,7 +78,14 @@ assert 'lc_direct_track_remove_range' in lib, 'missing direct socket untrack on 
 assert 'lastForegroundingAt' in config, 'foregrounding dedup has no staleness escape'
 assert 'recoveryRetryCount' in config, 'post-recovery health check does not retry failed recoveries'
 assert 'LCProxyMaxRecoveryRetries' in config, 'health check retry is unbounded or missing'
-assert 'desiredForwarderPort <= 0' in config, 'kingcard mode without forwarder still points at the dead placeholder port'
+# Forwarder-down must fail CLOSED: drop traffic, notify the user, keep restarting.
+# Never fail open to direct — direct bypasses the kingcard tunnel and burns
+# metered (通用) data.
+assert 'forwarderUnavailable' in config, 'missing forwarder-down detection'
+assert 'scheduleForwarderRecoveryRetry' in config, 'no persistent forwarder restart retry'
+assert 'LCProxyForwarderUnavailableNotification' in config, 'forwarder-down does not notify the user'
+assert 'LCProxyForwarderUnavailableNotification' in control, 'no user-visible banner for forwarder-down'
+assert 'proxyActive = NO' not in config, 'kingcard mode must never fail open to direct when the forwarder is down'
 # Forwarder stop must not wedge on relays blocked on half-open upstream sockets.
 assert 'kp_forwarder_shutdown_upstreams' in core, 'stop does not wake relays blocked on upstream sockets'
 assert 'KP_FORWARDER_STOP_GRACE_MS' in core, 'kp_forwarder_stop wait is unbounded'

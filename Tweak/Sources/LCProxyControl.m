@@ -9,6 +9,37 @@
 static id<NSObject> g_lcDidBecomeActiveObserver;
 static id<NSObject> g_lcDidEnterBackgroundObserver;
 static id<NSObject> g_lcWillEnterForegroundObserver;
+static id<NSObject> g_lcForwarderUnavailableObserver;
+
+// 王卡转发器不可用时的强提示（不受 showProxyBanner 开关约束）：
+// 此刻进程保持 fail-closed 断网，必须让用户知道为什么没网、且不会偷跑直连流量。
+static void LCProxyShowUnavailableBanner(NSString *text) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIWindow *hud = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+        hud.windowLevel = UIWindowLevelStatusBar + 2;
+        hud.userInteractionEnabled = NO;
+        hud.backgroundColor = [UIColor clearColor];
+        UILabel *label = [[UILabel alloc] init];
+        label.text = text;
+        label.font = [UIFont boldSystemFontOfSize:13];
+        label.textColor = [UIColor whiteColor];
+        label.backgroundColor = [[UIColor colorWithRed:0.78 green:0.25 blue:0.07 alpha:1] colorWithAlphaComponent:0.9];
+        label.textAlignment = NSTextAlignmentCenter;
+        label.numberOfLines = 0;
+        CGFloat width = MIN(hud.bounds.size.width - 32, 340);
+        CGSize fit = [label sizeThatFits:CGSizeMake(width - 24, CGFLOAT_MAX)];
+        label.layer.cornerRadius = 8;
+        label.layer.masksToBounds = YES;
+        CGFloat top = hud.bounds.size.height > 0 ? hud.bounds.size.height * 0.12 : 64;
+        label.frame = CGRectMake((hud.bounds.size.width - width) / 2.0, top, width, fit.height + 20);
+        [hud addSubview:label];
+        hud.hidden = NO;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            hud.hidden = YES;
+        });
+    });
+}
 
 static void LCProxyShowBanner(NSDictionary *settings) {
     if (![settings[@"showProxyBanner"] boolValue]) return;
@@ -85,6 +116,15 @@ static void LCProxyControlConstructor(void) {
                                                            queue:[NSOperationQueue mainQueue]
                                                       usingBlock:^(NSNotification * _Nonnull note) {
             [[LCProxyConfig shared] notifyDidEnterBackground];
+        }];
+
+        g_lcForwarderUnavailableObserver =
+        [[NSNotificationCenter defaultCenter] addObserverForName:LCProxyForwarderUnavailableNotification
+                                                          object:nil
+                                                           queue:[NSOperationQueue mainQueue]
+                                                      usingBlock:^(NSNotification * _Nonnull note) {
+            NSString *msg = [note.userInfo[@"message"] isKindOfClass:[NSString class]] ? note.userInfo[@"message"] : nil;
+            LCProxyShowUnavailableBanner(msg ?: @"王卡转发器不可用：已阻断联网，正在自动恢复…");
         }];
 
         // Persist this process's cellular traffic in 10-minute buckets.
