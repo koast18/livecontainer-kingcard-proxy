@@ -88,6 +88,7 @@ assert 'LCProxyForwarderUnavailableNotification' in control, 'no user-visible ba
 assert 'proxyActive = NO' not in config, 'kingcard mode must never fail open to direct when the forwarder is down'
 # Forwarder stop must not wedge on relays blocked on half-open upstream sockets.
 assert 'kp_forwarder_shutdown_upstreams' in core, 'stop does not wake relays blocked on upstream sockets'
+assert 'kp_forwarder_shutdown_upstreams_locked' in core, 'stop no longer shuts down upstreams from the same critical section'
 assert 'KP_FORWARDER_STOP_GRACE_MS' in core, 'kp_forwarder_stop wait is unbounded'
 assert 'pthread_cond_timedwait' in core, 'kp_forwarder_stop still uses an infinite cond wait'
 assert 'kp_up_open' in core, 'forwarder upstream sockets are not registered for shutdown'

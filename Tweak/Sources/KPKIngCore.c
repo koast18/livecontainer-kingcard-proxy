@@ -1158,13 +1158,20 @@ static int kp_up_open(kp_forwarder *fw, const char *host, int port, int timeout_
     return fd;
 }
 
-void kp_forwarder_shutdown_upstreams(kp_forwarder *fw) {
-    if (!fw) return;
-    pthread_mutex_lock(&fw->client_lock);
+// 已持有 client_lock 的调用方使用的内部变体（kp_forwarder_stop 在同一个临界区
+// 内同时 shutdown 客户端与上游两侧）。公开入口负责加锁：这里严格在锁内
+// shutdown，锁内 close 由所属线程完成，避免并发 close/复用 fd 号后误伤无关连接。
+static void kp_forwarder_shutdown_upstreams_locked(kp_forwarder *fw) {
     for (int i = 0; i < fw->upstream_fd_count; i++) {
         int fd = fw->upstream_fds[i];
         if (fd >= 0) shutdown(fd, SHUT_RDWR);
     }
+}
+
+void kp_forwarder_shutdown_upstreams(kp_forwarder *fw) {
+    if (!fw) return;
+    pthread_mutex_lock(&fw->client_lock);
+    kp_forwarder_shutdown_upstreams_locked(fw);
     pthread_mutex_unlock(&fw->client_lock);
 }
 
@@ -2248,10 +2255,7 @@ int kp_forwarder_stop(kp_forwarder *fw) {
     // 同时 shutdown 所有登记的上游 fd：转发线程可能阻塞在上游 recv（HTTP body
     // 流式转发）而不是 client fd，只关 client 侧无法唤醒它们——这正是
     // “回前台后整个 App 无网、只能划掉重进”的根源。
-    for (int i = 0; i < fw->upstream_fd_count; i++) {
-        int fd = fw->upstream_fds[i];
-        if (fd >= 0) shutdown(fd, SHUT_RDWR);
-    }
+    kp_forwarder_shutdown_upstreams_locked(fw);
     // 有限等待替代无限 cond_wait：socket 已被 shutdown 的线程毫秒级退出，
     // 但取号 hook 内的网络等待可达数十秒。无限等会把生命周期锁永久占住，
     // 之后所有前台恢复/网络恢复全部卡死。
