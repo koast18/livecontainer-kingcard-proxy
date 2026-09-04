@@ -29,6 +29,9 @@ jobs:
       - name: Async proxy relay test
         run: bash Scripts/test_async_proxy.sh
 
+      - name: Forwarder stop regression test
+        run: bash Scripts/test_forwarder_stop.sh
+
       - name: Queen crypto self-test
         run: bash Scripts/test_queen_crypto.sh
 

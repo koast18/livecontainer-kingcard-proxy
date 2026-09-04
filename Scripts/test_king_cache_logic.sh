@@ -34,6 +34,20 @@ assert 'earliestExpiry' in king, 'missing preemptive timer scheduling'
 # Cache reads must search both primary and shared LiveContainer data dirs.
 assert 'LCProxyAllDataDirectories' in king, 'loadState does not search shared dirs'
 
+# Multi-LiveContainer state convergence:
+# - the cross-process lock must cover every directory the state file is written to
+assert 'stateLockPaths' in king, 'state lock does not cover all state directories'
+assert 'acquireStateLocks' in king, 'missing multi-directory state lock acquisition'
+assert 'releaseStateLocks' in king, 'missing multi-directory state lock release'
+assert '- (int)acquireStateLock ' not in king, 'old single-directory state lock still present'
+# - loadState must pick the freshest copy, not blindly prefer primary
+assert 'bestUpdatedAt' in king, 'loadState does not converge on the freshest state copy'
+assert 'updatedAt' in king, 'saveState does not stamp updatedAt for freshness comparison'
+# - lock contention must retry quickly instead of waiting for the 2-min timer
+assert 'scheduleRefreshRetryAfterLockContention' in king, 'no fast retry when the state lock is held by another instance'
+# - latency probing must be capped so the state lock is not held for tens of seconds
+assert 'KP_LATENCY_PROBE_MAX' in king, 'sequential latency probing is not capped'
+
 # Foreground activation should not force a synchronous refresh on the main thread.
 assert 'refreshCredentials' not in control, 'foreground notification still forces refresh'
 

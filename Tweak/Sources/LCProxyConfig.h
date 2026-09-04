@@ -2,6 +2,11 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
+/// 王卡模式下转发器未能运行时发出（进入该状态时触发一次；恢复后再次故障会重新触发）。
+/// userInfo: message = 面向用户的提示文案。此时进程保持 fail-closed：连接被丢弃，
+/// 绝不直连（直连会消耗通用流量）。
+extern NSString *const LCProxyForwarderUnavailableNotification;
+
 @interface LCProxyConfig : NSObject
 
 + (instancetype)shared;

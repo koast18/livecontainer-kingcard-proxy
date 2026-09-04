@@ -195,12 +195,20 @@ void kp_forwarder_set_refresh_hook(kp_forwarder *fw, kp_refresh_fn fn, void *ctx
 /// 启动监听线程。返回 0 成功。
 int kp_forwarder_start(kp_forwarder *fw);
 
-/// 停止并关闭。
-void kp_forwarder_stop(kp_forwarder *fw);
+/// 停止并关闭。返回 0 = 所有转发线程已退出，可安全释放；
+/// 返回 -1 = 超过等待时限仍有线程存活（如卡在取号 hook 的网络等待），
+/// 调用方此时不得释放 fw（kp_forwarder_free 会按僵尸泄漏处理）。
+int kp_forwarder_stop(kp_forwarder *fw);
 
 /// Stop and close all active client sockets, but do not close descriptors here;
 /// worker threads remain the sole close owner to avoid fd reuse races.
+/// Registered upstream sockets are shutdown as well so workers blocked on a
+/// half-open upstream (common after app suspend) are woken immediately.
 void kp_forwarder_shutdown_clients(kp_forwarder *fw);
+
+/// Shutdown every registered upstream socket (does not close them; the owning
+/// worker thread closes under the registry lock). Used by stop/recovery paths.
+void kp_forwarder_shutdown_upstreams(kp_forwarder *fw);
 
 /// Number of currently registered client workers.
 int kp_forwarder_active_clients(kp_forwarder *fw);

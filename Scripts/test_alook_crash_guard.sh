@@ -38,12 +38,27 @@ grep -q "fw->active_clients >= KP_FORWARDER_MAX_CLIENTS" "$CORE" \
     || fail "KPKIngCore.c no longer rejects connections above the forwarder cap"
 
 # --- forwarder stop waits for client threads before free guard ---
+# kp_forwarder_stop must wake relay threads blocked on BOTH the client fd and
+# the upstream fd (half-open upstreams after app suspend never deliver data),
+# and it must never free (or block forever) while a client thread is alive:
+# the wait is bounded by KP_FORWARDER_STOP_GRACE_MS and kp_forwarder_free
+# leaks the forwarder as a zombie when threads outlive the grace period.
 grep -q "client_cond" "$CORE" \
     || fail "KPKIngCore.c no longer has a client-exit condition variable"
-grep -q "pthread_cond_wait(&fw->client_cond, &fw->client_lock)" "$CORE" \
-    || fail "KPKIngCore.c no longer waits for active clients in kp_forwarder_stop"
+grep -q "pthread_cond_timedwait(&fw->client_cond, &fw->client_lock" "$CORE" \
+    || fail "KPKIngCore.c no longer bounds the stop wait in kp_forwarder_stop"
 grep -q "while (fw->active_clients > 0)" "$CORE" \
     || fail "KPKIngCore.c no longer waits on active_clients before freeing"
+grep -q "define KP_FORWARDER_STOP_GRACE_MS" "$CORE" \
+    || fail "KPKIngCore.c lost the stop grace deadline"
+grep -q "kp_forwarder_shutdown_upstreams" "$CORE" \
+    || fail "KPKIngCore.c no longer wakes relays blocked on upstream sockets"
+grep -q "kp_upstream_close" "$CORE" \
+    || fail "KPKIngCore.c lost the close-under-registry-lock upstream helper"
+grep -q "forwarder leaked intentionally" "$CORE" \
+    || fail "KPKIngCore.c frees forwarders while client threads may still run"
+grep -q "kp_relay_upstream_to_client" "$CORE" \
+    || fail "KPKIngCore.c HTTP body relay no longer has an idle-timeout pump"
 
 # --- async_proxy relay thread cap guard ---
 grep -q "define LC_ASYNC_MAX_RELAY_THREADS 64" "$ASYNC" \

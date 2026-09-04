@@ -55,6 +55,7 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
 @property (nonatomic, assign) BOOL lastRefreshSuccess;
 @property (nonatomic, strong) dispatch_source_t refreshTimer;
 @property (nonatomic, assign) BOOL refreshing;
+@property (nonatomic, assign) BOOL lockRetryScheduled;
 @property (nonatomic, copy) NSString *lastSettingsSignature;
 @property (nonatomic, strong) NSMutableArray<NSDictionary *> *refreshLog;
 @property (nonatomic, assign) BOOL lastHealthCheckOk;
@@ -232,6 +233,25 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
     });
 }
 
+// 锁竞争快速重试：另一个实例（往往是首次安装后长达几十秒的首次取号）持有
+// 状态锁时，本实例的刷新会失败。若只等 2 分钟周期定时器，期间所有请求都会
+// 拿不到凭证而 502 —— 用户看到“第二个 App 直接网络错误”。5 秒后重试一次，
+// 兜住绝大多数“对方即将释放锁”的场景。
+- (void)scheduleRefreshRetryAfterLockContention {
+    [self.lock lock];
+    BOOL alreadyScheduled = self.lockRetryScheduled;
+    if (!alreadyScheduled) self.lockRetryScheduled = YES;
+    [self.lock unlock];
+    if (alreadyScheduled) return;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
+                   dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        [self.lock lock];
+        self.lockRetryScheduled = NO;
+        [self.lock unlock];
+        [self refreshCredentials];
+    });
+}
+
 - (void)startRefreshTimer {
     [self stopRefreshTimer];
 
@@ -390,60 +410,95 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
 // ---------------------------------------------------------------------------
 // 状态持久化与同步取号辅助
 // ---------------------------------------------------------------------------
-- (NSString *)stateLockPath {
-    return [LCProxyDataDirectory() stringByAppendingPathComponent:@"kingcard-state.lock"];
+// 跨进程状态锁：kingcard-state.json 会写入 primary 与共享 AppGroup 两个目录，
+// 多个 LiveContainer 实例（各自 primary 不同、共享同一 AppGroup）真正争用的是
+// 共享副本。只锁 primary 时各进程各持一把不同的锁同时改写共享文件，
+// “串行化”完全失效，取号/代理池刷新会基于旧副本互相覆盖（多实例只有先开的
+// App 有网的现象之一）。这里按 LCProxyAllDataDirectories 的固定顺序锁全部
+// 目录的 lock 文件：锁序一致且 primary 锁只有本实例进程会竞争，不会成环。
+// fcntl 记录锁 + 有限等待；另一个实例刷新中途被 iOS 挂起时本进程 8 秒后放弃。
+- (NSArray<NSString *> *)stateLockPaths {
+    NSMutableArray<NSString *> *paths = [NSMutableArray array];
+    for (NSString *dir in LCProxyAllDataDirectories()) {
+        NSString *p = [dir stringByAppendingPathComponent:@"kingcard-state.lock"];
+        if (![paths containsObject:p]) [paths addObject:p];
+    }
+    return paths;
 }
 
-// 跨进程状态锁：多个 LiveContainer Guest 共享同一个 kingcard-state.json，
-// 取号/代理池刷新必须是“读-改-写”原子操作，否则两个进程会基于旧副本互相覆盖。
-// 这里用 fcntl 记录锁 + 有限等待；如果另一个实例刷新中途被 iOS 挂起，
-// 本进程不会无限阻塞，8 秒后放弃并使用已有缓存。
-- (int)acquireStateLock {
-    NSString *path = [self stateLockPath];
-    [[NSFileManager defaultManager] createDirectoryAtPath:[path stringByDeletingLastPathComponent]
-                              withIntermediateDirectories:YES attributes:nil error:nil];
-    int fd = open(path.UTF8String, O_CREAT | O_RDWR, 0644);
-    if (fd < 0) return -1;
-    struct flock fl = {0};
-    fl.l_type = F_WRLCK;
-    fl.l_whence = SEEK_SET;
+- (NSArray<NSNumber *> *)acquireStateLocks {
     NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:8.0];
-    while (YES) {
-        if (fcntl(fd, F_SETLK, &fl) == 0) return fd;
-        int err = errno;
-        if (err != EACCES && err != EAGAIN) {
-            close(fd);
-            return -1;
+    NSMutableArray<NSNumber *> *fds = [NSMutableArray array];
+    for (NSString *path in [self stateLockPaths]) {
+        [[NSFileManager defaultManager] createDirectoryAtPath:[path stringByDeletingLastPathComponent]
+                                  withIntermediateDirectories:YES attributes:nil error:nil];
+        int fd = open(path.UTF8String, O_CREAT | O_RDWR, 0644);
+        if (fd < 0) {
+            [self releaseStateLocks:fds];
+            return @[];
         }
-        if ([[NSDate date] timeIntervalSinceDate:deadline] >= 0) {
-            close(fd);
-            return -1;
+        struct flock fl = {0};
+        fl.l_type = F_WRLCK;
+        fl.l_whence = SEEK_SET;
+        BOOL locked = NO;
+        while (YES) {
+            if (fcntl(fd, F_SETLK, &fl) == 0) {
+                locked = YES;
+                break;
+            }
+            int err = errno;
+            if (err != EACCES && err != EAGAIN) break;
+            if ([[NSDate date] timeIntervalSinceDate:deadline] >= 0) break;
+            [NSThread sleepForTimeInterval:0.1];
         }
-        [NSThread sleepForTimeInterval:0.1];
+        if (!locked) {
+            close(fd);
+            [self releaseStateLocks:fds];
+            return @[];
+        }
+        [fds addObject:@(fd)];
+    }
+    return fds;
+}
+
+- (void)releaseStateLocks:(NSArray<NSNumber *> *)fds {
+    for (NSNumber *n in fds) {
+        int fd = n.intValue;
+        if (fd < 0) continue;
+        struct flock fl = {0};
+        fl.l_type = F_UNLCK;
+        fl.l_whence = SEEK_SET;
+        (void)fcntl(fd, F_SETLK, &fl);
+        close(fd);
     }
 }
 
-- (void)releaseStateLock:(int)fd {
-    if (fd < 0) return;
-    struct flock fl = {0};
-    fl.l_type = F_UNLCK;
-    fl.l_whence = SEEK_SET;
-    (void)fcntl(fd, F_SETLK, &fl);
-    close(fd);
-}
-
+// 多实例状态收敛：primary 与共享目录各有一份 kingcard-state.json 时，
+// 不能盲目优先 primary —— 那样第二个 LiveContainer 实例第一次从共享目录
+// 播种后就会永远读自己的旧副本，别的实例刷新出的新 Q-Token/代理池它再也
+// 看不见（多实例只有先开的 App 有网的现象之一）。这里按 updatedAt 选最新。
 - (NSMutableDictionary *)loadState {
+    NSMutableDictionary *best = nil;
+    double bestUpdatedAt = -1.0;
     for (NSString *dir in LCProxyAllDataDirectories()) {
         NSString *path = [dir stringByAppendingPathComponent:@"kingcard-state.json"];
         NSData *data = [NSData dataWithContentsOfFile:path];
         if (!data) continue;
         id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-        if ([obj isKindOfClass:[NSDictionary class]]) return [obj mutableCopy];
+        if (![obj isKindOfClass:[NSDictionary class]]) continue;
+        NSMutableDictionary *d = [obj mutableCopy];
+        NSNumber *updatedAt = [d[@"updatedAt"] isKindOfClass:[NSNumber class]] ? d[@"updatedAt"] : nil;
+        double ts = updatedAt ? updatedAt.doubleValue : 0.0;
+        if (!best || ts > bestUpdatedAt) {
+            best = d;
+            bestUpdatedAt = ts;
+        }
     }
-    return [NSMutableDictionary dictionary];
+    return best ?: [NSMutableDictionary dictionary];
 }
 
-- (void)saveState:(NSDictionary *)state {
+- (void)saveState:(NSMutableDictionary *)state {
+    state[@"updatedAt"] = @([[NSDate date] timeIntervalSince1970]);
     for (NSString *dir in LCProxyAllDataDirectories()) {
         [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
         NSData *data = [NSJSONSerialization dataWithJSONObject:state options:NSJSONWritingPrettyPrinted error:nil];
@@ -505,10 +560,18 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
     return kpq_tcp_connect_ms([parts[0] UTF8String], port, 800);
 }
 
+// 代理池按 TCP 连通延迟排序。逐个 800ms 探测是串行的，而且发生在持有跨进程
+// 状态锁的刷新临界区内：池子大时一次排序能把锁占住几十秒，其他 LiveContainer
+// 实例全部取号失败（表现为“只有最先打开的 App 有网”）。只探测前几个节点，
+// 其余按服务端原顺序排在已探测节点之后（故障转移仍然可用）。
+static const NSUInteger KP_LATENCY_PROBE_MAX = 8;
+
 - (NSArray<NSString *> *)proxiesSortedByLatency:(NSArray<NSString *> *)proxies {
     if (proxies.count <= 1) return proxies;
-    NSMutableArray<NSString *> *items = [proxies mutableCopy];
-    [items sortUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
+    NSUInteger probeCount = MIN(proxies.count, KP_LATENCY_PROBE_MAX);
+    NSArray<NSString *> *head = [proxies subarrayWithRange:NSMakeRange(0, probeCount)];
+    NSMutableArray<NSString *> *sortedHead = [head mutableCopy];
+    [sortedHead sortUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
         int msA = [self tcpConnectMsForProxy:a];
         int msB = [self tcpConnectMsForProxy:b];
         if (msA < 0) msA = INT32_MAX;
@@ -517,7 +580,11 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
         if (msA > msB) return NSOrderedDescending;
         return NSOrderedSame;
     }];
-    return items;
+    if (proxies.count > probeCount) {
+        NSArray<NSString *> *tail = [proxies subarrayWithRange:NSMakeRange(probeCount, proxies.count - probeCount)];
+        return [sortedHead arrayByAddingObjectsFromArray:tail];
+    }
+    return sortedHead;
 }
 
 - (NSString *)localRandomGuid {
@@ -574,8 +641,9 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
     self.refreshing = YES;
     [self.lock unlock];
 
-    int stateLockFd = [self acquireStateLock];
-    if (stateLockFd < 0) {
+    NSArray<NSNumber *> *stateLockFds = [self acquireStateLocks];
+    if (stateLockFds.count == 0) {
+        [self scheduleRefreshRetryAfterLockContention];
         [self.lock lock];
         self.refreshing = NO;
         self.lastRefreshSuccess = NO;
@@ -769,7 +837,7 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
     [self saveState:state];
     return YES;
     } @finally {
-        [self releaseStateLock:stateLockFd];
+        [self releaseStateLocks:stateLockFds];
     }
 }
 
