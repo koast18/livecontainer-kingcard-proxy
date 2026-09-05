@@ -189,8 +189,26 @@ void kp_forwarder_set_king_state(kp_forwarder *fw,
                                  const char *const http_proxies[], size_t http_count,
                                  const char *const https_proxies[], size_t https_count);
 
+/// Atomically removes all KingCard credentials and both Queen proxy pools.
+/// Call this before reporting a refresh or persistent-state failure so stale
+/// credentials cannot carry user traffic after the control plane is invalid.
+void kp_forwarder_clear_king_state(kp_forwarder *fw);
+
 /// 设置事件驱动刷新回调：上游 CONNECT 非 200/连接失败时调用，成功后重试一次。
 void kp_forwarder_set_refresh_hook(kp_forwarder *fw, kp_refresh_fn fn, void *ctx);
+
+/// Pins a running forwarder while work outside its worker threads uses it.
+/// A pinned forwarder is not freed by a concurrent lifecycle restart.
+int kp_forwarder_retain(kp_forwarder *fw);
+void kp_forwarder_release(kp_forwarder *fw);
+
+/// Grants exactly one, short-lived, credential-bound PBProxy TLS CONNECT for
+/// cold-start GUID bootstrap. `proxy_authorization` must match the CONNECT
+/// Proxy-Authorization header before the permit is consumed.
+uint64_t kp_forwarder_grant_pbproxy_bootstrap(kp_forwarder *fw,
+                                              const char *proxy_authorization,
+                                              int ttl_ms);
+void kp_forwarder_revoke_pbproxy_bootstrap(kp_forwarder *fw, uint64_t lease);
 
 /// 启动监听线程。返回 0 成功。
 int kp_forwarder_start(kp_forwarder *fw);

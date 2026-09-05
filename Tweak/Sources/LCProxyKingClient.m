@@ -5,6 +5,7 @@
 //  Queen/King 免流协议客户端（JCE/WUP/PBProxy）。
 //
 #import "LCProxyKingClient.h"
+#import <CFNetwork/CFNetwork.h>
 #import "KPKCrypto.h"
 #import "KPKQueenCore.h"
 #import "KPKIngCore.h"
@@ -27,9 +28,36 @@ static NSString *const kProxyReqType = @"MTT.RouteIPListReq";
 static NSString *const kRspKey = @"rsp";
 static NSString *const kTokenRspType = @"MTT.TokenInfoRsp";
 static NSString *const kProxyRspType = @"MTT.RouteIPListRsp";
+static NSString *const kPBProxyBootstrapUser = @"lcproxy-bootstrap";
 
 static NSString *const kCommKey = @"mvLBiZsiTbGwrfJB";
 static NSString *const kKeyIDHex = @"a690d5f54b43ca535af266c3180769c7";
+
+@interface KPKPBProxyBootstrapAuthDelegate : NSObject <NSURLSessionTaskDelegate>
+@property (nonatomic, copy) NSString *password;
+@end
+
+@implementation KPKPBProxyBootstrapAuthDelegate
+
+- (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task
+didReceiveChallenge:(NSURLAuthenticationChallenge *)challenge
+ completionHandler:(void (^)(NSURLSessionAuthChallengeDisposition disposition, NSURLCredential * _Nullable credential))completionHandler {
+    (void)session;
+    (void)task;
+    NSURLProtectionSpace *protectionSpace = challenge.protectionSpace;
+    if (protectionSpace.isProxy &&
+        [protectionSpace.authenticationMethod isEqualToString:NSURLAuthenticationMethodHTTPBasic] &&
+        challenge.previousFailureCount == 0 && self.password.length) {
+        NSURLCredential *credential = [NSURLCredential credentialWithUser:kPBProxyBootstrapUser
+                                                                  password:self.password
+                                                               persistence:NSURLCredentialPersistenceNone];
+        completionHandler(NSURLSessionAuthChallengeUseCredential, credential);
+        return;
+    }
+    completionHandler(NSURLSessionAuthChallengePerformDefaultHandling, nil);
+}
+
+@end
 
 static NSArray<NSString *> *KPKDefaultWupURLs(void) {
     static NSArray<NSString *> *urls;
@@ -882,9 +910,10 @@ static NSString *KPKParseGetGuidResponse(NSData *raw) {
     return KPKHexUpper(guid);
 }
 
-static NSData *KPKSyncPostNSURLSession(NSString *urlString, NSDictionary *headers, NSData *body, NSTimeInterval timeout) {
+static NSData *KPKSyncPostNSURLSession(NSString *urlString, NSDictionary *headers, NSData *body,
+                                       int localProxyPort, NSTimeInterval timeout) {
     NSURL *url = [NSURL URLWithString:urlString];
-    if (!url) return nil;
+    if (!url || localProxyPort <= 0 || localProxyPort > 65535) return nil;
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
     req.HTTPMethod = @"POST";
     req.HTTPBody = body;
@@ -896,7 +925,16 @@ static NSData *KPKSyncPostNSURLSession(NSString *urlString, NSDictionary *header
     __block NSData *result = nil;
     __block NSError *resultError = nil;
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-    NSURLSession *session = [NSURLSession sessionWithConfiguration:[NSURLSessionConfiguration ephemeralSessionConfiguration]];
+    NSURLSessionConfiguration *configuration = [NSURLSessionConfiguration ephemeralSessionConfiguration];
+    configuration.connectionProxyDictionary = @{
+        (__bridge NSString *)kCFNetworkProxiesHTTPEnable: @YES,
+        (__bridge NSString *)kCFNetworkProxiesHTTPProxy: @"127.0.0.1",
+        (__bridge NSString *)kCFNetworkProxiesHTTPPort: @(localProxyPort),
+        (__bridge NSString *)kCFNetworkProxiesHTTPSEnable: @YES,
+        (__bridge NSString *)kCFNetworkProxiesHTTPSProxy: @"127.0.0.1",
+        (__bridge NSString *)kCFNetworkProxiesHTTPSPort: @(localProxyPort),
+    };
+    NSURLSession *session = [NSURLSession sessionWithConfiguration:configuration];
     NSURLSessionDataTask *task = [session dataTaskWithRequest:req completionHandler:^(NSData * _Nullable data, NSURLResponse * _Nullable response, NSError * _Nullable error) {
         if (error) {
             resultError = error;
@@ -906,64 +944,11 @@ static NSData *KPKSyncPostNSURLSession(NSString *urlString, NSDictionary *header
         dispatch_semaphore_signal(sem);
     }];
     [task resume];
-    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(timeout * NSEC_PER_SEC) + 5LL * NSEC_PER_SEC));
+    long waitResult = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(timeout * NSEC_PER_SEC) + 5LL * NSEC_PER_SEC));
+    if (waitResult != 0) [task cancel];
     [session finishTasksAndInvalidate];
     if (resultError) return nil;
     return result;
-}
-
-static NSData *KPKSyncPost(NSString *urlString, NSDictionary *headers, NSData *body, NSTimeInterval timeout) {
-    if ([urlString hasPrefix:@"https://"]) {
-        // HTTPS 无法用裸 socket 直连（无客户端 TLS），退回系统栈；
-        // 当前仅 PBProxy GetGuid 使用 https，其失败有 localRandomGuid 兜底。
-        return KPKSyncPostNSURLSession(urlString, headers, body, timeout);
-    }
-
-    // 组装 C 侧头数组
-    NSMutableArray<NSData *> *kept = [NSMutableArray array];
-    const char **cHeaders = NULL;
-    NSUInteger count = headers.count;
-    if (count > 0) {
-        cHeaders = (const char **)calloc(count + 1, sizeof(char *));
-        NSUInteger i = 0;
-        for (NSString *key in headers) {
-            NSString *line = [NSString stringWithFormat:@"%@: %@", key, headers[key]];
-            NSData *d = [line dataUsingEncoding:NSUTF8StringEncoding];
-            [kept addObject:d];
-            cHeaders[i++] = (const char *)d.bytes;
-        }
-    }
-
-    size_t outCap = 32 * 1024;
-    char *out = (char *)calloc(1, outCap);
-    int rc = -1;
-    NSData *parsed = nil;
-    if (out) {
-        size_t respLen = 0;
-        rc = kp_http_post_direct_len(urlString.UTF8String,
-                                     (const char *const *)cHeaders,
-                                     body.bytes, body.length,
-                                     (int)(timeout * 1000.0),
-                                     out, outCap, &respLen);
-        if (rc == 0 && respLen > 0) {
-            // 提取 body（自动处理 gzip 等，与原 NSURLSession 行为对齐）。
-            // 栈上缓冲：避免 static 缓冲在并发/重入时互相污染。
-            char bodyBuf[24 * 1024];
-            size_t bodyLen = 0;
-            kp_fetch_diag diag;
-            kp_fetch_diag_init(&diag);
-            if (kp_parse_http_response(out, respLen, bodyBuf, sizeof(bodyBuf), &bodyLen, &diag) == 0 && bodyLen > 0) {
-                parsed = [NSData dataWithBytes:bodyBuf length:bodyLen];
-            }
-        }
-        free(out);
-    }
-    if (cHeaders) free(cHeaders);
-    if (rc != 0 || !parsed) {
-        NSLog(@"[LCProxyKingClient] direct post failed: %@ rc=%d", urlString, rc);
-        return nil;
-    }
-    return parsed;
 }
 
 // ---------------------------------------------------------------------------
@@ -994,34 +979,61 @@ static NSData *KPKSyncPost(NSString *urlString, NSDictionary *headers, NSData *b
             mo, (long)width, (long)height, osRelease ?: @"10", (long)api];
 }
 
-+ (void)fetchGuidFromServerWithQua2:(NSString *)qua2
-                            timeout:(NSTimeInterval)timeout
-                         completion:(void (^)(NSString * _Nullable guid, NSError * _Nullable error))completion {
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        NSData *body = KPKBuildGetGuidRequest(qua2);
-        NSDictionary *headers = @{
-            @"Host": @"pbprx.qq.com",
-            @"Content-Type": @"application/multipart-formdata",
-            @"User-Agent": @"MQQBrowser",
-            @"Accept": @"*/*",
-            @"Connection": @"Close",
-            @"PB": @"1",
-            @"Q-GUID": @"00000000000000000000000000000000",
-            @"Q-UA2": qua2,
-            @"Traceid": KPKCurrentMillis(),
-        };
-        NSData *resp = KPKSyncPost(kPBProxyURL, headers, body, timeout);
-        if (!resp) {
-            completion(nil, [NSError errorWithDomain:@"LCProxyKing" code:-1 userInfo:@{NSLocalizedDescriptionKey: @"GetGuid 网络失败"}]);
-            return;
++ (NSURLSessionDataTask *)fetchGuidFromServerWithQua2:(NSString *)qua2
+                                 throughLocalProxyPort:(int)localProxyPort
+                               bootstrapProxyPassword:(NSString *)bootstrapProxyPassword
+                                              timeout:(NSTimeInterval)timeout
+                                           completion:(void (^)(NSString * _Nullable guid, NSError * _Nullable error))completion {
+    NSURL *url = [NSURL URLWithString:kPBProxyURL];
+    if (!url || localProxyPort <= 0 || localProxyPort > 65535 || !bootstrapProxyPassword.length) {
+        completion(nil, [NSError errorWithDomain:@"LCProxyKing" code:-1
+            userInfo:@{NSLocalizedDescriptionKey: @"GetGuid 本地代理不可用"}]);
+        return nil;
+    }
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
+    request.HTTPMethod = @"POST";
+    request.timeoutInterval = timeout;
+    request.HTTPBody = KPKBuildGetGuidRequest(qua2);
+    NSDictionary *headers = @{
+        @"Host": @"pbprx.qq.com",
+        @"Content-Type": @"application/multipart-formdata",
+        @"User-Agent": @"MQQBrowser",
+        @"Accept": @"*/*",
+        @"Connection": @"Close",
+        @"PB": @"1",
+        @"Q-GUID": @"00000000000000000000000000000000",
+        @"Q-UA2": qua2,
+        @"Traceid": KPKCurrentMillis(),
+    };
+    for (NSString *key in headers) [request setValue:headers[key] forHTTPHeaderField:key];
+
+    NSURLSessionConfiguration *configuration = [NSURLSessionConfiguration ephemeralSessionConfiguration];
+    configuration.connectionProxyDictionary = @{
+        (__bridge NSString *)kCFNetworkProxiesHTTPEnable: @YES,
+        (__bridge NSString *)kCFNetworkProxiesHTTPProxy: @"127.0.0.1",
+        (__bridge NSString *)kCFNetworkProxiesHTTPPort: @(localProxyPort),
+        (__bridge NSString *)kCFNetworkProxiesHTTPSEnable: @YES,
+        (__bridge NSString *)kCFNetworkProxiesHTTPSProxy: @"127.0.0.1",
+        (__bridge NSString *)kCFNetworkProxiesHTTPSPort: @(localProxyPort),
+    };
+    KPKPBProxyBootstrapAuthDelegate *delegate = [[KPKPBProxyBootstrapAuthDelegate alloc] init];
+    delegate.password = bootstrapProxyPassword;
+    NSURLSession *session = [NSURLSession sessionWithConfiguration:configuration delegate:delegate delegateQueue:nil];
+    __block NSURLSessionDataTask *task = nil;
+    task = [session dataTaskWithRequest:request completionHandler:^(NSData * _Nullable data, NSURLResponse * _Nullable response, NSError * _Nullable error) {
+        (void)delegate;
+        (void)response;
+        if (error) {
+            completion(nil, error);
+        } else {
+            NSString *guid = KPKParseGetGuidResponse(data);
+            completion(guid, guid ? nil : [NSError errorWithDomain:@"LCProxyKing" code:-2
+                userInfo:@{NSLocalizedDescriptionKey: @"GetGuid 响应解析失败"}]);
         }
-        NSString *guid = KPKParseGetGuidResponse(resp);
-        if (!guid) {
-            completion(nil, [NSError errorWithDomain:@"LCProxyKing" code:-2 userInfo:@{NSLocalizedDescriptionKey: @"GetGuid 响应解析失败"}]);
-            return;
-        }
-        completion(guid, nil);
-    });
+        [session finishTasksAndInvalidate];
+    }];
+    [task resume];
+    return task;
 }
 
 + (void)fetchTokenWithGuid:(NSString *)guid

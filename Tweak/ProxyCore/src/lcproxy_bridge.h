@@ -12,9 +12,12 @@ extern "C" {
 // Runtime proxy controls (applied immediately in addition to proxychains.conf)
 void lcproxy_socket_set_bypass(int on);
 void lcproxy_control_set_enabled(int enabled);
+int  lcproxy_control_set_config_path(const char *path);
 void lcproxy_control_reload_config(void);
 int  lcproxy_control_get_proxy_count(void);
 int  lcproxy_control_get_enabled(void);
+void lcproxy_control_set_config_valid(int valid);
+int  lcproxy_control_get_config_valid(void);
 void lcproxy_control_set_block_non_tcp(int enabled);
 int  lcproxy_control_get_block_non_tcp(void);
 
@@ -24,7 +27,14 @@ int  lcproxy_control_get_block_non_tcp(void);
 #define LC_PROXY_CHAIN_MAX 512
 void lcproxy_control_copy_proxy_chain(proxy_data *dst, unsigned int dst_cap,
                                       unsigned int *out_count,
-                                      chain_type *out_chain_type);
+                                      chain_type *out_chain_type,
+                                      unsigned int *out_max_chain);
+void lcproxy_control_copy_route_rules(localaddr_arg *localnet, size_t localnet_cap,
+                                      size_t *out_localnet_count,
+                                      dnat_arg *dnat, size_t dnat_cap,
+                                      size_t *out_dnat_count,
+                                      unsigned int *out_remote_dns_subnet);
+enum dns_lookup_flavor lcproxy_control_get_resolver(void);
 
 // Real-time network path hints (NWPathMonitor updates routing fail-closed)
 void     lcproxy_network_monitor_update(int known, int non_cellular);

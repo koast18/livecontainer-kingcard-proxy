@@ -66,7 +66,7 @@ assert 'lcproxy_control_copy_proxy_chain' in lib, 'missing chain snapshot API'
 assert 'lcproxy_network_should_direct' in config, 'effective mode does not use fail-closed direct decision'
 assert 'nw_path_monitor_create' in config, 'missing NWPathMonitor integration'
 assert 'handleNetworkPath' in config, 'missing path handler'
-assert 'writeProxychainsConf:s toDirectory:dir' in config, 'does not regenerate conf on effective mode change'
+assert 'writeProxychainsConf:s toDirectory:self.dataDirectory' in config, 'does not regenerate canonical conf on effective mode change'
 assert 'lcproxy_network_monitor_update' in lib, 'missing network monitor update implementation'
 assert 'lcproxy_network_should_direct' in lib, 'missing network direct decision implementation'
 assert 'lc_direct_track_close_all' in lib, 'missing direct socket kill switch'
@@ -86,6 +86,14 @@ assert 'scheduleForwarderRecoveryRetry' in config, 'no persistent forwarder rest
 assert 'LCProxyForwarderUnavailableNotification' in config, 'forwarder-down does not notify the user'
 assert 'LCProxyForwarderUnavailableNotification' in control, 'no user-visible banner for forwarder-down'
 assert 'proxyActive = NO' not in config, 'kingcard mode must never fail open to direct when the forwarder is down'
+assert 'BOOL configReady = lcproxy_control_set_config_path' in config, \
+    'canonical config write and C-path pinning are not treated as one readiness gate'
+assert 'BOOL needsRuntimeReload = configReady &&' in config, \
+    'a failed canonical config write can reparse stale proxy settings'
+assert '(proxyActive && !wasConfigValid)' in config, \
+    'a repaired canonical config does not force C runtime recovery after a failed write'
+assert 'configReady && (!proxyActive || lcproxy_control_get_config_valid())' in config, \
+    'King route publication can proceed before the canonical config is usable'
 # Forwarder stop must not wedge on relays blocked on half-open upstream sockets.
 assert 'kp_forwarder_shutdown_upstreams' in core, 'stop does not wake relays blocked on upstream sockets'
 assert 'kp_forwarder_shutdown_upstreams_locked' in core, 'stop no longer shuts down upstreams from the same critical section'

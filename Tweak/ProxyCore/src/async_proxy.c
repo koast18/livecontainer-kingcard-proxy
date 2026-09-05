@@ -16,8 +16,6 @@
 #include "../vendor/proxychains-ng/src/core.h"
 #include "lcproxy_bridge.h"
 
-extern unsigned int proxychains_max_chain;
-
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
 #endif
@@ -26,7 +24,7 @@ extern unsigned int proxychains_max_chain;
 // 创建一个 detached relay 线程。这里加一个全局活跃上限，超过后让调用方回退到
 // 同步代理路径，避免无限创建线程耗尽 iOS 进程资源。
 #define LC_ASYNC_MAX_RELAY_THREADS 64
-#define LC_ASYNC_PROXY_CHAIN_MAX 64
+#define LC_ASYNC_PROXY_CHAIN_MAX LC_PROXY_CHAIN_MAX
 static int g_lc_async_relay_count = 0;
 static pthread_mutex_t g_lc_async_peer_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_lc_async_peer_fds[LC_ASYNC_MAX_RELAY_THREADS];
@@ -195,13 +193,14 @@ static void *relay_worker(void *arg) {
         // run for a long time and must not race with config reloads.
         proxy_data chain_pd[LC_ASYNC_PROXY_CHAIN_MAX];
         unsigned int chain_count = 0;
+        unsigned int max_chain = 1;
         chain_type chain_ct = STRICT_TYPE;
         lcproxy_control_copy_proxy_chain(chain_pd, LC_ASYNC_PROXY_CHAIN_MAX,
-                                         &chain_count, &chain_ct);
+                                         &chain_count, &chain_ct, &max_chain);
         int rc = connect_proxy_chain(
             up, job->target_ip, htons(job->target_port),
             chain_pd, chain_count, chain_ct,
-            proxychains_max_chain);
+            max_chain);
         lcproxy_socket_set_bypass(0);
 
         if (rc == SUCCESS) {
