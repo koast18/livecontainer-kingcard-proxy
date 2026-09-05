@@ -112,13 +112,24 @@ static nw_path_monitor_t g_networkMonitor;
 
 - (NSDictionary *)load {
     NSDictionary *raw = nil;
+    NSDate *rawDate = nil;
     for (NSString *dir in LCProxyAllDataDirectories()) {
-        NSData *data = [NSData dataWithContentsOfFile:[dir stringByAppendingPathComponent:LCProxySettingsFile]];
+        NSString *path = [dir stringByAppendingPathComponent:LCProxySettingsFile];
+        NSDate *mtime = nil;
+        if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
+            mtime = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil].fileModificationDate;
+        }
+        if (!mtime) continue;
+        NSData *data = [NSData dataWithContentsOfFile:path];
         if (!data) continue;
         id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-        if ([obj isKindOfClass:[NSDictionary class]]) {
+        if (![obj isKindOfClass:[NSDictionary class]]) continue;
+        // 共享 App 会同时看到 AppGroup 目录与启动方 LC 私有目录的多份
+        // settings.json；按修改时间取最新，避免共享目录里的陈旧副本盖掉
+        // 刚在控制台保存的配置（否则共享 App 会带着旧配置甚至默认值运行）。
+        if (!rawDate || [mtime compare:rawDate] == NSOrderedDescending) {
             raw = obj;
-            break;
+            rawDate = mtime;
         }
     }
     if (!raw) return [self defaults];

@@ -19,6 +19,8 @@ jobs:
 
       - name: King cache/refresh logic static tests
         run: bash Scripts/test_king_cache_logic.sh
+      - name: Shared-app data dir regression tests
+        run: bash Scripts/test_shared_app_paths.sh
       - name: Foreground reload/shared-app forwarder static checks
         run: bash Scripts/test_foreground_reload_logic.sh
       - name: Proxy override unit tests

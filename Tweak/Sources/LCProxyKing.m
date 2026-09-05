@@ -410,12 +410,14 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
 // ---------------------------------------------------------------------------
 // 状态持久化与同步取号辅助
 // ---------------------------------------------------------------------------
-// 跨进程状态锁：kingcard-state.json 会写入 primary 与共享 AppGroup 两个目录，
-// 多个 LiveContainer 实例（各自 primary 不同、共享同一 AppGroup）真正争用的是
-// 共享副本。只锁 primary 时各进程各持一把不同的锁同时改写共享文件，
+// 跨进程状态锁：kingcard-state.json 会写入多个数据目录，多个 LiveContainer
+// 实例（私有 App 各自 primary、共享 App 以 AppGroup 目录为 primary）真正争用
+// 的是共享副本。只锁 primary 时各进程各持一把不同的锁同时改写共享文件，
 // “串行化”完全失效，取号/代理池刷新会基于旧副本互相覆盖（多实例只有先开的
 // App 有网的现象之一）。这里按 LCProxyAllDataDirectories 的固定顺序锁全部
-// 目录的 lock 文件：锁序一致且 primary 锁只有本实例进程会竞争，不会成环。
+// 目录的 lock 文件；该列表按路径全局排序，进程间锁序一致不会成环（共享 App
+// 进程的 primary 是 AppGroup 目录，与私有 App 进程的插入顺序天然相反，排序
+// 是不成环的前提）。
 // fcntl 记录锁 + 有限等待；另一个实例刷新中途被 iOS 挂起时本进程 8 秒后放弃。
 - (NSArray<NSString *> *)stateLockPaths {
     NSMutableArray<NSString *> *paths = [NSMutableArray array];
