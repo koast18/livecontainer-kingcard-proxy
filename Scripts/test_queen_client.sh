@@ -12,7 +12,7 @@ void proxychains_write_log(char *str, ...) {
 EOF
 
 clang -fobjc-arc -O0 -g \
-  -framework Foundation -lz \
+  -framework Foundation -framework CFNetwork -lz \
   -ITweak/Sources -ITweak/ProxyCore/src -ITweak/ProxyCore/vendor/proxychains-ng/src \
   Tweak/Sources/LCProxyKingClient.m \
   Tweak/Sources/KPKCrypto.c \
