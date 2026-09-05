@@ -26,6 +26,7 @@ run_step() {
 }
 
 run_step "King cache/refresh static checks" bash Scripts/test_king_cache_logic.sh
+run_step "Shared-app data dir regression checks" bash Scripts/test_shared_app_paths.sh
 run_step "Foreground reload/shared-app forwarder static checks" bash Scripts/test_foreground_reload_logic.sh
 run_step "Alook high-download crash guards" bash Scripts/test_alook_crash_guard.sh
 run_step "Proxy override unit tests" bash Scripts/test_proxy_override.sh
