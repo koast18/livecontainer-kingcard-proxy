@@ -1,0 +1,26 @@
+name: Debug Dylib Build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  debug:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Reproduce dylib build with full output
+        run: |
+          set +e
+          ./Scripts/build_ios.sh > /tmp/dylib_out.txt 2>&1
+          RC=$?
+          echo "====== build_ios.sh exit code: $RC" | tee -a /tmp/dylib_out.txt
+          tail -40 /tmp/dylib_out.txt
+          exit 0
+
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: dylib-diag
+          path: /tmp/dylib_out.txt
