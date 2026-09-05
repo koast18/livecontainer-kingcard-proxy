@@ -112,10 +112,11 @@ assert '[cls respondsToSelector:selector]' in paths, \
 assert '[lcSharedUtils respondsToSelector:sel]' in updater, \
     'console updater can call an unavailable LCSharedUtils selector'
 
-# 王卡状态只锁定并写入 canonical App Group 文件；私有目录仅用于受锁迁移。
+# 王卡状态仍以 canonical 为权威，但同时写入/锁定所有可访问数据目录，
+# 避免共享 App 因 AppGroup 目录不可见/不可写而完全丢失状态。
 assert 'LCProxyCanonicalDataDirectory' in king, 'King state is not canonicalized'
-assert 'return @[[directory stringByAppendingPathComponent:@"kingcard-state.lock"]];' in king, \
-    'King state lock covers migration copies instead of the single canonical state'
+assert 'for (NSString *dir in LCProxyAllDataDirectories())' in king, \
+    'King state lock does not cover all writable data directories'
 assert 'saveState:(NSMutableDictionary *)state error:' in king, 'King state write does not report failure'
 print('test_shared_app_paths: OK')
 PY

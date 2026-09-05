@@ -6,6 +6,7 @@ NSString * _Nullable LCProxySharedRootFromDylibPath(NSString *dylibPath);
 NSString *LCProxySharedRootDirectory(void);
 NSString *LCProxyDylibPath(void);
 NSString *LCProxyDataDirectory(void);
+NSString *LCProxyGuestDataDirectory(void);
 NSString * _Nullable LCProxySharedDataDirectory(void);
 /// The only directory permitted to own active settings and KingCard state.
 /// An App Group, when available, is authoritative over launch-private copies.

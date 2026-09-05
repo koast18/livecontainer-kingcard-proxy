@@ -39,6 +39,12 @@ NSString *LCProxyDataDirectory(void) {
     return [LCProxySharedRootDirectory() stringByAppendingPathComponent:@"LCProxy"];
 }
 
+NSString *LCProxyGuestDataDirectory(void) {
+    NSArray<NSString *> *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    if (!paths.count) return nil;
+    return [paths[0] stringByAppendingPathComponent:@"LCProxy"];
+}
+
 // LiveContainer 在进入 guest 前把自身沙盒家目录写入 LC_HOME_PATH（LCBootstrap），
 // 随后 guest 的 HOME 才被切到 guest 数据目录。共享 App 的 dylib 从 App Group 的
 // Tweaks 加载，primary 与 App Group 数据目录相同；一旦共享目录里没有
@@ -89,6 +95,8 @@ NSArray<NSString *> *LCProxyAllDataDirectories(void) {
     if (primary.length) [dirs addObject:primary];
     NSString *dylibLocal = LCProxyDataDirectory();
     if (dylibLocal.length && ![dirs containsObject:dylibLocal]) [dirs addObject:dylibLocal];
+    NSString *guest = LCProxyGuestDataDirectory();
+    if (guest.length && ![dirs containsObject:guest]) [dirs addObject:guest];
     NSString *shared = LCProxySharedDataDirectory();
     if (shared.length && ![dirs containsObject:shared]) [dirs addObject:shared];
     NSString *launchPrivate = LCProxyLaunchPrivateDataDirectory();

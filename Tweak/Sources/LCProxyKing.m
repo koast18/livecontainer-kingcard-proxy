@@ -585,9 +585,13 @@ typedef NS_ENUM(NSInteger, LCProxyKingLeaseResult) {
 // remain migration inputs only, so they must never receive a state write or a
 // lock that could make their stale contents authoritative again.
 - (NSArray<NSString *> *)stateLockPaths {
-    NSString *directory = LCProxyCanonicalDataDirectory();
-    if (!directory.length) return @[];
-    return @[[directory stringByAppendingPathComponent:@"kingcard-state.lock"]];
+    NSMutableArray<NSString *> *paths = [NSMutableArray array];
+    for (NSString *dir in LCProxyAllDataDirectories()) {
+        if (!dir.length) continue;
+        NSString *p = [dir stringByAppendingPathComponent:@"kingcard-state.lock"];
+        if (![paths containsObject:p]) [paths addObject:p];
+    }
+    return paths;
 }
 
 - (NSArray<NSNumber *> *)acquireStateLocks {
@@ -679,24 +683,33 @@ typedef NS_ENUM(NSInteger, LCProxyKingLeaseResult) {
     state[@"updatedAt"] = @([[NSDate date] timeIntervalSince1970]);
     NSError *error = nil;
     NSData *data = [NSJSONSerialization dataWithJSONObject:state options:NSJSONWritingPrettyPrinted error:&error];
-    NSString *directory = LCProxyCanonicalDataDirectory();
-    NSString *path = [directory stringByAppendingPathComponent:@"kingcard-state.json"];
-    if (!data || !directory.length ||
-        ![[NSFileManager defaultManager] createDirectoryAtPath:directory withIntermediateDirectories:YES attributes:nil error:&error] ||
-        ![data writeToFile:path options:NSDataWritingAtomic error:&error]) {
+    if (!data) {
         if (outError) *outError = error;
         return NO;
     }
-    NSData *written = [NSData dataWithContentsOfFile:path options:0 error:&error];
-    id decoded = written ? [NSJSONSerialization JSONObjectWithData:written options:0 error:&error] : nil;
-    BOOL intact = [decoded isKindOfClass:[NSDictionary class]] && [(NSDictionary *)decoded isEqualToDictionary:state];
-    if (!intact && !error) {
+    BOOL wroteAny = NO;
+    for (NSString *directory in LCProxyAllDataDirectories()) {
+        if (!directory.length) continue;
+        NSString *path = [directory stringByAppendingPathComponent:@"kingcard-state.json"];
+        if (![[NSFileManager defaultManager] createDirectoryAtPath:directory
+                                      withIntermediateDirectories:YES attributes:nil error:&error] ||
+            ![data writeToFile:path options:NSDataWritingAtomic error:&error]) {
+            continue;
+        }
+        NSData *written = [NSData dataWithContentsOfFile:path options:0 error:&error];
+        id decoded = written ? [NSJSONSerialization JSONObjectWithData:written options:0 error:&error] : nil;
+        if ([decoded isKindOfClass:[NSDictionary class]] &&
+            [(NSDictionary *)decoded isEqualToDictionary:state]) {
+            wroteAny = YES;
+        }
+    }
+    if (!wroteAny && outError && !error) {
         error = [NSError errorWithDomain:@"LCProxyKing" code:-30 userInfo:@{
             NSLocalizedDescriptionKey: @"王卡状态写入后完整性校验失败",
         }];
     }
     if (outError) *outError = error;
-    return intact;
+    return wroteAny;
 }
 
 - (LCProxyKingLeaseResult)acquireRefreshLeaseWithForce:(BOOL)force
@@ -756,7 +769,7 @@ typedef NS_ENUM(NSInteger, LCProxyKingLeaseResult) {
     NSArray<NSNumber *> *fds = [self acquireStateLocks];
     if (fds.count == 0) return NO;
     @try {
-        NSMutableDictionary *latest = [self canonicalState];
+        NSMutableDictionary *latest = [self loadState];
         NSString *leaseOwner = [latest[@"refreshLeaseOwner"] isKindOfClass:[NSString class]] ? latest[@"refreshLeaseOwner"] : nil;
         NSNumber *leaseGeneration = [latest[@"refreshLeaseGeneration"] isKindOfClass:[NSNumber class]] ? latest[@"refreshLeaseGeneration"] : nil;
         NSNumber *leaseBase = [latest[@"refreshLeaseBaseUpdatedAt"] isKindOfClass:[NSNumber class]] ? latest[@"refreshLeaseBaseUpdatedAt"] : nil;
@@ -837,7 +850,7 @@ typedef NS_ENUM(NSInteger, LCProxyKingLeaseResult) {
     NSArray<NSNumber *> *fds = [self acquireStateLocks];
     if (fds.count == 0) return LCProxyKingCommitResultLockUnavailable;
     @try {
-        NSMutableDictionary *latest = [self canonicalState];
+        NSMutableDictionary *latest = [self loadState];
         NSString *leaseOwner = [latest[@"refreshLeaseOwner"] isKindOfClass:[NSString class]] ? latest[@"refreshLeaseOwner"] : nil;
         NSNumber *leaseGeneration = [latest[@"refreshLeaseGeneration"] isKindOfClass:[NSNumber class]] ? latest[@"refreshLeaseGeneration"] : nil;
         NSNumber *leaseBase = [latest[@"refreshLeaseBaseUpdatedAt"] isKindOfClass:[NSNumber class]] ? latest[@"refreshLeaseBaseUpdatedAt"] : nil;

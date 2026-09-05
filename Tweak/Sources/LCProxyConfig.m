@@ -173,14 +173,24 @@ static nw_path_monitor_t g_networkMonitor;
     NSError *err = nil;
     NSData *data = [NSJSONSerialization dataWithJSONObject:settings options:NSJSONWritingPrettyPrinted error:&err];
     if (!data) return NO;
-    NSString *dir = self.dataDirectory;
-    if (![[NSFileManager defaultManager] createDirectoryAtPath:dir
-                                  withIntermediateDirectories:YES attributes:nil error:&err]) return NO;
-    NSString *settingsPath = [dir stringByAppendingPathComponent:LCProxySettingsFile];
-    NSData *existing = [NSData dataWithContentsOfFile:settingsPath];
-    if (![existing isEqualToData:data] &&
-        ![data writeToFile:settingsPath options:NSDataWritingAtomic error:&err]) return NO;
-    return [self writeProxychainsConf:settings toDirectory:dir];
+    BOOL wroteAny = NO;
+    for (NSString *dir in LCProxyAllDataDirectories()) {
+        if (!dir.length) continue;
+        if (![[NSFileManager defaultManager] createDirectoryAtPath:dir
+                                      withIntermediateDirectories:YES attributes:nil error:&err]) {
+            continue;
+        }
+        NSString *settingsPath = [dir stringByAppendingPathComponent:LCProxySettingsFile];
+        NSData *existing = [NSData dataWithContentsOfFile:settingsPath];
+        if ([existing isEqualToData:data] ||
+            [data writeToFile:settingsPath options:NSDataWritingAtomic error:&err]) {
+            wroteAny = YES;
+        }
+        if ([self writeProxychainsConf:settings toDirectory:dir]) {
+            wroteAny = YES;
+        }
+    }
+    return wroteAny;
 }
 
 - (BOOL)saveSettings:(NSDictionary *)settings {
@@ -198,7 +208,11 @@ static nw_path_monitor_t g_networkMonitor;
 }
 
 - (BOOL)writeProxychainsConf:(NSDictionary *)settings {
-    return [self writeProxychainsConf:settings toDirectory:self.dataDirectory];
+    BOOL wroteAny = NO;
+    for (NSString *dir in LCProxyAllDataDirectories()) {
+        if ([self writeProxychainsConf:settings toDirectory:dir]) wroteAny = YES;
+    }
+    return wroteAny;
 }
 
 - (BOOL)writeProxychainsConf:(NSDictionary *)settings toDirectory:(NSString *)dir {
@@ -437,6 +451,13 @@ static nw_path_monitor_t g_networkMonitor;
     BOOL configPathChanged = !self.lastAppliedConfigPath ||
                              ![configPath isEqualToString:self.lastAppliedConfigPath];
     BOOL configWritten = [self writeProxychainsConf:s toDirectory:self.dataDirectory];
+    // Also keep writable copies in every other data directory (private, guest
+    // container, etc.) so a shared app can still find a valid config if the
+    // canonical App Group copy is missing or not visible to the current process.
+    for (NSString *dir in LCProxyAllDataDirectories()) {
+        if ([dir isEqualToString:self.dataDirectory]) continue;
+        [self writeProxychainsConf:s toDirectory:dir];
+    }
 
     // C code cannot derive an App Group container from a private dylib path.
     // Pin it to the Foundation-resolved canonical file; an unwritable/missing
