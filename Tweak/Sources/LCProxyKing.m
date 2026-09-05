@@ -520,7 +520,7 @@ typedef NS_ENUM(NSInteger, LCProxyKingLeaseResult) {
     if (![inputSignature isEqualToString:[self credentialInputSignatureForSettings:settings]]) return NO;
     NSArray *validHttp = [self validatedProxyPool:queenHttp];
     NSArray *validHttps = [self validatedProxyPool:queenHttps];
-    if (!queenHttp.count || !queenHttps.count || validHttp.count != queenHttp.count || validHttps.count != queenHttps.count) return NO;
+    if ((!queenHttp.count && !queenHttps.count) || validHttp.count != queenHttp.count || validHttps.count != queenHttps.count) return NO;
 
     double now = [[NSDate date] timeIntervalSince1970];
     NSNumber *tokenExpireEpoch = [state[@"tokenExpireEpoch"] isKindOfClass:[NSNumber class]] ? state[@"tokenExpireEpoch"] : nil;
@@ -1323,7 +1323,7 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
         [steps appendFormat:@"  HTTPS: %@\n", [queenHttps componentsJoinedByString:@", "]];
     }
 
-    if (!queenHttp.count || !queenHttps.count) {
+    if (!queenHttp.count && !queenHttps.count) {
         [steps appendString:@"代理池: 为空\n"];
         return [self finishRefreshWithState:state success:NO src:source ms:-[t0 timeIntervalSinceNow] * 1000.0 steps:steps baseUpdatedAt:baseUpdatedAt error:@"Queen 代理池为空"];
     }
