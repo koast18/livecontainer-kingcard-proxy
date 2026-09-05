@@ -176,12 +176,12 @@ assert 'completionLock' in guid_fetch and 'requestClosed = YES;' in guid_fetch a
 smoke_test = Path('Scripts/queen_client_test.m').read_text(encoding='utf-8')
 assert 'bootstrapProxyPassword:' in smoke_test, \
     'Queen client smoke test no longer matches the credential-bound GetGuid API'
-assert 'case 822:' in core and 'case 824:' in core, \
-    'Queen 822/824 responses no longer trigger a refresh/retry path'
-assert 'code == 822 || code == 824' not in core, \
-    'Queen 822/824 responses still fall back to arbitrary direct traffic'
-assert core.count('kp_forwarder_record_direct_host(fw, host);') == 1, \
-    'a target other than PBProxy can still use the forwarder direct path'
+assert 'case 820:' in core and 'case 821:' in core and 'case 823:' in core, \
+    'Queen credential-refresh codes (820/821/823) no longer trigger a refresh path'
+assert 'code == 822 || code == 824' in core, \
+    'Queen 822/824 server-directed direct fallback was removed'
+assert core.count('kp_forwarder_record_direct_host(fw, host);') == 3, \
+    'direct-path log calls changed (expect HTTP+CONNECT fallback + PBProxy bootstrap)'
 
 # Foreground activation should not force a synchronous refresh on the main thread.
 assert 'refreshCredentials' not in control, 'foreground notification still forces refresh'

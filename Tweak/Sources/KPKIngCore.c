@@ -1596,15 +1596,14 @@ static int kp_parse_status_code(const char *buf, size_t len) {
 }
 
 // 这些状态码通常表示 Q-Token/Q-Key 失效或代理池需要刷新。
-// 800/801 经确认不是凭证失效信号，不在这里处理。822/824 也必须刷新后
-// 失败关闭，不能把任意用户目标改为直连而消耗通用流量。
+// 800/801 经确认不是凭证失效信号，不在这里处理。822/824 是服务端主动
+// 指示的直连兑底（既有协议行为，见 queen_http/queen_https 处理分支），
+// 不归为凭证失效码。
 static int kp_code_needs_credential_refresh(int code) {
     switch (code) {
         case 820:
         case 821:
-        case 822:
         case 823:
-        case 824:
             return 1;
         default:
             return 0;
@@ -1933,6 +1932,27 @@ static void kp_handle_client(kp_forwarder *fw, int client) {
                 kp_upstream_close(fw, &up);
                 continue;
             }
+            if (code == 822 || code == 824) {
+                // 服务端主动指示的直连兑底（既有协议行为）：直接连目标主机
+                // 不再走王卡通道，改由服务端计费/免流策略兜底。
+                kp_upstream_close(fw, &up);
+                fw->stat_direct_fallbacks++;
+                kp_forwarder_record_direct_host(fw, host);
+                char rebuilt[4096];
+                int rn = kp_rebuild_proxy_request(reqbuf, off, method, host, port, path,
+                                                  rebuilt, sizeof(rebuilt));
+                int dup = kp_up_open(fw, host, port, 8000);
+                if (rn <= 0 || dup < 0) {
+                    if (dup >= 0) kp_upstream_close(fw, &dup);
+                    kp_send_simple_response(client, 502, "Bad Gateway");
+                    KP_CLOSESOCK(client);
+                    return;
+                }
+                kp_http_forward(dup, client, rebuilt, (size_t)rn);
+                kp_upstream_close(fw, &dup);
+                KP_CLOSESOCK(client);
+                return;
+            }
             if (code >= 200 && code < 600) {
                 // 响应头之后的 body 流式转发必须带空闲上限（半开上游会永久静默）。
                 uint64_t up_recv = (uint64_t)rgot;
@@ -2044,6 +2064,29 @@ https_retry:
         if (kp_code_needs_credential_refresh(code)) {
             kp_upstream_close(fw, &up);
             continue;
+        }
+        if (code == 822 || code == 824) {
+            // 服务端主动指示的直连兑底（既有协议行为）：直接连目标主机。
+            kp_upstream_close(fw, &up);
+            fw->stat_direct_fallbacks++;
+            kp_forwarder_record_direct_host(fw, host);
+            int dup = kp_up_open(fw, host, port, 10000);
+            if (dup < 0) { kp_send_simple_response(client, 502, "Bad Gateway"); KP_CLOSESOCK(client); return; }
+            const char *ok = "HTTP/1.1 200 Connection Established\r\n\r\n";
+            if (kp_send_all(client, ok, strlen(ok)) != 0) {
+                kp_upstream_close(fw, &dup);
+                KP_CLOSESOCK(client);
+                return;
+            }
+            if (kp_reader_send_available(&reader, dup, NULL) != 0) {
+                kp_upstream_close(fw, &dup);
+                KP_CLOSESOCK(client);
+                return;
+            }
+            kp_pipe_bidirectional_counted(dup, client, NULL, NULL);
+            kp_upstream_close(fw, &dup);
+            KP_CLOSESOCK(client);
+            return;
         }
         if (code == 200) {
             char *body = strstr(resp, "\r\n\r\n");

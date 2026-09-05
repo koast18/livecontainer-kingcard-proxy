@@ -17,7 +17,7 @@
   - 通过旧 WUP `proxyip/getIPListByRouter` 拉取 `queen_http` / `queen_https` 代理池，支持 MCCMNC / APN / subtype / extra-info / card-type 网络匹配参数。
   - HTTP 走 `queen_http` 分头模式：`Q-GUID` / `Q-UA2` / `Q-Token` / `Q-Type` / `Q-Key` / `Q-RequestId`。
   - HTTPS 走 `queen_https` CONNECT 合并头：`Proxy-Authorization: Q-GUID|...,Q-UA2|...,Q-Token|...,Q-Key|...,Q-RequestId|...,Q-Type|...`。
-  - 处理代理响应码 820/821/822/824（刷新凭证重试）及 823（换节点重试）；刷新仍失败时保持 fail-closed，绝不将用户目标自动改为直连。
+  - 处理代理响应码 820/821/823（刷新凭证重试）；822/824 为服务端主动指示的直连兑底（既有协议行为，仅限该类响应码时直连目标主机，其余失败路径保持 fail-closed，绝不隐式将用户目标改为直连）。
   - 每 2 分钟自动周期刷新凭证与代理池，避免过期。
   - 可选“非蜂窝网络自动直连”：开启后，当前网络为非蜂窝（Wi-Fi/其他）时自动切到直连，否则走王卡代理；关闭时始终走王卡代理。
 - **蜂窝流量统计**：
