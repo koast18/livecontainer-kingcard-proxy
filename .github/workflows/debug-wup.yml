@@ -1,0 +1,25 @@
+name: Debug WUP Compare
+
+on:
+  workflow_dispatch:
+
+jobs:
+  debug:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Reproduce queen WUP compare with full output
+        run: |
+          set +e
+          bash Scripts/test_queen_wup_compare.sh > /tmp/wup_out.txt 2>&1
+          RC=$?
+          echo "====== test_queen_wup_compare.sh exit code: $RC" | tee -a /tmp/wup_out.txt
+          exit 0
+
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: wup-diag
+          path: /tmp/wup_out.txt
