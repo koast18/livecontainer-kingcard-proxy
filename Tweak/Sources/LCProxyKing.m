@@ -1073,12 +1073,10 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
 
 - (BOOL)refreshCredentialsWithForce:(BOOL)force {
     [self.lock lock];
-    if (!self.routePublished) {
-        self.lastRefreshSuccess = NO;
-        self.lastError = @"王卡本地路由尚未发布";
-        [self.lock unlock];
-        return NO;
-    }
+    // Credential bootstrap must be allowed before the local route is published;
+    // routePublished only gates user traffic through the forwarder. Otherwise a
+    // shared app whose forwarder is still starting can never acquire a GUID and
+    // stays offline forever.
     if (self.refreshing) {
         [self.lock unlock];
         return NO;
@@ -1202,7 +1200,9 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
         guid = [self syncFetchGuid:qua2 timeout:timeout error:&guidErr];
         if (!guid) {
             [steps appendFormat:@"GUID: PBProxy 失败 %@\n", guidErr.localizedDescription ?: @""];
-            return [self finishRefreshWithState:state success:NO src:source ms:-[t0 timeIntervalSinceNow] * 1000.0 steps:steps baseUpdatedAt:baseUpdatedAt error:@"未获得可信 PBProxy GUID"];
+            guid = [self localRandomGuid];
+            source = @"guid-local";
+            [steps appendFormat:@"GUID: 本地生成（服务器失败 %@）\n", guidErr.localizedDescription ?: @""];
         } else {
             source = @"guid-pbprx";
             actuallyFetchedUpstream = YES;

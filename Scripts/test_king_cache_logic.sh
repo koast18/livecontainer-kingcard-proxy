@@ -124,6 +124,10 @@ network_refresh = refresh[refresh.index('if (!guidOverride && (force || !guid))'
 assert 'self.lastSource =' not in network_refresh, \
     'network refresh writes status outside self.lock'
 assert '- (NSString *)syncFetchGuid:' in king, 'missing synchronous GetGuid bridge'
+assert 'guid = [self localRandomGuid];' in refresh, \
+    'PBProxy GetGuid failure must fall back to local GUID so token/proxy refresh can continue'
+assert 'if (!self.routePublished) {' not in refresh, \
+    'credential bootstrap must not be blocked before route publication'
 
 # Explicit credentials always override remote refreshes, including forced ones.
 assert '!guidOverride && (force || !guid)' in king, \
