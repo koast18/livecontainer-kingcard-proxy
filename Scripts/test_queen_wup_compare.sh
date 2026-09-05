@@ -15,6 +15,7 @@ EOF
 
 clang -fobjc-arc -O0 -g \
   -framework Foundation -framework CFNetwork -lz \
+  -DLC_PROXY_DIRECT_HELPERS_IN_SHIMM \
   -ITweak/Sources -ITweak/ProxyCore/src -ITweak/ProxyCore/vendor/proxychains-ng/src \
   Tweak/Sources/LCProxyKingClient.m \
   Tweak/Sources/KPKCrypto.c \
