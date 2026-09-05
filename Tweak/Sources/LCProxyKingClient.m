@@ -926,13 +926,18 @@ static NSData *KPKSyncPostNSURLSession(NSString *urlString, NSDictionary *header
     __block NSError *resultError = nil;
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
     NSURLSessionConfiguration *configuration = [NSURLSessionConfiguration ephemeralSessionConfiguration];
+    // iOS: kCFNetworkProxiesHTTPS* is unavailable, and the HTTP proxy keys
+    // cover https requests via CONNECT (standard HTTP-proxy semantics). The
+    // macOS-only HTTPS keys are kept behind TARGET_OS_OSX for host tests.
     configuration.connectionProxyDictionary = @{
         (__bridge NSString *)kCFNetworkProxiesHTTPEnable: @YES,
         (__bridge NSString *)kCFNetworkProxiesHTTPProxy: @"127.0.0.1",
         (__bridge NSString *)kCFNetworkProxiesHTTPPort: @(localProxyPort),
+#if TARGET_OS_OSX
         (__bridge NSString *)kCFNetworkProxiesHTTPSEnable: @YES,
         (__bridge NSString *)kCFNetworkProxiesHTTPSProxy: @"127.0.0.1",
         (__bridge NSString *)kCFNetworkProxiesHTTPSPort: @(localProxyPort),
+#endif
     };
     NSURLSession *session = [NSURLSession sessionWithConfiguration:configuration];
     NSURLSessionDataTask *task = [session dataTaskWithRequest:req completionHandler:^(NSData * _Nullable data, NSURLResponse * _Nullable response, NSError * _Nullable error) {
@@ -1008,13 +1013,16 @@ static NSData *KPKSyncPostNSURLSession(NSString *urlString, NSDictionary *header
     for (NSString *key in headers) [request setValue:headers[key] forHTTPHeaderField:key];
 
     NSURLSessionConfiguration *configuration = [NSURLSessionConfiguration ephemeralSessionConfiguration];
+    // iOS: kCFNetworkProxiesHTTPS* is unavailable; HTTP proxy keys cover https.
     configuration.connectionProxyDictionary = @{
         (__bridge NSString *)kCFNetworkProxiesHTTPEnable: @YES,
         (__bridge NSString *)kCFNetworkProxiesHTTPProxy: @"127.0.0.1",
         (__bridge NSString *)kCFNetworkProxiesHTTPPort: @(localProxyPort),
+#if TARGET_OS_OSX
         (__bridge NSString *)kCFNetworkProxiesHTTPSEnable: @YES,
         (__bridge NSString *)kCFNetworkProxiesHTTPSProxy: @"127.0.0.1",
         (__bridge NSString *)kCFNetworkProxiesHTTPSPort: @(localProxyPort),
+#endif
     };
     KPKPBProxyBootstrapAuthDelegate *delegate = [[KPKPBProxyBootstrapAuthDelegate alloc] init];
     delegate.password = bootstrapProxyPassword;
