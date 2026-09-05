@@ -11,6 +11,14 @@ extern "C" {
 
 // Runtime proxy controls (applied immediately in addition to proxychains.conf)
 void lcproxy_socket_set_bypass(int on);
+// Direct libc calls captured before fishhook/other proxychains instances. These
+// bypass every injected connect/getaddrinfo hook so control-plane WUP requests
+// can still reach Tencent even when multiple proxy dylibs are loaded.
+int lcproxy_direct_getaddrinfo(const char *node, const char *service,
+                               const struct addrinfo *hints,
+                               struct addrinfo **res);
+void lcproxy_direct_freeaddrinfo(struct addrinfo *res);
+int lcproxy_direct_connect(int sock, const struct sockaddr *addr, socklen_t len);
 void lcproxy_control_set_enabled(int enabled);
 int  lcproxy_control_set_config_path(const char *path);
 void lcproxy_control_reload_config(void);

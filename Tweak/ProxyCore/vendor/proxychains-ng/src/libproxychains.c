@@ -164,6 +164,23 @@ void lcproxy_socket_set_bypass(int on) {
     lc_bypass_set(on);
 }
 
+int lcproxy_direct_getaddrinfo(const char *node, const char *service,
+                               const struct addrinfo *hints,
+                               struct addrinfo **res) {
+    if (true_getaddrinfo) return true_getaddrinfo(node, service, hints, res);
+    return getaddrinfo(node, service, hints, res);
+}
+
+void lcproxy_direct_freeaddrinfo(struct addrinfo *res) {
+    if (true_freeaddrinfo) true_freeaddrinfo(res);
+    else freeaddrinfo(res);
+}
+
+int lcproxy_direct_connect(int sock, const struct sockaddr *addr, socklen_t len) {
+    if (true_connect) return true_connect(sock, addr, len);
+    return connect(sock, addr, len);
+}
+
 static int64_t lc_now_bucket_start(void) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
