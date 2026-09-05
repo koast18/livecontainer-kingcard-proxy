@@ -1551,6 +1551,28 @@ HOOKFUNC(int, connect, int sock, const struct sockaddr *addr, unsigned int len) 
  * connect().  The ABI-compatible prototype below matches the Darwin
  * connectx() syscall wrapper.  We only intercept plain stream connects and
  * route them through the same proxychains core. */
+
+static int lc_sockaddr_is_loopback(const struct sockaddr *addr, socklen_t addrlen) {
+	if(!addr)
+		return 0;
+	if(addr->sa_family == AF_INET) {
+		if(addrlen < sizeof(struct sockaddr_in))
+			return 0;
+		const struct sockaddr_in *sin = (const struct sockaddr_in *)addr;
+		return (ntohl(sin->sin_addr.s_addr) & 0xff000000U) == 0x7f000000U;
+	}
+	if(addr->sa_family == AF_INET6) {
+		if(addrlen < sizeof(struct sockaddr_in6))
+			return 0;
+		const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)addr;
+		static const unsigned char kLcLoopbackV6[16] = {
+			0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+		};
+		return memcmp(&sin6->sin6_addr, kLcLoopbackV6, sizeof(kLcLoopbackV6)) == 0;
+	}
+	return 0;
+}
+
 HOOKFUNC(int, connectx, int sock, const sa_endpoints_t *endpoints,
          sae_associd_t associd, unsigned int flags, const struct iovec *ext,
          unsigned int extlen, size_t *pcid, sae_connid_t *connid) {
