@@ -45,8 +45,12 @@ static NSMutableString *gDiag = nil;
     const char *home = getenv("LC_HOME_PATH");
     if (home && home[0]) {
         NSString *h = [NSString stringWithUTF8String:home];
+        // LC_HOME_PATH names the container root. Private-app tweaks are only
+        // loaded from <LC_HOME_PATH>/Documents/Tweaks, never from its root.
+        if (![[h lastPathComponent] isEqualToString:@"Documents"]) {
+            h = [h stringByAppendingPathComponent:@"Documents"];
+        }
         [candidates addObject:h];
-        [candidates addObject:[h stringByAppendingPathComponent:@"Documents"]];
     }
     NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
     if (paths.count) [candidates addObject:paths[0]];
@@ -256,6 +260,7 @@ static BOOL LCProxyCodeSignatureValid(NSString *path) {
     Class lcSharedUtils = NSClassFromString(@"LCSharedUtils");
     if (!lcSharedUtils) return nil;
     SEL sel = NSSelectorFromString(@"appGroupID");
+    if (![lcSharedUtils respondsToSelector:sel]) return nil;
     NSString *groupID = ((NSString *(*)(id, SEL))objc_msgSend)(lcSharedUtils, sel);
     if (![groupID isKindOfClass:[NSString class]] || groupID.length == 0) return nil;
     NSURL *groupURL = [[NSFileManager defaultManager] containerURLForSecurityApplicationGroupIdentifier:groupID];

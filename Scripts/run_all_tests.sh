@@ -27,18 +27,19 @@ run_step() {
 
 run_step "King cache/refresh static checks" bash Scripts/test_king_cache_logic.sh
 run_step "Shared-app data dir regression checks" bash Scripts/test_shared_app_paths.sh
+run_step "Shared-app proxychains config path tests" bash Scripts/test_proxychains_config_path.sh
 run_step "Foreground reload/shared-app forwarder static checks" bash Scripts/test_foreground_reload_logic.sh
 run_step "Alook high-download crash guards" bash Scripts/test_alook_crash_guard.sh
 run_step "Proxy override unit tests" bash Scripts/test_proxy_override.sh
 run_step "Async proxy relay tests" bash Scripts/test_async_proxy.sh
 run_step "Forwarder stop regression tests" bash Scripts/test_forwarder_stop.sh
-run_step "Queen crypto self-test" bash Scripts/test_queen_crypto.sh
-run_step "Queen WUP binary comparison" bash Scripts/test_queen_wup_compare.sh
 
 if command -v xcrun >/dev/null 2>&1; then
+    run_step "Queen crypto self-test" bash Scripts/test_queen_crypto.sh
+    run_step "Queen WUP binary comparison" bash Scripts/test_queen_wup_compare.sh
     run_step "iOS dylib build (compile/link check)" bash Scripts/build_ios.sh
 else
-    echo "=== iOS dylib build skipped (requires macOS/Xcode) ==="
+    echo "=== Queen protocol and iOS dylib checks skipped (require macOS/Xcode) ==="
 fi
 
 if [ "$FAILED" -ne 0 ]; then

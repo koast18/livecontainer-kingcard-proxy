@@ -21,6 +21,8 @@ jobs:
         run: bash Scripts/test_king_cache_logic.sh
       - name: Shared-app data dir regression tests
         run: bash Scripts/test_shared_app_paths.sh
+      - name: Shared-app proxychains config path tests
+        run: bash Scripts/test_proxychains_config_path.sh
       - name: Foreground reload/shared-app forwarder static checks
         run: bash Scripts/test_foreground_reload_logic.sh
       - name: Proxy override unit tests

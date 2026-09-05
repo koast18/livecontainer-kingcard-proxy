@@ -5,7 +5,6 @@
 //  极简 HTTP POST 客户端（POSIX socket，绕过 ATS / 系统代理）。
 //
 #include "KPKQueenCore.h"
-#include "KPSocketHook.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -28,9 +27,7 @@ static int kpq_connect_host(const char *host, int port, int timeout_ms) {
     hints.ai_socktype = SOCK_STREAM;
     char portstr[16];
     snprintf(portstr, sizeof(portstr), "%d", port);
-    kp_socket_set_bypass(1);
     if (getaddrinfo(host, portstr, &hints, &res) != 0) {
-        kp_socket_set_bypass(0);
         return -1;
     }
     int fd = -1;
@@ -79,7 +76,6 @@ static int kpq_connect_host(const char *host, int port, int timeout_ms) {
         break;
     }
     freeaddrinfo(res);
-    kp_socket_set_bypass(0);
     return fd;
 }
 

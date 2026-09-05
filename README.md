@@ -6,18 +6,18 @@
 
 - **代理开关**：随时启用/禁用 HTTP 代理，不修改 `proxychains.conf` 也能立即生效。
 - **前台/熄屏恢复自愈**：返回前台时重建转发器与中继资源；转发线程不再可能永久阻塞在半开上游连接上（停止流程会同时唤醒客户端与上游两侧 socket，并以有限时限兜底），恢复后健康检查失败会自动补一轮重建；王卡转发器不可用时保持断网丢包（**绝不直连**，防止消耗通用流量）、弹横幅提示用户，并按退避持续自动重启转发器。
-- **共享 App 多实例兼容**：王卡本地转发器改为每进程独立临时端口，避免多个 LiveContainer 共享同一 App Group 时争用 `127.0.0.1:18080`；取号状态锁覆盖 primary 与共享目录全部副本，各实例按最新状态收敛，代理池延迟探测限量以免长时间占锁。共享 App（dylib 从 App Group 的 Tweaks 加载）的数据目录列表额外回落到启动方 LiveContainer 的私有目录（`LC_HOME_PATH`），共享目录缺/陈旧 `settings.json` 时不再退到 `custom 127.0.0.1:8080` 的死默认值；多份配置按修改时间取最新，目录列表按路径全局排序以保证跨进程锁序一致。
+- **共享 App 多实例兼容**：王卡本地转发器改为每进程独立临时端口，避免多个 LiveContainer 共享同一 App Group 时争用 `127.0.0.1:18080`；App Group 中的 canonical 配置和取号状态始终优先，启动方 LiveContainer 私有目录（`LC_HOME_PATH`）仅在 canonical 文件缺失或损坏时作为一次迁移来源。取号租约只包围状态仲裁和原子提交，网络取号与延迟探测在锁外执行；过期但未被其他实例接管的租约仍可安全提交。配置不可用时连接保持 fail-closed，绝不隐式直连。
 - **网络切换 fail-closed**：使用 NWPathMonitor 实时感知 Wi-Fi/蜂窝变化；开启“非蜂窝自动直连”时，仅在确认非蜂窝才直连，切换期间默认保持王卡代理，并从直连切回代理时关闭旧直连 TCP 连接，降低蜂窝下直连公网风险。
-- **丢弃非 TCP**：开关 `block_non_tcp`，禁止 UDP/QUIC/ICMP/raw socket 绕过代理。
+- **丢弃非 TCP**：自定义代理可通过 `block_non_tcp` 开关禁止 UDP/QUIC/ICMP/raw socket 绕过代理；王卡模式始终强制丢弃这些流量，因为本地转发器只承载 TCP，恢复期间也不会泄漏通用流量。
 - **代理地址配置**：在控制台修改 `http host port`，保存后写回共享 `proxychains.conf`。
 - **上游模式**：支持“直连（无代理）”、“自定义代理”、“王卡代理”三种模式。
 - **王卡代理（Queen/King 新版协议）**：王卡模式内置本地转发器：
-  - 自动初始化 `Q-GUID`（PBProxy `GetGuid`，失败本地生成）。
+  - 自动初始化 `Q-GUID`（PBProxy `GetGuid`；无可信结果时保持 fail-closed）。
   - 通过旧 WUP `httpWupToken/getTokenInfo` 获取 `Q-Token` / `Q-Key`（RSA+AES 加密信封，ECB/CBC 双模式）。
   - 通过旧 WUP `proxyip/getIPListByRouter` 拉取 `queen_http` / `queen_https` 代理池，支持 MCCMNC / APN / subtype / extra-info / card-type 网络匹配参数。
   - HTTP 走 `queen_http` 分头模式：`Q-GUID` / `Q-UA2` / `Q-Token` / `Q-Type` / `Q-Key` / `Q-RequestId`。
   - HTTPS 走 `queen_https` CONNECT 合并头：`Proxy-Authorization: Q-GUID|...,Q-UA2|...,Q-Token|...,Q-Key|...,Q-RequestId|...,Q-Type|...`。
-  - 处理代理响应码 820/821（刷新凭证重试）、823（换节点重试）、822/824（自动直连兜底）。
+  - 处理代理响应码 820/821/822/824（刷新凭证重试）及 823（换节点重试）；刷新仍失败时保持 fail-closed，绝不将用户目标自动改为直连。
   - 每 2 分钟自动周期刷新凭证与代理池，避免过期。
   - 可选“非蜂窝网络自动直连”：开启后，当前网络为非蜂窝（Wi-Fi/其他）时自动切到直连，否则走王卡代理；关闭时始终走王卡代理。
 - **蜂窝流量统计**：
@@ -25,7 +25,7 @@
   - 只在检测到蜂窝网络（无 Wi-Fi）时累计。
   - 每个 App 进程独立落盘，控制台汇总所有 App。
 - **本地 Web 控制台**：dylib 内嵌 HTTP 服务（`127.0.0.1:19092`），控制 IPA 用 WKWebView 打开。
-- **首次自动安装 dylib**：控制 IPA 首次打开会从 GitHub Release 下载 `LCProxyControl-<version>.dylib` 到 LiveContainer 的 `Tweaks` 目录，签名后重启即可。
+- **首次自动安装 dylib**：控制 IPA 首次打开会从 GitHub Release 下载 `LCProxyControl-<version>.dylib` 到私有 App 实际扫描的 `<LC_HOME_PATH>/Documents/Tweaks` 目录；签名后会复制已签名副本至 App Group 的 `Tweaks`，重启即可用于共享 App。
 
 ## 仓库结构
 
@@ -93,7 +93,7 @@ https://raw.githubusercontent.com/koast18/livecontainer-kingcard-proxy/master/Al
 
 该地址固定不变；更新版本时只需更新仓库中的 `AltStore/altstore-source.json` 并打新 tag，Actions 会自动构建并发布 Release 资产。
 
-> 配置读取：dylib 只会读取自己管理的 `<LC Documents>/LCProxy/proxychains.conf`，不会扫描系统其他 `proxychains.conf`，避免配置互相干扰。
+> 配置读取：dylib 优先读取 App Group canonical `proxychains.conf`；仅当它缺失时才使用启动方 `<LC_HOME_PATH>/Documents/LCProxy/proxychains.conf` 迁移。不会扫描系统其他 `proxychains.conf`，避免配置互相干扰。
 
 ## 流量统计说明
 

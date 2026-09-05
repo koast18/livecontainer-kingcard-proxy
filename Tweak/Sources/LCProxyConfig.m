@@ -24,6 +24,7 @@ static nw_path_monitor_t g_networkMonitor;
 @property (nonatomic, assign) int lastAppliedShouldDirect;
 @property (nonatomic, copy) NSString *lastAppliedRuntimeSignature;
 @property (nonatomic, copy) NSString *lastAppliedEffectiveMode;
+@property (nonatomic, copy) NSString *lastAppliedConfigPath;
 @property (nonatomic, assign) int lastAppliedForwarderPort;
 @property (nonatomic, copy) NSString *lifecycleState;
 @property (nonatomic, assign) NSUInteger networkGeneration;
@@ -51,6 +52,10 @@ static nw_path_monitor_t g_networkMonitor;
 - (void)noteForwarderAvailability:(BOOL)available;
 - (void)scheduleForwarderRecoveryRetry;
 - (void)resetRecoveryBudgets;
+- (NSDictionary *)mergedSettingsFrom:(NSDictionary *)settings;
+- (NSDictionary *)settingsInDirectory:(NSString *)directory;
+- (NSDictionary *)newestFallbackSettings;
+- (BOOL)synchronizeSettings:(NSDictionary *)settings;
 @end
 
 @implementation LCProxyConfig
@@ -78,7 +83,7 @@ static nw_path_monitor_t g_networkMonitor;
     return self;
 }
 
-- (NSString *)dataDirectory { return LCProxyDataDirectory(); }
+- (NSString *)dataDirectory { return LCProxyCanonicalDataDirectory(); }
 - (NSString *)settingsPath { return [self.dataDirectory stringByAppendingPathComponent:LCProxySettingsFile]; }
 - (NSString *)proxychainsConfPath { return [self.dataDirectory stringByAppendingPathComponent:LCProxyConfFile]; }
 
@@ -111,56 +116,75 @@ static nw_path_monitor_t g_networkMonitor;
 }
 
 - (NSDictionary *)load {
+    // The App Group is the authority when it exists. A launch-private copy is
+    // only a one-time migration source; otherwise a newer stale private write
+    // can silently roll a shared app back to an obsolete proxy route.
+    NSDictionary *raw = [self settingsInDirectory:self.dataDirectory];
+    if (raw) return [self mergedSettingsFrom:raw];
+
+    raw = [self newestFallbackSettings];
+    if (!raw) return [self defaults];
+    NSDictionary *merged = [self mergedSettingsFrom:raw];
+    // Do not run with a fallback selected but no canonical file: the C
+    // constructor must converge on the same path before any route is enabled.
+    if (![self synchronizeSettings:merged]) return [self defaults];
+    return merged;
+}
+
+- (NSDictionary *)settingsInDirectory:(NSString *)directory {
+    if (!directory.length) return nil;
+    NSString *path = [directory stringByAppendingPathComponent:LCProxySettingsFile];
+    NSData *data = [NSData dataWithContentsOfFile:path];
+    if (!data) return nil;
+    id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    return [obj isKindOfClass:[NSDictionary class]] ? obj : nil;
+}
+
+- (NSDictionary *)newestFallbackSettings {
     NSDictionary *raw = nil;
     NSDate *rawDate = nil;
     for (NSString *dir in LCProxyAllDataDirectories()) {
+        if ([dir isEqualToString:self.dataDirectory]) continue;
         NSString *path = [dir stringByAppendingPathComponent:LCProxySettingsFile];
         NSDate *mtime = nil;
         if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
             mtime = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil].fileModificationDate;
         }
         if (!mtime) continue;
-        NSData *data = [NSData dataWithContentsOfFile:path];
-        if (!data) continue;
-        id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-        if (![obj isKindOfClass:[NSDictionary class]]) continue;
-        // 共享 App 会同时看到 AppGroup 目录与启动方 LC 私有目录的多份
-        // settings.json；按修改时间取最新，避免共享目录里的陈旧副本盖掉
-        // 刚在控制台保存的配置（否则共享 App 会带着旧配置甚至默认值运行）。
+        NSDictionary *obj = [self settingsInDirectory:dir];
+        if (!obj) continue;
         if (!rawDate || [mtime compare:rawDate] == NSOrderedDescending) {
             raw = obj;
             rawDate = mtime;
         }
     }
-    if (!raw) return [self defaults];
-    NSMutableDictionary *merged = [NSMutableDictionary dictionaryWithDictionary:[self defaults]];
-    for (NSString *key in [self.defaults allKeys]) {
-        if (raw[key]) merged[key] = raw[key];
-    }
-    return merged;
+    return raw;
 }
 
-- (BOOL)saveSettings:(NSDictionary *)settings {
+- (NSDictionary *)mergedSettingsFrom:(NSDictionary *)settings {
     NSMutableDictionary *merged = [NSMutableDictionary dictionaryWithDictionary:[self defaults]];
     for (NSString *key in [self.defaults allKeys]) {
         if (settings[key]) merged[key] = settings[key];
     }
-    BOOL ok = YES;
-    for (NSString *dir in LCProxyAllDataDirectories()) {
-        NSError *err = nil;
-        if (![[NSFileManager defaultManager] createDirectoryAtPath:dir
-                                      withIntermediateDirectories:YES attributes:nil error:&err]) {
-            ok = NO;
-            continue;
-        }
-        NSData *data = [NSJSONSerialization dataWithJSONObject:merged options:NSJSONWritingPrettyPrinted error:&err];
-        if (!data || ![data writeToFile:[dir stringByAppendingPathComponent:LCProxySettingsFile] options:NSDataWritingAtomic error:&err]) {
-            ok = NO;
-            continue;
-        }
-        if (![self writeProxychainsConf:merged toDirectory:dir]) ok = NO;
-    }
-    return ok;
+    return merged;
+}
+
+- (BOOL)synchronizeSettings:(NSDictionary *)settings {
+    NSError *err = nil;
+    NSData *data = [NSJSONSerialization dataWithJSONObject:settings options:NSJSONWritingPrettyPrinted error:&err];
+    if (!data) return NO;
+    NSString *dir = self.dataDirectory;
+    if (![[NSFileManager defaultManager] createDirectoryAtPath:dir
+                                  withIntermediateDirectories:YES attributes:nil error:&err]) return NO;
+    NSString *settingsPath = [dir stringByAppendingPathComponent:LCProxySettingsFile];
+    NSData *existing = [NSData dataWithContentsOfFile:settingsPath];
+    if (![existing isEqualToData:data] &&
+        ![data writeToFile:settingsPath options:NSDataWritingAtomic error:&err]) return NO;
+    return [self writeProxychainsConf:settings toDirectory:dir];
+}
+
+- (BOOL)saveSettings:(NSDictionary *)settings {
+    return [self synchronizeSettings:[self mergedSettingsFrom:settings]];
 }
 
 - (NSString *)effectiveProxyModeForSettings:(NSDictionary *)settings {
@@ -178,8 +202,8 @@ static nw_path_monitor_t g_networkMonitor;
 }
 
 - (BOOL)writeProxychainsConf:(NSDictionary *)settings toDirectory:(NSString *)dir {
-    [[NSFileManager defaultManager] createDirectoryAtPath:dir
-                              withIntermediateDirectories:YES attributes:nil error:nil];
+    if (!dir.length || ![[NSFileManager defaultManager] createDirectoryAtPath:dir
+                                             withIntermediateDirectories:YES attributes:nil error:nil]) return NO;
     NSString *effectiveMode = [self effectiveProxyModeForSettings:settings];
     NSString *type = @"http";
     NSString *host = @"127.0.0.1";
@@ -206,8 +230,10 @@ static nw_path_monitor_t g_networkMonitor;
     }
     [conf appendString:@"tcp_read_time_out 15000\n"];
     [conf appendString:@"tcp_connect_time_out 8000\n"];
-    if ([settings[@"blockNonTcp"] boolValue]) {
-        [conf appendString:@"# Drop non-TCP traffic (UDP/QUIC/ICMP/raw sockets).\n"];
+    BOOL blockNonTcp = [settings[@"blockNonTcp"] boolValue] ||
+                       [effectiveMode isEqualToString:@"kingcard"];
+    if (blockNonTcp) {
+        [conf appendString:@"# Drop non-TCP traffic (required for KingCard; optional otherwise).\n"];
         [conf appendString:@"block_non_tcp\n"];
     }
     [conf appendString:@"# Exclude loopback and common LAN ranges so local services keep working.\n"];
@@ -221,8 +247,11 @@ static nw_path_monitor_t g_networkMonitor;
         [conf appendString:@"[ProxyList]\n"];
         [conf appendFormat:@"%@ %@ %ld\n", type, host, (long)port];
     }
+    NSString *path = [dir stringByAppendingPathComponent:LCProxyConfFile];
+    NSString *existing = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+    if ([existing isEqualToString:conf]) return YES;
     NSError *err = nil;
-    return [conf writeToFile:[dir stringByAppendingPathComponent:LCProxyConfFile]
+    return [conf writeToFile:path
                   atomically:YES encoding:NSUTF8StringEncoding error:&err];
 }
 
@@ -366,6 +395,9 @@ static nw_path_monitor_t g_networkMonitor;
     BOOL settingsChanged = !self.lastAppliedRuntimeSignature || ![signature isEqualToString:self.lastAppliedRuntimeSignature];
 
     LCProxyKing *king = [LCProxyKing shared];
+    // A forwarder receives an ephemeral port before proxychains has installed
+    // that port. Keep credential bootstrap closed until both layers agree.
+    [king beginRoutePublication];
 
     if (forceRecovery) {
         // Kill every old-generation relay before rebuilding the forwarder.
@@ -392,24 +424,46 @@ static nw_path_monitor_t g_networkMonitor;
     // 绝不允许退化为直连：直连会绕过王卡通道、消耗通用流量。
     BOOL forwarderUnavailable = [effectiveMode isEqualToString:@"kingcard"] &&
                                 enabled && desiredForwarderPort <= 0;
-    BOOL block = [s[@"blockNonTcp"] boolValue] && proxyActive;
+    // The forwarder only carries TCP. Keep UDP/QUIC blocked for every active
+    // KingCard session, including while a failed forwarder is being rebuilt.
+    BOOL block = proxyActive && ([s[@"blockNonTcp"] boolValue] ||
+                                 [effectiveMode isEqualToString:@"kingcard"]);
     kp_set_debug_enabled([s[@"debugLogging"] boolValue] ? 1 : 0);
 
-    BOOL needsRuntimeReload = forceRecovery || settingsChanged || forwarderPortChanged;
-
-    // Always regenerate the shared conf. In auto-direct mode the on-disk conf
+    // Always regenerate the canonical conf. In auto-direct mode the on-disk conf
     // must match the effective mode before reload, otherwise a Wi-Fi -> cellular
     // transition can leave proxy_count at zero while proxychains is enabled.
-    for (NSString *dir in LCProxyAllDataDirectories()) {
-        [self writeProxychainsConf:s toDirectory:dir];
+    NSString *configPath = self.proxychainsConfPath;
+    BOOL configPathChanged = !self.lastAppliedConfigPath ||
+                             ![configPath isEqualToString:self.lastAppliedConfigPath];
+    BOOL configWritten = [self writeProxychainsConf:s toDirectory:self.dataDirectory];
+
+    // C code cannot derive an App Group container from a private dylib path.
+    // Pin it to the Foundation-resolved canonical file; an unwritable/missing
+    // canonical file must stay closed instead of reviving a private fallback.
+    BOOL wasConfigValid = lcproxy_control_get_config_valid();
+    BOOL configReady = lcproxy_control_set_config_path(configPath.fileSystemRepresentation) && configWritten;
+    if (!configReady) {
+        lcproxy_control_set_config_valid(0);
     }
+
+    // Never reparse a stale file after a canonical write failed. A later
+    // successful write must reload even when settings and port are unchanged.
+    BOOL needsRuntimeReload = configReady && (forceRecovery || settingsChanged ||
+                                              forwarderPortChanged || configPathChanged ||
+                                              (proxyActive && !wasConfigValid));
 
     lcproxy_control_set_enabled(proxyActive ? 1 : 0);
     lcproxy_control_set_block_non_tcp(block ? 1 : 0);
 
     if (needsRuntimeReload) {
         lcproxy_control_reload_config();
+        // The parser resets file-derived state at each reload. Reapply the
+        // effective runtime policy so KingCard never re-enables UDP/QUIC if a
+        // config read fails or a stale file lacks block_non_tcp.
+        lcproxy_control_set_block_non_tcp(block ? 1 : 0);
         self.lastAppliedRuntimeSignature = signature;
+        self.lastAppliedConfigPath = configPath;
         self.lastAppliedForwarderPort = desiredForwarderPort;
         self.lastAppliedEffectiveMode = effectiveMode;
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -417,8 +471,13 @@ static nw_path_monitor_t g_networkMonitor;
         });
     } else {
         self.lastAppliedRuntimeSignature = signature;
+        self.lastAppliedConfigPath = configPath;
         self.lastAppliedForwarderPort = desiredForwarderPort;
         self.lastAppliedEffectiveMode = effectiveMode;
+    }
+
+    if (configReady && (!proxyActive || lcproxy_control_get_config_valid())) {
+        [king publishRouteForSettings:s proxyActive:proxyActive];
     }
 
     self.lastAppliedShouldDirect = lcproxy_network_should_direct() ? 1 : 0;

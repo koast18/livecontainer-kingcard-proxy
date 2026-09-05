@@ -7,6 +7,7 @@
 | 层级 | 覆盖内容 | 关键脚本 |
 | --- | --- | --- |
 | 静态检查 | 王卡缓存/刷新逻辑是否仍满足预期 | `Scripts/test_king_cache_logic.sh` |
+| 配置路径回归 | 共享 App C 构造器优先 App Group canonical `proxychains.conf`，仅在缺失时使用启动方私有副本 | `Scripts/test_proxychains_config_path.sh` |
 | 单元测试 | 异步 loopback TCP relay 的核心行为 | `Scripts/test_async_proxy.sh` |
 | 加密自测 | Queen 协议相关 crypto 原始字节正确性 | `Scripts/test_queen_crypto.sh` |
 | 二进制对比 | native 与 Python 参考实现的 WUP 字节一致 | `Scripts/test_queen_wup_compare.sh` |
@@ -62,12 +63,13 @@ bash Scripts/run_all_tests.sh
 该脚本按顺序运行：
 
 1. King cache/refresh 静态检查
-2. Async proxy relay 单元测试
-3. Queen crypto 自测
-4. Queen WUP 二进制对比
-5. iOS dylib 编译/链接检查
+2. Shared-app 配置路径回归（含 C 侧 `LC_HOME_PATH` 仅作 canonical 缺失时的回落、无配置及不受支持的 `connectx` fail-closed、王卡 UDP/QUIC 丢弃）
+3. Async proxy relay 单元测试
+4. Queen crypto 自测
+5. Queen WUP 二进制对比
+6. iOS dylib 编译/链接检查
 
-如果当前机器是 Linux 或没有 Xcode，只会跳过 iOS dylib 构建步骤，其余测试仍会运行。
+如果当前机器是 Linux 或没有 Xcode，iOS dylib 构建和 Foundation/CFNetwork 的 Queen 客户端测试无法替代 macOS/Xcode 验证；可运行的纯 C、代理链与静态检查仍会执行。
 
 ## 4. GitHub Actions 自动测试
 

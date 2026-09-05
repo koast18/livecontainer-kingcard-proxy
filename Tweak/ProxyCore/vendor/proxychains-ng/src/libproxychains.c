@@ -39,6 +39,7 @@
 #include <net/if.h>
 #include <stdint.h>
 #include <time.h>
+#include <stdarg.h>
 
 
 #include "core.h"
@@ -55,10 +56,7 @@
 #define     SOCKPORT(x)     (satosin(x)->sin_port)
 #define     SOCKFAMILY(x)     (satosin(x)->sin_family)
 #define     MAX_CHAIN 512
-/* Stack-friendly snapshot cap for the connect hook. LiveContainer writes a
- * single-hop chain, so 64 entries is far more than needed while keeping the
- * hook stack below ~34 KB. */
-#define     LC_CONNECT_CHAIN_SNAPSHOT_MAX 64
+#define     LC_CONNECT_CHAIN_SNAPSHOT_MAX MAX_CHAIN
 
 #ifdef IS_SOLARIS
 #undef connect
@@ -70,6 +68,16 @@ close_t true_close;
 close_range_t true_close_range;
 connect_t true_connect;
 connectx_t true_connectx;
+typedef int (*dup_t)(int);
+typedef int (*dup2_t)(int, int);
+typedef int (*fcntl_t)(int, int, ...);
+dup_t true_dup;
+dup2_t true_dup2;
+fcntl_t true_fcntl;
+#if defined(__linux__)
+typedef int (*dup3_t)(int, int, int);
+dup3_t true_dup3;
+#endif
 gethostbyname_t true_gethostbyname;
 getaddrinfo_t true_getaddrinfo;
 freeaddrinfo_t true_freeaddrinfo;
@@ -122,6 +130,9 @@ typedef struct {
 } lc_traffic_bucket;
 
 static int lc_proxy_disabled = 0;
+/* No managed config at process start is never permission for a direct leak. */
+static int lc_proxy_config_valid = 0;
+static pthread_mutex_t lc_proxy_chain_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t lc_stats_lock = PTHREAD_MUTEX_INITIALIZER;
 static lc_traffic_bucket lc_buckets[LC_STATS_MAX_BUCKETS];
 static int lc_bucket_count = 0;
@@ -188,27 +199,75 @@ static void lc_direct_track_close_all(void);
 static void lc_direct_track_remove(int fd);
 static void lc_direct_track_remove_range(unsigned first, unsigned last);
 static void lc_direct_track_add_if_remote(int sock, const struct sockaddr *addr, socklen_t addrlen);
+static void lc_direct_track_copy(int source, int duplicate);
+static int lc_direct_track_contains(int fd);
+
+typedef struct {
+    proxy_data chain[MAX_CHAIN];
+    unsigned int chain_count;
+    unsigned int max_chain;
+    chain_type chain_type;
+    localaddr_arg localnet[MAX_LOCALNET];
+    size_t localnet_count;
+    dnat_arg dnat[MAX_DNAT];
+    size_t dnat_count;
+    unsigned int remote_dns_subnet;
+    enum dns_lookup_flavor resolver;
+    int config_valid;
+} lc_proxy_config_snapshot;
+
+static pthread_mutex_t lc_direct_admission_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t lc_direct_admission_cond = PTHREAD_COND_INITIALIZER;
+static int lc_direct_admissions = 0;
+static int lc_direct_admissions_blocked = 0;
+
+static int lc_direct_admission_begin(void) {
+    pthread_mutex_lock(&lc_direct_admission_lock);
+    int admitted = __atomic_load_n(&lc_proxy_disabled, __ATOMIC_ACQUIRE) &&
+                   !lc_direct_admissions_blocked;
+    if (admitted) lc_direct_admissions++;
+    pthread_mutex_unlock(&lc_direct_admission_lock);
+    return admitted;
+}
+
+static void lc_direct_admission_end(void) {
+    pthread_mutex_lock(&lc_direct_admission_lock);
+    if (lc_direct_admissions > 0) lc_direct_admissions--;
+    if (lc_direct_admissions == 0) pthread_cond_broadcast(&lc_direct_admission_cond);
+    pthread_mutex_unlock(&lc_direct_admission_lock);
+}
 
 void lcproxy_control_set_enabled(int enabled) {
-    int was_disabled = lc_proxy_disabled;
     int now_disabled = enabled ? 0 : 1;
+    int was_disabled = __atomic_exchange_n(&lc_proxy_disabled, now_disabled, __ATOMIC_ACQ_REL);
+    pthread_mutex_lock(&lc_direct_admission_lock);
+    lc_direct_admissions_blocked = now_disabled ? 0 : 1;
+    while (!now_disabled && lc_direct_admissions > 0)
+        pthread_cond_wait(&lc_direct_admission_cond, &lc_direct_admission_lock);
+    pthread_mutex_unlock(&lc_direct_admission_lock);
     if (was_disabled && !now_disabled) {
         // Leaving direct mode: kill sockets that were opened directly while on
         // Wi-Fi/auto-direct so they cannot keep leaking on cellular.
         lc_direct_track_close_all();
     }
-    lc_proxy_disabled = now_disabled;
 }
 int lcproxy_control_get_enabled(void) {
-    return lc_proxy_disabled ? 0 : 1;
+    return __atomic_load_n(&lc_proxy_disabled, __ATOMIC_ACQUIRE) ? 0 : 1;
+}
+void lcproxy_control_set_config_valid(int valid) {
+    __atomic_store_n(&lc_proxy_config_valid, valid ? 1 : 0, __ATOMIC_RELEASE);
+    if (!valid)
+        lc_direct_track_close_all();
+}
+int lcproxy_control_get_config_valid(void) {
+    return __atomic_load_n(&lc_proxy_config_valid, __ATOMIC_ACQUIRE);
 }
 void lcproxy_control_set_block_non_tcp(int enabled) {
-    proxychains_block_non_tcp = enabled ? 1 : 0;
+    __atomic_store_n(&proxychains_block_non_tcp, enabled ? 1 : 0, __ATOMIC_RELEASE);
 }
 int lcproxy_control_get_block_non_tcp(void) {
-    return proxychains_block_non_tcp;
+    return __atomic_load_n(&proxychains_block_non_tcp, __ATOMIC_ACQUIRE);
 }
-static pthread_mutex_t lc_proxy_chain_lock = PTHREAD_MUTEX_INITIALIZER;
 
 int lcproxy_control_get_proxy_count(void) {
     pthread_mutex_lock(&lc_proxy_chain_lock);
@@ -217,18 +276,71 @@ int lcproxy_control_get_proxy_count(void) {
     return count;
 }
 
+static int lc_proxy_config_missing(void) {
+	return !__atomic_load_n(&lc_proxy_disabled, __ATOMIC_ACQUIRE) &&
+           (!lcproxy_control_get_config_valid() || !lcproxy_control_get_proxy_count());
+}
+
 void lcproxy_control_copy_proxy_chain(proxy_data *dst, unsigned int dst_cap,
                                       unsigned int *out_count,
-                                      chain_type *out_chain_type) {
+                                      chain_type *out_chain_type,
+                                      unsigned int *out_max_chain) {
     pthread_mutex_lock(&lc_proxy_chain_lock);
     unsigned int count = proxychains_proxy_count;
-    if (count > dst_cap) count = dst_cap;
-    if (dst && count > 0) {
+    if (count > dst_cap || (count > 0 && !dst)) count = 0;
+    if (count > 0) {
         memcpy(dst, proxychains_pd, sizeof(proxy_data) * count);
     }
     if (out_count) *out_count = count;
     if (out_chain_type) *out_chain_type = proxychains_ct;
+    if (out_max_chain) *out_max_chain = proxychains_max_chain;
     pthread_mutex_unlock(&lc_proxy_chain_lock);
+}
+
+static void lcproxy_control_copy_config_snapshot(lc_proxy_config_snapshot *snapshot) {
+    if (!snapshot) return;
+    memset(snapshot, 0, sizeof(*snapshot));
+    pthread_mutex_lock(&lc_proxy_chain_lock);
+    snapshot->chain_count = proxychains_proxy_count;
+    if (snapshot->chain_count > MAX_CHAIN) snapshot->chain_count = 0;
+    if (snapshot->chain_count > 0)
+        memcpy(snapshot->chain, proxychains_pd, sizeof(proxy_data) * snapshot->chain_count);
+    snapshot->max_chain = proxychains_max_chain ? proxychains_max_chain : 1;
+    snapshot->chain_type = proxychains_ct;
+    snapshot->localnet_count = num_localnet_addr <= MAX_LOCALNET ? num_localnet_addr : 0;
+    if (snapshot->localnet_count > 0)
+        memcpy(snapshot->localnet, localnet_addr,
+               sizeof(localaddr_arg) * snapshot->localnet_count);
+    snapshot->dnat_count = num_dnats <= MAX_DNAT ? num_dnats : 0;
+    if (snapshot->dnat_count > 0)
+        memcpy(snapshot->dnat, dnats, sizeof(dnat_arg) * snapshot->dnat_count);
+    snapshot->remote_dns_subnet = remote_dns_subnet;
+    snapshot->resolver = proxychains_resolver;
+    snapshot->config_valid = __atomic_load_n(&lc_proxy_config_valid, __ATOMIC_ACQUIRE);
+    pthread_mutex_unlock(&lc_proxy_chain_lock);
+}
+
+void lcproxy_control_copy_route_rules(localaddr_arg *localnet, size_t localnet_cap,
+                                      size_t *out_localnet_count,
+                                      dnat_arg *dnat, size_t dnat_cap,
+                                      size_t *out_dnat_count,
+                                      unsigned int *out_remote_dns_subnet) {
+    pthread_mutex_lock(&lc_proxy_chain_lock);
+    size_t localnet_count = num_localnet_addr <= localnet_cap ? num_localnet_addr : 0;
+    size_t dnat_count = num_dnats <= dnat_cap ? num_dnats : 0;
+    if (localnet_count > 0 && localnet) memcpy(localnet, localnet_addr, sizeof(localaddr_arg) * localnet_count);
+    if (dnat_count > 0 && dnat) memcpy(dnat, dnats, sizeof(dnat_arg) * dnat_count);
+    if (out_localnet_count) *out_localnet_count = localnet_count;
+    if (out_dnat_count) *out_dnat_count = dnat_count;
+    if (out_remote_dns_subnet) *out_remote_dns_subnet = remote_dns_subnet;
+    pthread_mutex_unlock(&lc_proxy_chain_lock);
+}
+
+enum dns_lookup_flavor lcproxy_control_get_resolver(void) {
+    pthread_mutex_lock(&lc_proxy_chain_lock);
+    enum dns_lookup_flavor resolver = proxychains_resolver;
+    pthread_mutex_unlock(&lc_proxy_chain_lock);
+    return resolver;
 }
 
 int lcproxy_stats_is_cellular(void) {
@@ -407,24 +519,28 @@ static pthread_mutex_t lc_direct_lock = PTHREAD_MUTEX_INITIALIZER;
 static int lc_direct_is_local_addr(const struct sockaddr *addr, unsigned short port) {
     if (!addr) return 0;
     int family = addr->sa_family;
+    localaddr_arg localnet[MAX_LOCALNET];
+    size_t localnet_count = 0;
+    lcproxy_control_copy_route_rules(localnet, MAX_LOCALNET, &localnet_count,
+                                     NULL, 0, NULL, NULL);
     size_t i;
-    for (i = 0; i < num_localnet_addr; i++) {
-        if (localnet_addr[i].port && localnet_addr[i].port != port)
+    for (i = 0; i < localnet_count; i++) {
+        if (localnet[i].port && localnet[i].port != port)
             continue;
-        if (localnet_addr[i].family != family)
+        if (localnet[i].family != family)
             continue;
         if (family == AF_INET) {
             const struct sockaddr_in *sin = (const struct sockaddr_in *)addr;
-            if (((sin->sin_addr.s_addr ^ localnet_addr[i].in_addr.s_addr) &
-                 localnet_addr[i].in_mask.s_addr) == 0)
+            if (((sin->sin_addr.s_addr ^ localnet[i].in_addr.s_addr) &
+                 localnet[i].in_mask.s_addr) == 0)
                 return 1;
         } else if (family == AF_INET6) {
             const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)addr;
-            size_t prefix_bytes = localnet_addr[i].in6_prefix / CHAR_BIT;
-            size_t prefix_bits = localnet_addr[i].in6_prefix % CHAR_BIT;
-            if (prefix_bytes && memcmp(&sin6->sin6_addr, &localnet_addr[i].in6_addr, prefix_bytes) != 0)
+            size_t prefix_bytes = localnet[i].in6_prefix / CHAR_BIT;
+            size_t prefix_bits = localnet[i].in6_prefix % CHAR_BIT;
+            if (prefix_bytes && memcmp(&sin6->sin6_addr, &localnet[i].in6_addr, prefix_bytes) != 0)
                 continue;
-            if (prefix_bits && (sin6->sin6_addr.s6_addr[prefix_bytes] ^ localnet_addr[i].in6_addr.s6_addr[prefix_bytes]) >> (CHAR_BIT - prefix_bits))
+            if (prefix_bits && (sin6->sin6_addr.s6_addr[prefix_bytes] ^ localnet[i].in6_addr.s6_addr[prefix_bytes]) >> (CHAR_BIT - prefix_bits))
                 continue;
             return 1;
         }
@@ -480,6 +596,41 @@ static void lc_direct_track_remove(int fd) {
     pthread_mutex_unlock(&lc_direct_lock);
 }
 
+static int lc_direct_track_contains(int fd) {
+    int found = 0;
+    pthread_mutex_lock(&lc_direct_lock);
+    for (int i = 0; i < lc_direct_fd_count; i++) {
+        if (lc_direct_fds[i] == fd) {
+            found = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&lc_direct_lock);
+    return found;
+}
+
+static void lc_direct_track_copy(int source, int duplicate) {
+    if (source < 0 || duplicate < 0 || source == duplicate) return;
+    pthread_mutex_lock(&lc_direct_lock);
+    int source_is_direct = 0;
+    for (int i = 0; i < lc_direct_fd_count; i++) {
+        if (lc_direct_fds[i] == source) {
+            source_is_direct = 1;
+            break;
+        }
+    }
+    for (int i = 0; i < lc_direct_fd_count; i++) {
+        if (lc_direct_fds[i] == duplicate) {
+            lc_direct_fds[i] = lc_direct_fds[lc_direct_fd_count - 1];
+            lc_direct_fd_count--;
+            break;
+        }
+    }
+    if (source_is_direct && lc_direct_fd_count < LC_DIRECT_FD_MAX)
+        lc_direct_fds[lc_direct_fd_count++] = duplicate;
+    pthread_mutex_unlock(&lc_direct_lock);
+}
+
 static void lc_direct_track_remove_range(unsigned first, unsigned last) {
     pthread_mutex_lock(&lc_direct_lock);
     int out = 0;
@@ -499,7 +650,9 @@ static void lc_direct_track_close_all(void) {
     int i;
     for (i = 0; i < lc_direct_fd_count; i++) {
         int fd = lc_direct_fds[i];
-        if (fd >= 0 && fcntl(fd, F_GETFD) != -1) {
+        if (fd >= 0) {
+            /* shutdown invalidates every duplicated descriptor of this socket. */
+            shutdown(fd, SHUT_RDWR);
             true_close(fd);
         }
     }
@@ -736,6 +889,16 @@ static void get_chain_data(proxy_data * pd, unsigned int *proxy_count, chain_typ
 	tcp_read_time_out = 4 * 1000;
 	tcp_connect_time_out = 10 * 1000;
 	*ct = DYNAMIC_TYPE;
+	proxychains_max_chain = 1;
+	proxychains_quiet_mode = 0;
+	__atomic_store_n(&proxychains_block_non_tcp, 0, __ATOMIC_RELEASE);
+	proxychains_resolver = DNSLF_LIBC;
+	remote_dns_subnet = 224;
+	num_localnet_addr = 0;
+	num_dnats = 0;
+	memset(localnet_addr, 0, sizeof(localnet_addr));
+	memset(dnats, 0, sizeof(dnats));
+	memset(pd, 0, sizeof(proxy_data) * MAX_CHAIN);
 
 	env = get_config_path(getenv(PROXYCHAINS_CONF_FILE_ENV_VAR), buf, sizeof(buf));
 	if(!env || (file = fopen(env, "r")) == NULL) {
@@ -1004,6 +1167,7 @@ inv_host:
 	}
 	*proxy_count = count;
 	proxychains_got_chain_data = 1;
+	lcproxy_control_set_config_valid(1);
 	PDEBUG("proxy_dns: %s\n", rdns_resolver_string(proxychains_resolver));
 	return;
 
@@ -1013,6 +1177,7 @@ no_proxy:
 	*proxy_count = 0;
 	proxychains_got_chain_data = 1;
 	proxychains_resolver = DNSLF_LIBC;
+	lcproxy_control_set_config_valid(0);
 	proxychains_write_log(LOG_PREFIX "no usable proxy config, proxychains disabled\n");
 }
 
@@ -1023,7 +1188,8 @@ void lcproxy_control_reload_config(void) {
 	proxychains_proxy_count = 0;
 	get_chain_data(proxychains_pd, &proxychains_proxy_count, &proxychains_ct);
 	lcproxy_control_apply_proxy_override(proxychains_pd, proxychains_proxy_count);
-	int close_old_direct = (!lc_proxy_disabled && old_proxy_count == 0 && proxychains_proxy_count > 0);
+	rdns_init(proxychains_resolver);
+	int close_old_direct = (!__atomic_load_n(&lc_proxy_disabled, __ATOMIC_ACQUIRE) && old_proxy_count == 0 && proxychains_proxy_count > 0);
 	unsigned int new_count = proxychains_proxy_count;
 	pthread_mutex_unlock(&lc_proxy_chain_lock);
 	// If a direct-mode config (no proxy list) is replaced by a proxy config
@@ -1046,7 +1212,7 @@ void lcproxy_control_reload_config(void) {
 static int lc_drop_non_tcp_if_enabled(int fd) {
 	int socktype = 0;
 	socklen_t optlen = sizeof(socktype);
-	if(!proxychains_block_non_tcp)
+	if(!__atomic_load_n(&proxychains_block_non_tcp, __ATOMIC_ACQUIRE))
 		return 0;
 	if(getsockopt(fd, SOL_SOCKET, SO_TYPE, &socktype, &optlen) != 0)
 		return 0;
@@ -1061,7 +1227,7 @@ HOOKFUNC(int, close, int fd) {
 	lc_direct_track_remove(fd);
 	lc_fd_class_set(fd, LC_FD_CLASS_UNKNOWN);
 	if(!init_l) {
-		if(close_fds_cnt>=(sizeof close_fds/sizeof close_fds[0])) goto err;
+		if((size_t)close_fds_cnt >= (sizeof close_fds / sizeof close_fds[0])) goto err;
 		close_fds[close_fds_cnt++] = fd;
 		errno = 0;
 		return 0;
@@ -1094,16 +1260,24 @@ static void intsort(int *a, int n) {
 
 /* Warning: Linux manual says the third arg is `unsigned int`, but unistd.h says `int`. */
 HOOKFUNC(int, close_range, unsigned first, unsigned last, int flags) {
-	// close_range 可能批量关闭 fd；为避免 fd 复用时命中陈旧分类，整体清空缓存。
+	// CLOSE_RANGE_CLOEXEC preserves descriptors, so their kill-switch records
+	// must survive until a later real close.
+#ifdef CLOSE_RANGE_CLOEXEC
+	if (!(flags & CLOSE_RANGE_CLOEXEC)) {
+		lc_direct_track_remove_range(first, last);
+		memset(lc_fd_class, 0, sizeof(lc_fd_class));
+	}
+#else
 	lc_direct_track_remove_range(first, last);
 	memset(lc_fd_class, 0, sizeof(lc_fd_class));
+#endif
 	if(true_close_range == NULL) {
 		fprintf(stderr, "Calling close_range, but this platform does not provide this system call. ");
 		return -1;
 	}
 	if(!init_l) {
 		/* push back to cache, and delay the execution. */
-		if(close_range_buffer_cnt >= (sizeof close_range_buffer / sizeof close_range_buffer[0])) {
+		if((size_t)close_range_buffer_cnt >= (sizeof close_range_buffer / sizeof close_range_buffer[0])) {
 			errno = ENOMEM;
 			return -1;
 		}
@@ -1124,18 +1298,21 @@ HOOKFUNC(int, close_range, unsigned first, unsigned last, int flags) {
 	 * [first, cut1-1] , [cut1+1, cut2-1] , [cut2+1, cut3-1]
 	 * Finally, we delete the remaining sub-range, outside the loop. [cut3+1, tail]
 	 */
-	int next_fd_to_close = first;
+	unsigned next_fd_to_close = first;
 	for(i = 0; i < 4; ++i) {
-		if(protected_fds[i] < first || protected_fds[i] > last)
+		if(protected_fds[i] < 0 || (unsigned)protected_fds[i] < first ||
+		   (unsigned)protected_fds[i] > last)
 			continue;
-		int prev = (i == 0 || protected_fds[i-1] < first) ? first : protected_fds[i-1]+1;
-		if(prev != protected_fds[i]) {
-			if(-1 == true_close_range(prev, protected_fds[i]-1, flags)) {
+		unsigned prev = (i == 0 || protected_fds[i - 1] < 0 ||
+		                 (unsigned)protected_fds[i - 1] < first) ?
+		                first : (unsigned)protected_fds[i - 1] + 1;
+		if(prev != (unsigned)protected_fds[i]) {
+			if(-1 == true_close_range(prev, (unsigned)protected_fds[i] - 1, flags)) {
 				res = -1;
 				uerrno = errno;
 			}
 		}
-		next_fd_to_close = protected_fds[i]+1;
+		next_fd_to_close = (unsigned)protected_fds[i] + 1;
 	}
 	if(next_fd_to_close <= last) {
 		if(-1 == true_close_range(next_fd_to_close, last, flags)) {
@@ -1147,6 +1324,87 @@ HOOKFUNC(int, close_range, unsigned first, unsigned last, int flags) {
 	return res;
 }
 
+static void lc_fd_class_copy(int source, int duplicate) {
+	if (source != duplicate)
+		lc_fd_class_set(duplicate, lc_fd_class_get(source));
+}
+
+static void lc_track_duplicated_fd(int source, int duplicate) {
+	if (duplicate < 0) return;
+	lc_direct_track_copy(source, duplicate);
+	lc_fd_class_copy(source, duplicate);
+}
+
+HOOKFUNC(int, dup, int source) {
+	INIT();
+	int duplicate = true_dup(source);
+	lc_track_duplicated_fd(source, duplicate);
+	return duplicate;
+}
+
+HOOKFUNC(int, dup2, int source, int duplicate) {
+	INIT();
+	int result = true_dup2(source, duplicate);
+	lc_track_duplicated_fd(source, result);
+	return result;
+}
+
+#if defined(__linux__)
+HOOKFUNC(int, dup3, int source, int duplicate, int flags) {
+	INIT();
+	int result = true_dup3(source, duplicate, flags);
+	lc_track_duplicated_fd(source, result);
+	return result;
+}
+#endif
+
+static int lc_fcntl_is_noarg_command(int command) {
+	switch (command) {
+	case F_GETFD:
+	case F_GETFL:
+#ifdef F_GETOWN
+	case F_GETOWN:
+#endif
+#ifdef F_GETSIG
+	case F_GETSIG:
+#endif
+#ifdef F_GETLEASE
+	case F_GETLEASE:
+#endif
+#ifdef F_GETPIPE_SZ
+	case F_GETPIPE_SZ:
+#endif
+		return 1;
+	default:
+		return 0;
+	}
+}
+
+static int lc_fcntl_is_duplicate_command(int command) {
+	if (command == F_DUPFD) return 1;
+#ifdef F_DUPFD_CLOEXEC
+	if (command == F_DUPFD_CLOEXEC) return 1;
+#endif
+	return 0;
+}
+
+HOOKFUNC(int, fcntl, int fd, int command, ...) {
+	INIT();
+	if (lc_fcntl_is_noarg_command(command))
+		return true_fcntl(fd, command);
+
+	va_list args;
+	va_start(args, command);
+	/* Darwin and Linux pass fcntl's scalar and pointer third arguments in the
+	 * same ABI slot; preserving the raw word lets the real libc interpret it. */
+	uintptr_t arg = va_arg(args, uintptr_t);
+	va_end(args);
+	int result = true_fcntl(fd, command, arg);
+	if (lc_fcntl_is_duplicate_command(command))
+		lc_track_duplicated_fd(fd, result);
+	return result;
+}
+
 HOOKFUNC(int, connect, int sock, const struct sockaddr *addr, unsigned int len) {
 	INIT();
 	PFUNC();
@@ -1154,9 +1412,25 @@ HOOKFUNC(int, connect, int sock, const struct sockaddr *addr, unsigned int len) 
 
 	if(lc_bypass_get())
 		return true_connect(sock, addr, len);
-	if(!lcproxy_control_get_proxy_count() || lc_proxy_disabled) {
+	if(!addr || len < sizeof(sa_family_t)) {
+		errno = EINVAL;
+		return -1;
+	}
+	if(__atomic_load_n(&lc_proxy_disabled, __ATOMIC_ACQUIRE) &&
+	   lc_direct_admission_begin()) {
 		lc_direct_track_add_if_remote(sock, addr, len);
-		return true_connect(sock, addr, len);
+		int direct_ret = true_connect(sock, addr, len);
+		lc_direct_admission_end();
+		return direct_ret;
+	}
+	// A missing or invalid managed config is never permission to leak traffic.
+	// LCProxyConfig reloads after it creates/migrates the config; until then,
+	// fail closed unless the user explicitly selected direct/disabled mode above.
+	lc_proxy_config_snapshot config;
+	lcproxy_control_copy_config_snapshot(&config);
+	if(!config.config_valid || config.chain_count == 0) {
+		errno = ECONNREFUSED;
+		return -1;
 	}
 	int socktype = 0, flags = 0, ret = 0;
 	socklen_t optlen = 0;
@@ -1203,18 +1477,18 @@ HOOKFUNC(int, connect, int sock, const struct sockaddr *addr, unsigned int len) 
 	PDEBUG("port: %d\n", port);
 
 	// check if connect called from proxydns
-        remote_dns_connect = !v6 && (ntohl(p_addr_in->s_addr) >> 24 == remote_dns_subnet);
+        remote_dns_connect = !v6 && (ntohl(p_addr_in->s_addr) >> 24 == config.remote_dns_subnet);
 
 	// more specific first
-	if (!v6) for(i = 0; i < num_dnats && !remote_dns_connect && !dnat; i++)
-		if(dnats[i].orig_dst.s_addr == p_addr_in->s_addr)
-			if(dnats[i].orig_port && (dnats[i].orig_port == port))
-				dnat = &dnats[i];
+	if (!v6) for(i = 0; i < config.dnat_count && !remote_dns_connect && !dnat; i++)
+		if(config.dnat[i].orig_dst.s_addr == p_addr_in->s_addr)
+			if(config.dnat[i].orig_port && (config.dnat[i].orig_port == port))
+				dnat = &config.dnat[i];
 
-	if (!v6) for(i = 0; i < num_dnats && !remote_dns_connect && !dnat; i++)
-		if(dnats[i].orig_dst.s_addr == p_addr_in->s_addr)
-			if(!dnats[i].orig_port)
-				dnat = &dnats[i];
+	if (!v6) for(i = 0; i < config.dnat_count && !remote_dns_connect && !dnat; i++)
+		if(config.dnat[i].orig_dst.s_addr == p_addr_in->s_addr)
+			if(!config.dnat[i].orig_port)
+				dnat = &config.dnat[i];
 
 	if (dnat) {
 		p_addr_in = &dnat->new_dst;
@@ -1222,20 +1496,20 @@ HOOKFUNC(int, connect, int sock, const struct sockaddr *addr, unsigned int len) 
 			port = dnat->new_port;
 	}
 
-	for(i = 0; i < num_localnet_addr && !remote_dns_connect; i++) {
-		if (localnet_addr[i].port && localnet_addr[i].port != port)
+	for(i = 0; i < config.localnet_count && !remote_dns_connect; i++) {
+		if (config.localnet[i].port && config.localnet[i].port != port)
 			continue;
-		if (localnet_addr[i].family != (v6 ? AF_INET6 : AF_INET))
+		if (config.localnet[i].family != (v6 ? AF_INET6 : AF_INET))
 			continue;
 		if (v6) {
-			size_t prefix_bytes = localnet_addr[i].in6_prefix / CHAR_BIT;
-			size_t prefix_bits = localnet_addr[i].in6_prefix % CHAR_BIT;
-			if (prefix_bytes && memcmp(p_addr_in6->s6_addr, localnet_addr[i].in6_addr.s6_addr, prefix_bytes) != 0)
+			size_t prefix_bytes = config.localnet[i].in6_prefix / CHAR_BIT;
+			size_t prefix_bits = config.localnet[i].in6_prefix % CHAR_BIT;
+			if (prefix_bytes && memcmp(p_addr_in6->s6_addr, config.localnet[i].in6_addr.s6_addr, prefix_bytes) != 0)
 				continue;
-			if (prefix_bits && (p_addr_in6->s6_addr[prefix_bytes] ^ localnet_addr[i].in6_addr.s6_addr[prefix_bytes]) >> (CHAR_BIT - prefix_bits))
+			if (prefix_bits && (p_addr_in6->s6_addr[prefix_bytes] ^ config.localnet[i].in6_addr.s6_addr[prefix_bytes]) >> (CHAR_BIT - prefix_bits))
 				continue;
 		} else {
-			if((p_addr_in->s_addr ^ localnet_addr[i].in_addr.s_addr) & localnet_addr[i].in_mask.s_addr)
+			if((p_addr_in->s_addr ^ config.localnet[i].in_addr.s_addr) & config.localnet[i].in_mask.s_addr)
 				continue;
 		}
 		PDEBUG("accessing localnet using true_connect\n");
@@ -1249,18 +1523,6 @@ HOOKFUNC(int, connect, int sock, const struct sockaddr *addr, unsigned int len) 
 
 	memcpy(dest_ip.addr.v6, v6 ? (void*)p_addr_in6 : (void*)p_addr_in, v6?16:4);
 
-	// Snapshot the active chain so a concurrent config reload (which mutates
-	// proxychains_pd/proxychains_proxy_count in place) cannot race with this
-	// connect. The snapshot stays valid for the whole proxied connect call.
-	proxy_data chain_pd[LC_CONNECT_CHAIN_SNAPSHOT_MAX];
-	unsigned int chain_count = 0;
-	chain_type chain_ct = STRICT_TYPE;
-	lcproxy_control_copy_proxy_chain(chain_pd, LC_CONNECT_CHAIN_SNAPSHOT_MAX, &chain_count, &chain_ct);
-	if (chain_count == 0) {
-		lc_direct_track_add_if_remote(sock, addr, len);
-		return true_connect(sock, addr, len);
-	}
-
 	if((flags & O_NONBLOCK) && lcproxy_async_connect_start(sock, dest_ip, port, flags) == 0) {
 		lc_fd_class_set(sock, LC_FD_CLASS_NOCOUNT);
 		errno = EINPROGRESS;
@@ -1268,13 +1530,14 @@ HOOKFUNC(int, connect, int sock, const struct sockaddr *addr, unsigned int len) 
 	}
 
 	if(flags & O_NONBLOCK)
-		fcntl(sock, F_SETFL, !O_NONBLOCK);
+		fcntl(sock, F_SETFL, flags & ~O_NONBLOCK);
 
 	lc_bypass_set(1);
 	ret = connect_proxy_chain(sock,
 				  dest_ip,
 				  htons(port),
-				  chain_pd, chain_count, chain_ct, proxychains_max_chain);
+				  config.chain, config.chain_count, config.chain_type,
+				  config.max_chain);
 	lc_bypass_set(0);
 
 	fcntl(sock, F_SETFL, flags);
@@ -1305,14 +1568,34 @@ HOOKFUNC(int, connectx, int sock, const sa_endpoints_t *endpoints,
 	(void)connid;
 	if(lc_bypass_get())
 		return true_connectx(sock, endpoints, associd, flags, ext, extlen, pcid, connid);
-	if(!lcproxy_control_get_proxy_count() || !endpoints || !endpoints->sae_dstaddr ||
+	if(__atomic_load_n(&lc_proxy_disabled, __ATOMIC_ACQUIRE) &&
+	   lc_direct_admission_begin()) {
+		if (endpoints)
+			lc_direct_track_add_if_remote(sock, endpoints->sae_dstaddr, endpoints->sae_dstaddrlen);
+		int direct_ret = true_connectx(sock, endpoints, associd, flags, ext, extlen, pcid, connid);
+		lc_direct_admission_end();
+		return direct_ret;
+	}
+	if(lc_proxy_config_missing()) {
+		errno = ECONNREFUSED;
+		return -1;
+	}
+	// NSURLSession may use connectx with extensions for its explicit local HTTP
+	// proxy connection. Loopback cannot leak Internet traffic, so preserve the
+	// localnet behavior before rejecting unsupported external extensions.
+	if(endpoints && lc_sockaddr_is_loopback(endpoints->sae_dstaddr, endpoints->sae_dstaddrlen))
+		return true_connectx(sock, endpoints, associd, flags, ext, extlen, pcid, connid);
+	if(!endpoints || !endpoints->sae_dstaddr ||
 	   endpoints->sae_dstaddrlen < sizeof(struct sockaddr) || flags != 0 ||
 	   ext != NULL || extlen != 0 || pcid != NULL || connid != NULL) {
-		PDEBUG("connectx bypassed: proxy_count=%u endpoints=%p dst=%p flags=%u ext=%p extlen=%u pcid=%p connid=%p\n",
+		// connectx extensions cannot be represented by the connect() proxy path.
+		// Reject them while proxying instead of silently opening a direct socket.
+		PDEBUG("connectx rejected: proxy_count=%u endpoints=%p dst=%p flags=%u ext=%p extlen=%u pcid=%p connid=%p\n",
 		       (unsigned int)lcproxy_control_get_proxy_count(), (void*)endpoints,
 		       endpoints ? (void*)endpoints->sae_dstaddr : 0,
 		       flags, (void*)ext, extlen, (void*)pcid, (void*)connid);
-		return true_connectx(sock, endpoints, associd, flags, ext, extlen, pcid, connid);
+		errno = EOPNOTSUPP;
+		return -1;
 	}
 	PDEBUG("connectx proxying via pxcng_connect\n");
 	return pxcng_connect(sock, endpoints->sae_dstaddr, endpoints->sae_dstaddrlen);
@@ -1332,6 +1615,8 @@ HOOKFUNC(struct hostent*, gethostbyname, const char *name) {
 
 	if(lc_bypass_get())
 		return true_gethostbyname(name);
+	if(lc_proxy_config_missing())
+		return NULL;
 
 	if(proxychains_resolver == DNSLF_FORKEXEC)
 		return proxy_gethostbyname_old(name);
@@ -1349,6 +1634,8 @@ HOOKFUNC(int, getaddrinfo, const char *node, const char *service, const struct a
 
 	if(lc_bypass_get())
 		return true_getaddrinfo(node, service, hints, res);
+	if(lc_proxy_config_missing())
+		return EAI_FAIL;
 
 	if(proxychains_resolver != DNSLF_LIBC)
 		return proxy_getaddrinfo(node, service, hints, res);
@@ -1380,6 +1667,8 @@ HOOKFUNC(int, getnameinfo, const struct sockaddr *sa, socklen_t salen,
 
 	if(lc_bypass_get())
 		return true_getnameinfo(sa, salen, host, hostlen, serv, servlen, flags);
+	if(lc_proxy_config_missing())
+		return EAI_FAIL;
 
 	if(proxychains_resolver == DNSLF_LIBC) {
 		return true_getnameinfo(sa, salen, host, hostlen, serv, servlen, flags);
@@ -1406,12 +1695,14 @@ HOOKFUNC(int, getnameinfo, const struct sockaddr *sa, socklen_t salen,
 				return EAI_OVERFLOW;
 			if(scopeid) {
 				size_t l = strlen(host);
-				if(snprintf(host+l, hostlen-l, "%%%u", scopeid) >= hostlen-l)
+				int n = snprintf(host + l, hostlen - l, "%%%u", scopeid);
+				if(n < 0 || (size_t)n >= hostlen - l)
 					return EAI_OVERFLOW;
 			}
 		}
 		if(servlen) {
-			if(snprintf(serv, servlen, "%d", ntohs(SOCKPORT(*sa))) >= servlen)
+			int n = snprintf(serv, servlen, "%d", ntohs(SOCKPORT(*sa)));
+			if(n < 0 || (socklen_t)n >= servlen)
 				return EAI_OVERFLOW;
 		}
 	}
@@ -1430,6 +1721,8 @@ HOOKFUNC(struct hostent*, gethostbyaddr, const void *addr, socklen_t len, int ty
 
 	if(lc_bypass_get())
 		return true_gethostbyaddr(addr, len, type);
+	if(lc_proxy_config_missing())
+		return NULL;
 
 	if(proxychains_resolver == DNSLF_LIBC)
 		return true_gethostbyaddr(addr, len, type);
@@ -1461,6 +1754,10 @@ HOOKFUNC(ssize_t, sendto, int sockfd, const void *buf, size_t len, int flags,
 	       const struct sockaddr *dest_addr, socklen_t addrlen) {
 	INIT();
 	PFUNC();
+	if(!lc_bypass_get() && lc_proxy_config_missing()) {
+		errno = ECONNREFUSED;
+		return -1;
+	}
 	if(lc_drop_non_tcp_if_enabled(sockfd))
 		return -1;
 	if (flags & MSG_FASTOPEN) {
@@ -1480,6 +1777,10 @@ HOOKFUNC(ssize_t, sendto, int sockfd, const void *buf, size_t len, int flags,
 HOOKFUNC(ssize_t, sendmsg, int sockfd, const struct msghdr *msg, int flags) {
 	INIT();
 	PFUNC();
+	if(!lc_bypass_get() && lc_proxy_config_missing()) {
+		errno = ECONNREFUSED;
+		return -1;
+	}
 	if(lc_drop_non_tcp_if_enabled(sockfd))
 		return -1;
 	ssize_t lc_ret = true_sendmsg(sockfd, msg, flags);
@@ -1504,6 +1805,11 @@ static ssize_t lc_real_read(int fd, void *buf, size_t len) {
 HOOKFUNC(ssize_t, send, int sockfd, const void *buf, size_t len, int flags) {
 	INIT();
 	PFUNC();
+	if(!lc_bypass_get() && !lcproxy_control_get_config_valid() &&
+	   lc_direct_track_contains(sockfd)) {
+		errno = ECONNREFUSED;
+		return -1;
+	}
 	if(lc_drop_non_tcp_if_enabled(sockfd))
 		return -1;
 	ssize_t lc_ret = true_send(sockfd, buf, len, flags);
@@ -1517,6 +1823,11 @@ HOOKFUNC(ssize_t, write, int fd, const void *buf, size_t len) {
 		return lc_real_write(fd, buf, len);
 	INIT();
 	PFUNC();
+	if(!lc_bypass_get() && !lcproxy_control_get_config_valid() &&
+	   lc_direct_track_contains(fd)) {
+		errno = ECONNREFUSED;
+		return -1;
+	}
 	ssize_t lc_ret = lc_real_write(fd, buf, len);
 	if(lc_ret > 0 && lc_should_count_fd(fd))
 		lcproxy_stats_add_upload((uint64_t)lc_ret);
@@ -1594,6 +1905,12 @@ static void setup_hooks(void) {
 #endif
 	SETUP_SYM(close);
 	SETUP_SYM_OPTIONAL(close_range);
+	SETUP_SYM(dup);
+	SETUP_SYM(dup2);
+	SETUP_SYM(fcntl);
+#if defined(__linux__)
+	SETUP_SYM_OPTIONAL(dup3);
+#endif
 }
 
 #ifdef MONTEREY_HOOKING
@@ -1615,6 +1932,9 @@ static void setup_runtime_hooks(void) {
 		{"gethostbyaddr", (void*)pxcng_gethostbyaddr, (void**)&true_gethostbyaddr},
 		{"getnameinfo", (void*)pxcng_getnameinfo, (void**)&true_getnameinfo},
 		{"close", (void*)pxcng_close, (void**)&true_close},
+		{"dup", (void*)pxcng_dup, (void**)&true_dup},
+		{"dup2", (void*)pxcng_dup2, (void**)&true_dup2},
+		{"fcntl", (void*)pxcng_fcntl, (void**)&true_fcntl},
 	};
 	if(rebind_symbols(rebindings, sizeof(rebindings)/sizeof(rebindings[0])) != 0)
 		proxychains_write_log(LOG_PREFIX "fishhook rebind_symbols failed\n");
@@ -1649,5 +1969,8 @@ DYLD_HOOK(freeaddrinfo);
 DYLD_HOOK(gethostbyaddr);
 DYLD_HOOK(getnameinfo);
 DYLD_HOOK(close);
+DYLD_HOOK(dup);
+DYLD_HOOK(dup2);
+DYLD_HOOK(fcntl);
 
 #endif

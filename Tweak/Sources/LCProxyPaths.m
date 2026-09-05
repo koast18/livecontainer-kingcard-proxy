@@ -69,26 +69,31 @@ NSString *LCProxyDylibPath(void) {
 
 NSString * _Nullable LCProxySharedDataDirectory(void) {
     Class cls = NSClassFromString(@"LCSharedUtils");
-    if (!cls) return nil;
-    NSString *groupID = ((NSString *(*)(id, SEL))objc_msgSend)(cls, sel_registerName("appGroupID"));
+    SEL selector = sel_registerName("appGroupID");
+    if (!cls || ![cls respondsToSelector:selector]) return nil;
+    NSString *groupID = ((NSString *(*)(id, SEL))objc_msgSend)(cls, selector);
     if (![groupID isKindOfClass:[NSString class]] || groupID.length == 0) return nil;
     NSURL *groupURL = [[NSFileManager defaultManager] containerURLForSecurityApplicationGroupIdentifier:groupID];
     if (!groupURL) return nil;
     return [[groupURL URLByAppendingPathComponent:@"LiveContainer/LCProxy"] path];
 }
 
+NSString *LCProxyCanonicalDataDirectory(void) {
+    NSString *shared = LCProxySharedDataDirectory();
+    return shared.length ? shared : LCProxyDataDirectory();
+}
+
 NSArray<NSString *> *LCProxyAllDataDirectories(void) {
     NSMutableArray<NSString *> *dirs = [NSMutableArray array];
-    NSString *primary = LCProxyDataDirectory();
+    NSString *primary = LCProxyCanonicalDataDirectory();
     if (primary.length) [dirs addObject:primary];
+    NSString *dylibLocal = LCProxyDataDirectory();
+    if (dylibLocal.length && ![dirs containsObject:dylibLocal]) [dirs addObject:dylibLocal];
     NSString *shared = LCProxySharedDataDirectory();
     if (shared.length && ![dirs containsObject:shared]) [dirs addObject:shared];
     NSString *launchPrivate = LCProxyLaunchPrivateDataDirectory();
     if (launchPrivate.length && ![dirs containsObject:launchPrivate]) [dirs addObject:launchPrivate];
-    // 王卡状态锁按本列表顺序锁全部目录。不同进程的 primary 不同（私有 App
-    // 是 LC 私有目录、共享 App 是 AppGroup 目录），若按 primary 优先的插入
-    // 顺序返回，私有进程会以 [LC私有, AppGroup] 抢锁、共享进程以
-    // [AppGroup, LC私有] 抢锁 —— 顺序相反，可能互等成环。这里按路径排序，
-    // 所有进程看到的全局锁序一致。
+    // Legacy copies are only migration fallbacks, but keep their iteration
+    // order deterministic for callers that inspect them concurrently.
     return [dirs sortedArrayUsingSelector:@selector(compare:)];
 }

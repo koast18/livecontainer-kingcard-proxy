@@ -1,4 +1,5 @@
 #include <sys/socket.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -6,7 +7,7 @@
 #include "allocator_thread.h"
 #include "remotedns.h"
 
-#ifndef HAVE_SOCK_CLOEXEC
+#ifndef SOCK_CLOEXEC
 #define SOCK_CLOEXEC 0
 #endif
 
@@ -57,16 +58,9 @@ const char *rdns_resolver_string(enum dns_lookup_flavor flavor) {
 }
 
 void rdns_init(enum dns_lookup_flavor flavor) {
-	static int init_done = 0;
-	if(!init_done) switch(flavor) {
-		case DNSLF_RDNS_THREAD:
-			at_init();
-			break;
-		case DNSLF_RDNS_DAEMON:
-		default:
-			break;
-	}
-	init_done = 1;
+	static pthread_once_t thread_init_once = PTHREAD_ONCE_INIT;
+	if(flavor == DNSLF_RDNS_THREAD)
+		pthread_once(&thread_init_once, at_init);
 }
 
 void rdns_set_daemon(struct sockaddr_in* addr) {
