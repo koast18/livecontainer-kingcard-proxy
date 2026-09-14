@@ -276,6 +276,15 @@ int kp_debug_enabled(void);
 /// 取近期诊断（环形缓冲，最近 8 条，换行分隔；API 失败时回传给前端）
 void kp_debug_recent(char *out, size_t cap);
 
+// ---------- 按连接流量日志（省空间，用于分析运营商计费/免流边界） ----------
+/// 设置按连接流量日志文件路径（NULL/空串 = 关闭并关闭文件）。
+/// 每完成一个 TCP 连接写一行、制表符分隔；文件超过滚动上限时重命名为 <path>.1。
+void kp_traffic_log_set_path(const char *path);
+
+/// 开关按连接流量日志（默认关闭，由宿主设置启用）。
+void kp_traffic_log_set_enabled(int enabled);
+int  kp_traffic_log_enabled(void);
+
 #ifdef __cplusplus
 }
 #endif

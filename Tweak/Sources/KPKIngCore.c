@@ -98,6 +98,101 @@ void kp_dbg(const char *fmt, ...) {
     pthread_mutex_unlock(&g_kp_dbg_lock);
 }
 
+// ---------- 按连接流量日志 ----------
+// 目的：以最小空间记录“每个 TCP 连接”的收发字节与路由，用于分析运营商
+// 计费/免流边界。每连接仅一行（制表符分隔），不做逐包日志；文件超过上限时
+// 滚动为 <path>.1，总占用约 2 × KP_TRAFFIC_LOG_ROTATE_BYTES。
+#define KP_TRAFFIC_LOG_ROTATE_BYTES (1024 * 1024)
+
+static pthread_mutex_t g_kp_traffic_lock = PTHREAD_MUTEX_INITIALIZER;
+static FILE *g_kp_traffic_fp = NULL;
+static char g_kp_traffic_path[1024];
+static long long g_kp_traffic_size = 0;
+static volatile int g_kp_traffic_enabled = 0;
+
+static const char *const kp_traffic_header =
+    "# ts\thost\tport\tproto\troute\tup\tdown\tstatus\tproxy\tms\n";
+
+void kp_traffic_log_set_path(const char *path) {
+    pthread_mutex_lock(&g_kp_traffic_lock);
+    if (g_kp_traffic_fp) {
+        fclose(g_kp_traffic_fp);
+        g_kp_traffic_fp = NULL;
+    }
+    g_kp_traffic_path[0] = '\0';
+    g_kp_traffic_size = 0;
+    if (path && path[0]) {
+        snprintf(g_kp_traffic_path, sizeof(g_kp_traffic_path), "%s", path);
+    }
+    pthread_mutex_unlock(&g_kp_traffic_lock);
+}
+
+void kp_traffic_log_set_enabled(int enabled) {
+    g_kp_traffic_enabled = enabled ? 1 : 0;
+}
+
+int kp_traffic_log_enabled(void) {
+    return g_kp_traffic_enabled;
+}
+
+static long long kp_now_ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (long long)tv.tv_sec * 1000 + (long long)(tv.tv_usec / 1000);
+}
+
+static void kp_traffic_log_open_locked(void) {
+    if (g_kp_traffic_fp || g_kp_traffic_path[0] == '\0') return;
+    g_kp_traffic_fp = fopen(g_kp_traffic_path, "a");
+    if (!g_kp_traffic_fp) return;
+    fseek(g_kp_traffic_fp, 0, SEEK_END);
+    long sz = ftell(g_kp_traffic_fp);
+    g_kp_traffic_size = sz > 0 ? (long long)sz : 0;
+    if (g_kp_traffic_size == 0) {
+        fputs(kp_traffic_header, g_kp_traffic_fp);
+        g_kp_traffic_size = (long long)strlen(kp_traffic_header);
+    }
+}
+
+static void kp_traffic_log_rotate_locked(void) {
+    if (g_kp_traffic_fp) {
+        fclose(g_kp_traffic_fp);
+        g_kp_traffic_fp = NULL;
+    }
+    char bak[1060];
+    snprintf(bak, sizeof(bak), "%s.1", g_kp_traffic_path);
+    remove(bak);
+    rename(g_kp_traffic_path, bak);
+    g_kp_traffic_size = 0;
+    kp_traffic_log_open_locked();
+}
+
+// route: queen=经过王卡上游（应计免流），direct=直连兜底（应计通用流量），
+//        error=未建立。up/down 为实际发往/收自上游（或目标）的字节数。
+static void kp_traffic_log(const char *host, int port, const char *proto,
+                           const char *route, uint64_t up, uint64_t down,
+                           int status, const char *proxy, long long ms) {
+    if (!g_kp_traffic_enabled) return;
+    pthread_mutex_lock(&g_kp_traffic_lock);
+    kp_traffic_log_open_locked();
+    if (g_kp_traffic_fp && g_kp_traffic_size > KP_TRAFFIC_LOG_ROTATE_BYTES) {
+        kp_traffic_log_rotate_locked();
+    }
+    if (g_kp_traffic_fp) {
+        int n = fprintf(g_kp_traffic_fp,
+                        "%lld\t%s\t%d\t%s\t%s\t%llu\t%llu\t%d\t%s\t%lld\n",
+                        (long long)time(NULL),
+                        (host && host[0]) ? host : "-", port,
+                        proto ? proto : "-", route ? route : "-",
+                        (unsigned long long)up, (unsigned long long)down,
+                        status, (proxy && proxy[0]) ? proxy : "-",
+                        ms < 0 ? 0 : ms);
+        if (n > 0) g_kp_traffic_size += n;
+        fflush(g_kp_traffic_fp);
+    }
+    pthread_mutex_unlock(&g_kp_traffic_lock);
+}
+
 #if defined(__APPLE__) || defined(__unix__)
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -1472,9 +1567,10 @@ static void kp_relay_upstream_to_client(int up, int client, uint64_t *up_recv) {
 }
 
 // 隧道内转发重建请求并泵响应（单向、带空闲上限）
-static void kp_http_forward(int up, int client, const char *req, size_t reqlen) {
+static void kp_http_forward(int up, int client, const char *req, size_t reqlen,
+                            uint64_t *up_recv) {
     if (kp_send_all(up, req, reqlen) != 0) return;
-    kp_relay_upstream_to_client(up, client, NULL);
+    kp_relay_upstream_to_client(up, client, up_recv);
 }
 
 // 单线程双向泵：用 poll 同时监听两个方向，避免每条 CONNECT 隧道创建 2 个线程。
@@ -1841,6 +1937,7 @@ static void kp_handle_client(kp_forwarder *fw, int client) {
     char reqbuf[4096];
     kp_reader reader;
     kp_reader_init(&reader, client);
+    long long t0 = kp_now_ms();
 
     size_t header_len = 0;
     if (kp_reader_read_header(&reader, reqbuf, sizeof(reqbuf), &header_len) != 0) {
@@ -1880,7 +1977,7 @@ static void kp_handle_client(kp_forwarder *fw, int client) {
             if (rn <= 0) { kp_send_simple_response(client, 400, "Bad Request"); KP_CLOSESOCK(client); return; }
             int up = kp_up_open(fw, host, port, 8000);
             if (up < 0) { kp_send_simple_response(client, 502, "Bad Gateway"); KP_CLOSESOCK(client); return; }
-            kp_http_forward(up, client, rebuilt, (size_t)rn);
+            kp_http_forward(up, client, rebuilt, (size_t)rn, NULL);
             kp_upstream_close(fw, &up);
             KP_CLOSESOCK(client);
             return;
@@ -1948,7 +2045,10 @@ static void kp_handle_client(kp_forwarder *fw, int client) {
                     KP_CLOSESOCK(client);
                     return;
                 }
-                kp_http_forward(dup, client, rebuilt, (size_t)rn);
+                uint64_t direct_recv = 0;
+                kp_http_forward(dup, client, rebuilt, (size_t)rn, &direct_recv);
+                kp_traffic_log(host, port, "http", "direct",
+                               (uint64_t)rn, direct_recv, code, "-", kp_now_ms() - t0);
                 kp_upstream_close(fw, &dup);
                 KP_CLOSESOCK(client);
                 return;
@@ -1961,6 +2061,12 @@ static void kp_handle_client(kp_forwarder *fw, int client) {
                 }
                 kp_dbg("[fw] HTTP conn done host=%s:%d client_bytes=%zu up_sent=%zu up_recv=%llu",
                        host, port, off, (size_t)qn, (unsigned long long)up_recv);
+                {
+                    char proxy_ep[160];
+                    snprintf(proxy_ep, sizeof(proxy_ep), "%s:%d", proxy_host, proxy_port);
+                    kp_traffic_log(host, port, "http", "queen",
+                                   (uint64_t)qn, up_recv, code, proxy_ep, kp_now_ms() - t0);
+                }
                 kp_upstream_close(fw, &up);
                 KP_CLOSESOCK(client);
                 return;
@@ -2078,12 +2184,16 @@ https_retry:
                 KP_CLOSESOCK(client);
                 return;
             }
-            if (kp_reader_send_available(&reader, dup, NULL) != 0) {
+            uint64_t direct_up = 0;
+            uint64_t direct_down = 0;
+            if (kp_reader_send_available(&reader, dup, &direct_up) != 0) {
                 kp_upstream_close(fw, &dup);
                 KP_CLOSESOCK(client);
                 return;
             }
-            kp_pipe_bidirectional_counted(dup, client, NULL, NULL);
+            kp_pipe_bidirectional_counted(dup, client, &direct_down, &direct_up);
+            kp_traffic_log(host, port, "connect", "direct",
+                           direct_up, direct_down, code, "-", kp_now_ms() - t0);
             kp_upstream_close(fw, &dup);
             KP_CLOSESOCK(client);
             return;
@@ -2123,6 +2233,13 @@ https_retry:
             kp_pipe_bidirectional_counted(up, client, &up_to_client, &client_to_up);
             kp_dbg("[fw] CONNECT conn done host=%s:%d client_to_up=%llu up_to_client=%llu",
                    host, port, (unsigned long long)client_to_up, (unsigned long long)up_to_client);
+            {
+                char proxy_ep[160];
+                snprintf(proxy_ep, sizeof(proxy_ep), "%s:%d", proxy_host, proxy_port);
+                kp_traffic_log(host, port, "connect", "queen",
+                               (uint64_t)cn + client_to_up, up_to_client, code, proxy_ep,
+                               kp_now_ms() - t0);
+            }
             // 隧道已建立但客户端发了数据后上游一个字节都没回就关闭，常见于：
             // Q-Token 已失效/代理节点异常导致 TLS handshake 被对端直接终止。
             // 这里主动触发一次强制刷新，让后续连接有机会用新凭证恢复。

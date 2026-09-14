@@ -102,6 +102,36 @@ https://raw.githubusercontent.com/koast18/livecontainer-kingcard-proxy/master/Al
 - 每个进程把自身统计写入 `<LC Documents>/LCProxy/stats/<bundle>.json`，控制台汇总。
 - 精确度足够日常查看；系统私有网络栈/WKWebView 子进程等无法 100% 覆盖，与 ios-proxy-dylib 的代理覆盖范围一致。
 
+### 按连接请求流量日志（分析计费/免流边界）
+
+聚合统计只能看到总量，无法回答“哪些请求被运营商算钱”。为此王卡转发器额外写一份**按连接**的紧凑日志：
+
+- 位置：`<LC Documents>/LCProxy/traffic.log`（控制台“关于”里也会显示完整路径）。
+- 开关：控制台“请求流量日志”，默认开启；每次完成一个 TCP 连接写一行。
+- 省空间：每连接仅一行、制表符分隔，不做逐包记录；文件超过 1 MiB 滚动为 `traffic.log.1`，总占用约 2 MiB。
+- 字段：`ts  host  port  proto  route  up  down  status  proxy  ms`
+  - `route=queen`：走王卡上游代理（应计入专属/免流）。
+  - `route=direct`：王卡节点返回 822/824 时的**直连兜底**（应计入通用/收费流量），`host` 即被计费域名。
+  - `up`/`down`：实际发往/收自上游（或直连目标）的字节数，即真正走蜂窝的流量。
+  - `status`：王卡上游返回码（HTTP 为最终响应码，CONNECT 为隧道码）。
+  - `proxy`：本次使用的上游节点（直连兜底为 `-`）。
+
+用 `route=direct` 的行按 `host` 汇总 `up+down`，即可定位“被运营商计费”的域名；`route=queen` 的汇总则对应免流部分。
+
+仓库提供一个分析脚本：
+
+```bash
+python3 Scripts/analyze_traffic_log.py <LC Documents>/LCProxy/traffic.log
+# 或指定路由 / 起始时间 / TopN
+python3 Scripts/analyze_traffic_log.py --route direct --top 50 traffic.log traffic.log.1
+```
+
+脚本会输出按路由汇总、按域名的 Top 排行，以及 `route=direct`（计费嫌疑）域名清单。
+
+> 注意：`connect` 行是一条 TCP 隧道（HTTPS keep-alive 下可能承载多个请求），无法拆分到单个 HTTP 请求；`http` 行则是单个 HTTP 请求。
+
+> 覆盖范围：仅王卡转发器内的连接。其它路径（proxychains 直连、DNS、未拦截的 UDP/QUIC、取号请求）不在此文件内。
+
 ## License
 
 GPLv2（proxychains-ng 与派生代码），GCDWebServer 为 Apache-2.0。

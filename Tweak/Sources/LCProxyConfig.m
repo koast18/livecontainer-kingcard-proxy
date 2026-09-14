@@ -92,6 +92,7 @@ static nw_path_monitor_t g_networkMonitor;
         @"proxyEnabled": @YES,
         @"blockNonTcp": @NO,
         @"debugLogging": @NO,
+        @"trafficLogging": @YES,
         @"showProxyBanner": @YES,
         @"proxyMode": @"custom",
         @"proxyType": @"http",
@@ -444,8 +445,21 @@ static nw_path_monitor_t g_networkMonitor;
                                  [effectiveMode isEqualToString:@"kingcard"]);
     kp_set_debug_enabled([s[@"debugLogging"] boolValue] ? 1 : 0);
 
+    // 按连接流量日志：默认开启，文件有滚动上限（约 2 MiB）。路径固定在本 App
+    // 数据目录，开启时才会真正创建/追加。
+    BOOL trafficLogging = [s[@"trafficLogging"] boolValue];
+    kp_traffic_log_set_enabled(trafficLogging ? 1 : 0);
+    if (trafficLogging) {
+        NSString *dir = [self dataDirectory];
+        [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                                  withIntermediateDirectories:YES attributes:nil error:nil];
+        NSString *trafficPath = [dir stringByAppendingPathComponent:@"traffic.log"];
+        kp_traffic_log_set_path([trafficPath fileSystemRepresentation]);
+    } else {
+        kp_traffic_log_set_path(NULL);
+    }
+
     // Always regenerate the canonical conf. In auto-direct mode the on-disk conf
-    // must match the effective mode before reload, otherwise a Wi-Fi -> cellular
     // transition can leave proxy_count at zero while proxychains is enabled.
     NSString *configPath = self.proxychainsConfPath;
     BOOL configPathChanged = !self.lastAppliedConfigPath ||

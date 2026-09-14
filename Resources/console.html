@@ -52,6 +52,9 @@ th:first-child,td:first-child { text-align:left; }
     <div class="row"><span class="k">调试日志</span>
       <label class="switch"><input type="checkbox" id="debugLogging"><span class="slider"></span></label>
     </div>
+    <div class="row"><span class="k">请求流量日志（按连接，滚动 2 MiB）</span>
+      <label class="switch"><input type="checkbox" id="trafficLogging"><span class="slider"></span></label>
+    </div>
     <div class="row"><span class="k">启动显示代理加载横幅</span>
       <label class="switch"><input type="checkbox" id="showProxyBanner"><span class="slider"></span></label>
     </div>
@@ -130,6 +133,7 @@ th:first-child,td:first-child { text-align:left; }
     <div class="row"><span class="k">版本</span><span class="v" id="version">…</span></div>
     <div class="row"><span class="k">数据目录</span><span class="v" id="dataDir">…</span></div>
     <div class="row"><span class="k">代理配置</span><span class="v" id="confPath">…</span></div>
+    <div class="row"><span class="k">请求流量日志</span><span class="v" id="trafficLogPath">…</span></div>
     <div class="row"><span class="k">配置存在</span><span class="v" id="confExists">…</span></div>
     <div class="row"><span class="k">核心代理数</span><span class="v" id="proxyCount">…</span></div>
     <div class="row"><span class="k">控制端口</span><span class="v" id="port">…</span></div>
@@ -186,6 +190,7 @@ async function loadStatus() {
   $('version').textContent = s.version || '—';
   $('dataDir').textContent = s.dataDirectory || '—';
   $('confPath').textContent = s.proxychainsConfPath || '—';
+  $('trafficLogPath').textContent = s.trafficLogPath || '—';
   $('confExists').textContent = s.proxychainsConfExists ? '是' : '否';
   $('proxyCount').textContent = s.proxyCount != null ? String(s.proxyCount) : '—';
   $('port').textContent = s.serverPort || '—';
@@ -193,6 +198,7 @@ async function loadStatus() {
   $('proxyEnabled').checked = !!s.proxyEnabled;
   $('blockNonTcp').checked = !!s.blockNonTcp;
   $('debugLogging').checked = !!s.debugLogging;
+  $('trafficLogging').checked = s.trafficLogging != null ? !!s.trafficLogging : true;
   $('showProxyBanner').checked = s.showProxyBanner != null ? !!s.showProxyBanner : true;
   $('proxyMode').value = s.proxyMode || 'custom';
   $('proxyType').value = s.proxyType || 'http';
@@ -226,7 +232,7 @@ async function loadStats() {
   $('buckets').innerHTML = rows || '<tr><td colspan=3 style="text-align:center;color:#8b949e">暂无数据</td></tr>';
 }
 $('proxyMode').onchange = () => { markDirty(); syncModeUI(); };
-['proxyEnabled','blockNonTcp','debugLogging','showProxyBanner','kingAutoDirectOnNonCellular'].forEach(id => { $(id).addEventListener('change', markDirty); });
+['proxyEnabled','blockNonTcp','debugLogging','trafficLogging','showProxyBanner','kingAutoDirectOnNonCellular'].forEach(id => { $(id).addEventListener('change', markDirty); });
 ['proxyType','proxyHost','proxyPort','kingPhone','kingQType','kingMccmnc','kingApn','kingTypeName','kingSubtype','kingExtraInfo','kingCardType'].forEach(id => { $(id).addEventListener('input', markDirty); });
 function fmtLogTime(ts) {
   const d = new Date(ts*1000);
@@ -275,6 +281,7 @@ $('saveConfig').onclick = async () => {
     proxyEnabled: $('proxyEnabled').checked,
     blockNonTcp: $('blockNonTcp').checked,
     debugLogging: $('debugLogging').checked,
+    trafficLogging: $('trafficLogging').checked,
     showProxyBanner: $('showProxyBanner').checked,
     proxyMode: $('proxyMode').value,
     proxyType: $('proxyType').value.trim() || 'http',
