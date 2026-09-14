@@ -12,9 +12,11 @@ NS_ASSUME_NONNULL_BEGIN
                                 os:(NSString *)osRelease
                                 api:(NSInteger)api;
 
-+ (void)fetchGuidFromServerWithQua2:(NSString *)qua2
-                            timeout:(NSTimeInterval)timeout
-                         completion:(void (^)(NSString * _Nullable guid, NSError * _Nullable error))completion;
++ (NSURLSessionDataTask *)fetchGuidFromServerWithQua2:(NSString *)qua2
+                                 throughLocalProxyPort:(int)localProxyPort
+                               bootstrapProxyPassword:(NSString *)bootstrapProxyPassword
+                                              timeout:(NSTimeInterval)timeout
+                                           completion:(void (^)(NSString * _Nullable guid, NSError * _Nullable error))completion;
 
 /// 返回 @{@"token":..., @"qkey":..., @"expire_seconds":..., @"mode":..., @"url":...}
 + (void)fetchTokenWithGuid:(NSString *)guid

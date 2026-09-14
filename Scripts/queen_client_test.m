@@ -21,7 +21,11 @@ int main(int argc, char *argv[]) {
         NSString *qua2 = [LCProxyKingClient generateQua2WithModel:@"" width:1080 height:1920 os:@"10" api:33];
         NSLog(@"[test] qua2=%@", qua2);
 
-        [LCProxyKingClient fetchGuidFromServerWithQua2:qua2 timeout:20 completion:^(NSString * _Nullable g, NSError * _Nullable e) {
+        [LCProxyKingClient fetchGuidFromServerWithQua2:qua2
+                                 throughLocalProxyPort:18080
+                               bootstrapProxyPassword:@"queen-client-test"
+                                              timeout:20
+                                           completion:^(NSString * _Nullable g, NSError * _Nullable e) {
             if (!g) {
                 errorText = [NSString stringWithFormat:@"guid failed: %@", e.localizedDescription ?: @"unknown"];
                 NSLog(@"[test] guid error: %@", errorText);

@@ -31,7 +31,9 @@ GENH = src/version.h
 CFLAGS  += -Wall -O0 -g -std=c99 -D_GNU_SOURCE -pipe
 NO_AS_NEEDED = -Wl,--no-as-needed
 LDFLAGS = -fPIC $(NO_AS_NEEDED) $(LIBDL) $(PTHREAD)
-INC     = 
+# LiveContainer adds fishhook-based runtime rebinding and shared proxy-control
+# headers to libproxychains.c.
+INC     = -I../../fishhook -I../../src
 PIC     = -fPIC
 AR      = $(CROSS_COMPILE)ar
 RANLIB  = $(CROSS_COMPILE)ranlib

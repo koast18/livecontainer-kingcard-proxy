@@ -100,6 +100,13 @@ static const NSUInteger LCProxyDefaultPort = 19092;
     d[@"proxychainsConfExists"] = @([[NSFileManager defaultManager] fileExistsAtPath:[[LCProxyConfig shared] proxychainsConfPath]]);
     d[@"settingsPath"] = [[LCProxyConfig shared] settingsPath];
     d[@"settingsExists"] = @([[NSFileManager defaultManager] fileExistsAtPath:[[LCProxyConfig shared] settingsPath]]);
+    d[@"home"] = NSHomeDirectory();
+    const char *lcHome = getenv("LC_HOME_PATH");
+    d[@"lcHomePath"] = lcHome ? @(lcHome) : @"";
+    d[@"guestDataDirectory"] = LCProxyGuestDataDirectory() ?: @"";
+    d[@"sharedDataDirectory"] = LCProxySharedDataDirectory() ?: @"";
+    d[@"canonicalDataDirectory"] = LCProxyCanonicalDataDirectory();
+    d[@"dataDirectories"] = LCProxyAllDataDirectories();
     d[@"king"] = [[LCProxyKing shared] status];
     NSDictionary *runtimeDiag = [[LCProxyConfig shared] runtimeDiagnostics];
     if ([runtimeDiag isKindOfClass:[NSDictionary class]]) {

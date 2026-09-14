@@ -15,6 +15,10 @@ extern const char *proxy_type_strmap[];
 extern const char *chain_type_strmap[];
 extern const char *proxy_state_strmap[];
 
+/* The Objective-C runtime chooses the App Group canonical configuration.
+ * Once set, a missing path deliberately remains fail-closed rather than
+ * falling back to a launch-private copy. */
+int lcproxy_control_set_config_path(const char *path);
 char *get_config_path(char* default_path, char* pbuf, size_t bufsize);
 void pc_stringfromipv4(unsigned char *ip_buf_4_bytes, char *outbuf_16_bytes);
 int pc_isnumericipv4(const char* ipstring);

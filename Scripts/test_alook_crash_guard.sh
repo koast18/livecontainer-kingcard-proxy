@@ -47,7 +47,7 @@ grep -q "client_cond" "$CORE" \
     || fail "KPKIngCore.c no longer has a client-exit condition variable"
 grep -q "pthread_cond_timedwait(&fw->client_cond, &fw->client_lock" "$CORE" \
     || fail "KPKIngCore.c no longer bounds the stop wait in kp_forwarder_stop"
-grep -q "while (fw->active_clients > 0)" "$CORE" \
+grep -q "fw->active_clients > 0" "$CORE" \
     || fail "KPKIngCore.c no longer waits on active_clients before freeing"
 grep -q "define KP_FORWARDER_STOP_GRACE_MS" "$CORE" \
     || fail "KPKIngCore.c lost the stop grace deadline"

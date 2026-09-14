@@ -6,6 +6,7 @@
 //
 #include "KPKQueenCore.h"
 #include "KPSocketHook.h"
+#include "lcproxy_bridge.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -28,8 +29,12 @@ static int kpq_connect_host(const char *host, int port, int timeout_ms) {
     hints.ai_socktype = SOCK_STREAM;
     char portstr[16];
     snprintf(portstr, sizeof(portstr), "%d", port);
+    // Control-plane WUP requests must reach Tencent directly even while the
+    // local KingCard forwarder is still bootstrapping; otherwise the proxychains
+    // hook sends them into the empty forwarder and credential refresh can never
+    // complete.
     kp_socket_set_bypass(1);
-    if (getaddrinfo(host, portstr, &hints, &res) != 0) {
+    if (lcproxy_direct_getaddrinfo(host, portstr, &hints, &res) != 0) {
         kp_socket_set_bypass(0);
         return -1;
     }
@@ -42,7 +47,7 @@ static int kpq_connect_host(const char *host, int port, int timeout_ms) {
         // 超时不受 timeout_ms 控制，遇到不可达代理/IP 可能卡到系统 TCP 超时。
         int fl = fcntl(fd, F_GETFL, 0);
         fcntl(fd, F_SETFL, fl | O_NONBLOCK);
-        int rc = connect(fd, ai->ai_addr, ai->ai_addrlen);
+        int rc = lcproxy_direct_connect(fd, ai->ai_addr, ai->ai_addrlen);
         if (rc != 0 && errno == EINPROGRESS) {
             struct pollfd pfd;
             pfd.fd = fd;
@@ -78,7 +83,7 @@ static int kpq_connect_host(const char *host, int port, int timeout_ms) {
         }
         break;
     }
-    freeaddrinfo(res);
+    lcproxy_direct_freeaddrinfo(res);
     kp_socket_set_bypass(0);
     return fd;
 }

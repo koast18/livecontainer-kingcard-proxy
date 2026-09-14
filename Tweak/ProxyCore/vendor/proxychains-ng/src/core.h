@@ -22,6 +22,8 @@
 #include <sys/uio.h>
 #include <netdb.h>
 
+struct addrinfo;
+
 #ifndef __CORE_HEADER
 #define __CORE_HEADER
 
@@ -37,14 +39,21 @@
 #define GN_FLAGS_T int
 #endif
 
-/* Linux/macOS test-host compatibility: Darwin defines these socket-extension
- * types in <sys/socket.h>; non-Apple hosts only need the names for the
- * connectx_t function pointer typedef. */
+/* Darwin defines these socket-extension types in <sys/socket.h>. Keep an
+ * ABI-shaped host definition so the complete connectx hook is syntax-checked
+ * off Apple rather than hiding member-access errors behind an opaque type. */
 #ifndef __APPLE__
-typedef unsigned int sae_associd_t;
-typedef unsigned int sae_connid_t;
-struct sa_endpoints;
-typedef struct sa_endpoints sa_endpoints_t;
+typedef uint32_t sae_associd_t;
+typedef uint32_t sae_connid_t;
+typedef struct sa_endpoints {
+	unsigned int sae_srcif;
+	struct sockaddr *sae_srcaddr;
+	socklen_t sae_srcaddrlen;
+	struct sockaddr *sae_dstaddr;
+	socklen_t sae_dstaddrlen;
+} sa_endpoints_t;
+int connectx(int, const sa_endpoints_t *, sae_associd_t, unsigned int,
+             const struct iovec *, unsigned int, size_t *, sae_connid_t *);
 #endif
 #define     MAX_LOCALNET 64
 #define     MAX_DNAT 64

@@ -45,11 +45,13 @@ void lcproxy_socket_set_bypass(int on) {
 
 void lcproxy_control_copy_proxy_chain(proxy_data *dst, unsigned int dst_cap,
                                       unsigned int *out_count,
-                                      chain_type *out_chain_type) {
+                                      chain_type *out_chain_type,
+                                      unsigned int *out_max_chain) {
     unsigned int n = proxychains_proxy_count < dst_cap ? proxychains_proxy_count : dst_cap;
     if (dst && n > 0) memcpy(dst, proxychains_pd, sizeof(proxy_data) * n);
     if (out_count) *out_count = n;
     if (out_chain_type) *out_chain_type = proxychains_ct;
+    if (out_max_chain) *out_max_chain = proxychains_max_chain;
 }
 
 /* Stub connect_proxy_chain(): instead of a real HTTP proxy it either connects
