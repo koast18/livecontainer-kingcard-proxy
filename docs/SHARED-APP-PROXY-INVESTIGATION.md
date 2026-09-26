@@ -39,6 +39,18 @@
 | 0.5.51 | **无自愈**：`applyConfig` 重建分支先 `stopRefreshTimer`；若重建失败/被丢弃，进程既无转发器也无定时器/事件再触发 apply | `LCProxyKing.m refreshCredentialsWithForce:` 加看门狗 | override 永久指向死端口 → 「彻底断网且永不恢复」，只能切后台/重启 |
 | 0.5.53 | **WebKit 可能永远停在占位端口**：`livecontainer_reload_webkit_proxy()` 挂在 `needsRuntimeReload` 上 | `LCProxyConfig.m applyRuntimeSnapshot` | 首次应用若 canonical conf 写入失败（`configReady == NO`），reload 永不发生 → **原生 socket 正常但 `WKWebView` 网页全挂**（浏览器类 App 的几乎全部流量） |
 
+| 0.5.54 | **同步退役转发器把 runtime apply 卡死 20 秒**（实测确认的根因）：重建分支先 `self.forwarder = NULL` 摘除旧的，再**同步** `kp_forwarder_stop` + `kp_forwarder_free`（stop 等待 client 线程，而它们可能正卡在同步取号网络等待里；grace 上限 10s，free 内部还会再 stop 一轮）| `LCProxyKing.m applyConfig` | ① `self.forwarder` 已是 NULL → `forwarderPort=0` / `running=false`；② 旧监听 fd 已关闭但 ObjC 层上次发布的 override 仍指向它 → **所有连接被拒**；③ 期间任何新 apply（看门狗每 5s、前台恢复、NWPath）全部堵在 `lifecycleLock` 上排队 → **彻底无法联网且永不恢复**。实测形态：`forwarderPort=0` / `proxyOverridePort=<旧端口>` / `desiredForwarderRunning=true` / `forwarderDiscardCount=0` / `lastForwarderLifecycle=""`（因为信号发生在埋点之前）|
+
+### 0.5.54 的修法
+
+重建顺序倒过来，并把退役移出 apply 路径：
+
+1. **先**在锁外创建并启动新转发器；
+2. **再**在同一临界区内原子替换（`old = self.forwarder; self.forwarder = new;`）——`shouldRun` 期间 `self.forwarder` **永不为 NULL**；
+3. **最后**把旧实例交给专用串行队列（`forwarderReaperQueue`）异步回收。
+
+回收队列**不再获取 `lifecycleLock`**：退役实例已从 `self.forwarder` 摘除，只操作局部指针，与在建的新实例互不相干；若在这里重新拿 `lifecycleLock`，就会把最长 20s 的等待重新转嫁到 apply 路径上，等于没修。
+
 ### 0.5.52 是一次错误改动（已完整撤回）
 
 0.5.52 曾把「给 `defaultDataStore` 装代理配置」延后到主队列，理由是避免指向占位端口 18080。
@@ -57,6 +69,7 @@
 4. **追加式日志不加锁**：`kingcard-credentials.log` / `kingcard-refresh.log` / `dylib-loads.log` 用 `O_APPEND` 行级追加，跨进程安全；读取方取「最新且仍有效」的一条，损坏行跳过；任何 IO 失败静默忽略（纯诊断，绝不能影响转发）。
 5. **KingCard 强制 `block_non_tcp`**：转发器只承载 TCP，必须始终丢弃 UDP/QUIC。
 6. `.github/workflows/` 的构建门禁：`build_ios.sh` 会从 `version.txt` 重新生成 `Tweak/Sources/Version.h`，改版本只需改 `version.txt`。
+7. **绝不在 runtime apply 路径上同步销毁转发器。** `kp_forwarder_stop` 要等 client 线程退出（它们可能阻塞在同步取号 hook 的网络等待里，单次最长 15s；grace 上限 10s），`kp_forwarder_free` 内部还会再 stop 一轮 —— 合计最长 20s。重建必须"先启动新的、再原子替换、最后异步回收"，退役回收不得重新获取 `lifecycleLock`。`Scripts/test_king_cache_logic.sh` 有对应断言守护。
 
 ---
 

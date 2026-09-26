@@ -184,6 +184,36 @@ assert '[self isRunning]' in refresh and 'requestRuntimeApplyAsync' in refresh, 
 assert 'scheduleRefreshRetryAfter:5.0' in refresh, \
     'watchdog does not schedule a bounded retry after requesting a rebuild'
 
+# 转发器退役必须异步，且重建必须先启动新的再替换旧的。
+# kp_forwarder_stop 要等 client 线程退出（它们可能卡在同步取号 hook 的网络等待里，
+# 单次最长 15s；grace 上限 10s），kp_forwarder_free 内部还会再 stop 一轮 —— 在
+# runtime apply 路径上同步 stop/free 一个**正在运行**的转发器会把 apply 卡住最长
+# 20s：期间 self.forwarder 已是 NULL、旧监听 fd 已关闭，而 ObjC 层上次发布的
+# override 仍指向旧端口（所有连接被拒），后续 apply 还全部堵在 lifecycleLock 上排队。
+# 实测形态正是 forwarderPort=0 / running=false / proxyOverridePort=<旧端口> /
+# desiredForwarderRunning=true / forwarderDiscardCount=0 / lastForwarderLifecycle=""。
+apply_start = king.index('- (void)applyConfig:(NSDictionary *)settings effectiveMode:')
+# 只取 applyConfig 自身的方法体（到紧随其后的 retireForwarder: 定义之前），
+# 否则会把异步回收方法里的 kp_forwarder_stop 误算进来。
+apply_cfg = king[apply_start:king.index('// 异步回收退役的转发器', apply_start)]
+assert 'kp_forwarder_stop(' not in apply_cfg, \
+    'applyConfig still synchronously stops a running forwarder (up to 20s block on the apply path)'
+assert 'dispatch_async(self.forwarderReaperQueue' in king, \
+    'forwarder retirement is not asynchronous'
+assert king.count('[self retireForwarder:') >= 2, \
+    'not all forwarder retirement paths are asynchronous'
+_reaper = king[king.index('- (void)retireForwarder:(kp_forwarder *)fw {'):]
+_reaper = _reaper[:_reaper.index('\n}\n') + 3]
+assert 'lifecycleLock' not in _reaper, \
+    'retirement re-acquires lifecycleLock, which would re-block the runtime apply path'
+assert 'kp_forwarder_start(newForwarder)' in apply_cfg, \
+    'the replacement forwarder is not started before the old one is retired'
+_rebuild = apply_cfg[apply_cfg.index('kp_forwarder_start(newForwarder)'):]
+assert '[self retireForwarder:' in _rebuild, \
+    'the old forwarder is not retired after the replacement is already running'
+assert 'self.forwarder = NULL' not in _rebuild, \
+    'self.forwarder is still nulled during a rebuild (stale-override outage window)'
+
 # Explicit credentials always override remote refreshes, including forced ones.
 assert '!guidOverride && (force || !guid)' in king, \
     'forced refresh can overwrite kingGuidOverride'

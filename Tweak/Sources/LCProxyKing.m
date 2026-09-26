@@ -51,6 +51,9 @@ NSString *const LCProxyForwarderLifecycleChangedNotification = @"LCProxyForwarde
 @interface LCProxyKing ()
 @property (nonatomic, strong) NSLock *lock;
 @property (nonatomic, strong) NSLock *lifecycleLock;
+// 退役转发器的异步回收队列（串行）。kp_forwarder_stop 可能等待最长 10s、
+// kp_forwarder_free 内部还会再等一轮，绝不能阻塞 runtime apply 路径。
+@property (nonatomic, strong) dispatch_queue_t forwarderReaperQueue;
 @property (nonatomic, assign) void *forwarderPtr;
 @property (nonatomic, strong) NSMutableDictionary *cachedCredentialState;
 @property (nonatomic, strong) NSLock *cacheLock;
@@ -82,6 +85,7 @@ NSString *const LCProxyForwarderLifecycleChangedNotification = @"LCProxyForwarde
 - (NSArray<NSString *> *)validatedProxyPool:(id)value;
 - (NSString *)credentialInputSignatureForSettings:(NSDictionary *)settings;
 - (void)clearForwarderKingState;
+- (void)retireForwarder:(kp_forwarder *)fw;
 - (NSString *)credentialLogPath;
 - (void)appendCredentialRecord:(NSDictionary *)record;
 - (NSMutableDictionary *)newestValidRecordFromLog;
@@ -107,6 +111,7 @@ NSString *const LCProxyForwarderLifecycleChangedNotification = @"LCProxyForwarde
     if (self) {
         _lock = [[NSLock alloc] init];
         _lifecycleLock = [[NSLock alloc] init];
+        _forwarderReaperQueue = dispatch_queue_create("com.liveproxy.king.forwarder-reaper", DISPATCH_QUEUE_SERIAL);
         _cacheLock = [[NSLock alloc] init];
         _refreshLog = [[NSMutableArray alloc] init];
         _lastHealthCheckOk = NO;
@@ -187,27 +192,32 @@ NSString *const LCProxyForwarderLifecycleChangedNotification = @"LCProxyForwarde
         self.lastSettingsSignature = nil;
         self.desiredForwarderRunning = NO;
         [self.lock unlock];
-        // 不要在持有 self.lock 时 stop/free：kp_forwarder_stop 会等待所有 client
-        // 线程退出，而 client 线程失败重试时可能正在等待 self.lock 做取号刷新，
-        // 持锁等待会形成死锁。
-        if (oldForwarder) {
-            kp_forwarder_stop(oldForwarder);
-            kp_forwarder_free(oldForwarder);
-        }
+        // 不能在持有 self.lock 时 stop/free（client 线程可能正等 self.lock 做取号），
+        // 更不能在需要及时返回的路径上同步 stop/free —— 见 retireForwarder:。
+        [self retireForwarder:oldForwarder];
         return;
     }
 
-    // shouldRun 但当前没有 running 的转发器：先摘除旧引用并释放锁，再安全 stop/free。
-    oldForwarder = self.forwarder;
-    self.forwarder = NULL;
-    self.lastSettingsSignature = signature;
+    // shouldRun 但当前没有 running 的转发器：重建。
+    //
+    // ★ 顺序至关重要：**先建好并启动新转发器，成功后再原子替换，最后异步回收旧的**。
+    //
+    // 旧实现是"先摘除旧引用（self.forwarder = NULL）→ 同步 stop/free 旧的 → 再建新的"，
+    // 而 kp_forwarder_stop 要等 client 线程退出：它们可能正卡在同步取号 hook 的网络
+    // 等待里（单次最长 15s），grace 上限 10s，随后的 kp_forwarder_free 内部还会再
+    // stop 一次 → 单次重建最长阻塞 20s。这段时间里：
+    //   · self.forwarder 已是 NULL（forwarderPort=0 / running=false）
+    //   · 旧转发器的监听 fd 已关闭，但 ObjC 层上次发布的 override 仍指向那个端口
+    //   · 任何新的 apply（看门狗每 5s、前台恢复、网络变化）都卡在 lifecycleLock 上排队
+    // 结果就是"彻底无法联网且永不恢复"，且 forwarderDiscardCount/lastError 都无从体现。
+    // 先启动新的再替换旧的可彻底消除该窗口：shouldRun 期间 self.forwarder 永不为 NULL，
+    // 且 apply 路径不再等待旧转发器的 client 线程。
+    // 先落定"应该运行"的意图与 settings 签名，再去锁外创建/启动新转发器。
+    // applyConfig 全程持有 lifecycleLock，因此这两者不可能被并发改写。
+    [self.lock lock];
     self.desiredForwarderRunning = YES;
+    self.lastSettingsSignature = signature;
     [self.lock unlock];
-
-    if (oldForwarder) {
-        kp_forwarder_stop(oldForwarder);
-        kp_forwarder_free(oldForwarder);
-    }
 
     newForwarder = kp_forwarder_new("127.0.0.1", 0, "", 0);
     if (!newForwarder) {
@@ -229,29 +239,37 @@ NSString *const LCProxyForwarderLifecycleChangedNotification = @"LCProxyForwarde
         return;
     }
 
+    // 原子替换：新转发器立即生效，旧引用在同一临界区内摘除，不存在 NULL 窗口。
     [self.lock lock];
-    // 创建/启动新转发器期间锁已释放，可能已有另一次 applyConfig 先装上了自己的
-    // 转发器——只有那种情况才允许丢弃本次成果。原先这里还要求 settings 签名
-    // 一致，但并发 applyConfig 会改写 lastSettingsSignature，导致“刚 start 成功的
-    // 转发器被 stop+free，self.forwarder 保持 NULL”，而 ObjC 层上次发布的
-    // override 仍指向旧端口：所有连接被拒、横幅照常显示王卡代理、且 lastError
-    // 为空（无任何报错），极难排查。设置略有出入是可接受的：下一次 applyConfig
-    // 会走 alreadyRunning 分支收敛签名并重新装载凭证。
-    if (self.forwarder == NULL && self.desiredForwarderRunning) {
-        self.forwarder = newForwarder;
-        [self.lock unlock];
-        [self loadCachedStateIntoForwarder];
-        return;
-    }
-
-    self.forwarderDiscardCount++;
+    oldForwarder = self.forwarder;
+    self.forwarder = newForwarder;
     [self.lock unlock];
-    kp_forwarder_stop(newForwarder);
-    kp_forwarder_free(newForwarder);
-    [self notifyForwarderLifecycle:@"rebuild-discarded"];
+
+    // 旧转发器交给专用串行队列回收，绝不阻塞 apply 路径。
+    [self retireForwarder:oldForwarder];
+    [self loadCachedStateIntoForwarder];
     } @finally {
         [self.lifecycleLock unlock];
     }
+}
+
+// 异步回收退役的转发器。kp_forwarder_stop 必须等待 client 线程退出（它们可能卡在
+// 同步取号 hook 的网络等待里，最长 15s；grace 上限 10s，kp_forwarder_free 内部还会
+// 再 stop 一轮），因此在任何需要及时返回的路径上同步调用都会把整个 runtime apply
+// 卡住：override 无法更新到新端口、后续 apply 在 lifecycleLock 上排队，表现为彻底
+// 断网且不恢复（实测即 forwarderPort=0 而 proxyOverridePort 仍指向已关闭的旧端口）。
+//
+// 回收放到专用串行队列，且**不再获取 lifecycleLock**：退役的实例已从 self.forwarder
+// 摘除，回收只操作这个局部指针，与在建的新实例互不相干；若在这里拿 lifecycleLock，
+// 就会把最长 20s 的等待重新转嫁到 apply 路径上，等于没修。串行队列本身已保证同一
+// 时刻只回收一个实例。
+- (void)retireForwarder:(kp_forwarder *)fw {
+    if (!fw) return;
+    dispatch_async(self.forwarderReaperQueue, ^{
+        kp_forwarder_stop(fw);
+        // stop 未完成时 kp_forwarder_free 会按契约故意泄漏（不 free），不会 UAF。
+        kp_forwarder_free(fw);
+    });
 }
 
 - (void)beginRoutePublication {
