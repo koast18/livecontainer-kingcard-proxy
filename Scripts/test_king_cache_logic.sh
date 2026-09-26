@@ -55,6 +55,8 @@ for gone in (
     assert gone not in king, f'arbitration machinery still present: {gone}'
 
 # The append-only credential log is the only cross-process artifact.
+assert 'NSString *const LCProxyForwarderLifecycleChangedNotification =' in king, \
+    'forwarder lifecycle notification has no definition (linker error)'
 assert 'kingcard-credentials.log' in king, 'missing append-only credential log path'
 assert 'O_WRONLY | O_APPEND | O_CREAT' in king, 'credential log writes are not append-only'
 assert 'appendCredentialRecord:' in king, 'missing append-only record writer'

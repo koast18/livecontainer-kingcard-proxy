@@ -46,6 +46,8 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
     return [s rangeOfCharacterFromSet:cs].location == NSNotFound;
 }
 
+NSString *const LCProxyForwarderLifecycleChangedNotification = @"LCProxyForwarderLifecycleChangedNotification";
+
 @interface LCProxyKing ()
 @property (nonatomic, strong) NSLock *lock;
 @property (nonatomic, strong) NSLock *lifecycleLock;
