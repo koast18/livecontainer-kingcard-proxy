@@ -304,7 +304,23 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
 }
 
 // 取号失败后的退避重试：只影响本进程的重试节奏，与任何其他进程无关。
-- (void)scheduleRefreshRetryAfter:- (void)startRefreshTimer {
+- (void)scheduleRefreshRetryAfter:(NSTimeInterval)delay {
+    [self.lock lock];
+    BOOL alreadyScheduled = self.lockRetryScheduled;
+    if (!alreadyScheduled) self.lockRetryScheduled = YES;
+    [self.lock unlock];
+    if (alreadyScheduled) return;
+    delay = MAX(1.0, MIN(delay, 30.0));
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
+                   dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        [self.lock lock];
+        self.lockRetryScheduled = NO;
+        [self.lock unlock];
+        [self refreshCredentials];
+    });
+}
+
+- (void)startRefreshTimer {
     [self stopRefreshTimer];
 
     NSTimeInterval interval = LCProxyKingRefreshInterval;
