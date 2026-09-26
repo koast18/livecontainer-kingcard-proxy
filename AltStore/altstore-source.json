@@ -7,20 +7,20 @@
       "name": "LiveProxy 控制台",
       "bundleIdentifier": "com.liveproxy.console",
       "developerName": "koast18",
-      "version": "0.5.56",
-      "versionDate": "2026-09-26T23:17:49Z",
+      "version": "0.5.57",
+      "versionDate": "2026-09-26T23:27:29Z",
       "versionDescription": "LiveProxy 控制台：LiveContainer 任意 App HTTP 代理开关、非 TCP 丢弃、10 分钟粒度蜂窝流量统计。首次打开自动下载 dylib。",
-      "downloadURL": "https://gh-proxy.com/https://github.com/koast18/livecontainer-kingcard-proxy/releases/download/v0.5.56/LiveProxyConsole-0.5.56.ipa",
+      "downloadURL": "https://gh-proxy.com/https://github.com/koast18/livecontainer-kingcard-proxy/releases/download/v0.5.57/LiveProxyConsole-0.5.57.ipa",
       "localizedDescription": "LiveContainer 内任意 App 走 HTTP 代理的控制台 IPA。依赖 LCProxyControl dylib（自动下载到 LiveContainer Tweaks 目录），支持代理开关、丢弃非 TCP、蜂窝网络上传/下载流量统计（10 分钟时段）。",
       "iconURL": "https://raw.githubusercontent.com/koast18/livecontainer-kingcard-proxy/master/AltStore/icon.png",
       "tintColor": "2E7D32",
-      "size": 19474,
+      "size": 19475,
       "versions": [
         {
-          "version": "0.5.56",
-          "date": "2026-09-26T23:17:49Z",
-          "downloadURL": "https://gh-proxy.com/https://github.com/koast18/livecontainer-kingcard-proxy/releases/download/v0.5.56/LiveProxyConsole-0.5.56.ipa",
-          "localizedDescription": "回退 0.5.54 引入的转发器重建顺序改动（该改动导致签名 dylib 后控制台一打开就黑屏），恢复到 0.5.53 的顺序；控制台与诊断功能恢复正常。"
+          "version": "0.5.57",
+          "date": "2026-09-26T23:27:29Z",
+          "downloadURL": "https://gh-proxy.com/https://github.com/koast18/livecontainer-kingcard-proxy/releases/download/v0.5.57/LiveProxyConsole-0.5.57.ipa",
+          "localizedDescription": "修复转发器 accept 循环无界阻塞导致 pthread_join 永久挂起、进而把整个 runtime apply 卡死的永久断网问题；含 0.5.54 黑屏问题的回退。"
         }
       ]
     }
