@@ -1251,6 +1251,19 @@ static void kp_stat_increment(uint64_t *value) {
 // 级返回；卡在取号 hook 网络等待的线程可能数十秒，超时后按僵尸泄漏而非死等。
 #define KP_FORWARDER_STOP_GRACE_MS 10000
 
+// accept 循环的有界等待上限。绝不能依赖 shutdown()/close() 唤醒阻塞在 accept() 上的
+// 线程：Darwin 上对监听 socket 调用 shutdown() 返回 ENOTCONN、close() 也不会唤醒
+// accept（这正是上游 comment 里"macOS 无副作用"的含义）。一旦没人唤醒，
+// kp_forwarder_stop 里的 pthread_join 就会**永久阻塞**，而它是在
+// LCProxyConfig.applyRuntimeSnapshot → applyConfig 持有 lifecycleLock 时被调用的：
+//   · self.forwarder 已被置 NULL → forwarderPort=0 / running=false
+//   · ObjC 层上次发布的 proxy override 永远停在旧端口 → 所有连接被拒
+//   · runtimeQueue 上后续的每一次 apply（看门狗每 5s、前台恢复、NWPath）全部堵死
+// 表现就是"彻底无法联网且永不恢复"，且诊断字段为空、lastError 被看门狗覆盖。
+// 改成 poll 有界等待后，accept 线程最多 KP_FORWARDER_ACCEPT_POLL_MS 就回到循环顶部
+// 检查 running，join 因此有界。
+#define KP_FORWARDER_ACCEPT_POLL_MS 500
+
 struct client_arg {
     kp_forwarder *fw;
     int fd;
@@ -2313,6 +2326,19 @@ static void *kp_forwarder_run(void *arg) {
         socklen_t plen = sizeof(peer);
         int listen_fd = kp_forwarder_listen_fd(fw);
         if (listen_fd < 0) break;
+        // 有界等待后再 accept，绝不无限期阻塞在 accept() 上：见
+        // KP_FORWARDER_ACCEPT_POLL_MS 的说明（Darwin 下 shutdown/close 不会唤醒
+        // accept，会让 kp_forwarder_stop 的 pthread_join 永久阻塞，进而把
+        // lifecycleLock 与整个 runtimeQueue 一起锁死 → 永久断网）。
+        struct pollfd pfd;
+        pfd.fd = listen_fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        int pr = poll(&pfd, 1, KP_FORWARDER_ACCEPT_POLL_MS);
+        if (pr <= 0) {
+            // 超时 / EINTR / 出错：回到循环顶部重新检查 running 与 listen_fd。
+            continue;
+        }
         int client = accept(listen_fd, (struct sockaddr *)&peer, &plen);
         if (client < 0) {
             if (!kp_forwarder_running(fw)) break;
@@ -2563,20 +2589,29 @@ int kp_forwarder_probe_local(kp_forwarder *fw, int timeout_ms) {
 // 的网络等待）。此时调用方绝不能 free（use-after-free），应把 fw 当僵尸泄漏。
 int kp_forwarder_stop(kp_forwarder *fw) {
     if (!fw) return 0;
+    int listen_fd_to_close = -1;
     if (__atomic_exchange_n(&fw->running, 0, __ATOMIC_ACQ_REL)) {
         int listen_fd = __atomic_exchange_n(&fw->listen_fd, -1, __ATOMIC_ACQ_REL);
         if (listen_fd >= 0) {
-            // shutdown 先唤醒阻塞的 accept（Linux 上 close 不唤醒；macOS 无副作用）
+            // 只 shutdown、不在这里 close：accept 线程可能正 poll/accept 在这个 fd 上，
+            // 关掉一个仍被其它线程引用的 fd 会踏进未定义行为。真正的 close 放到
+            // join 之后进行。shutdown 仍保留，用于唤醒可能卡在 accept 上的实现
+            // （Linux 有效；Darwin 无副作用，靠 accept 循环的 poll 超时兜底）。
             shutdown(listen_fd, SHUT_RDWR);
-            KP_CLOSESOCK(listen_fd);
+            listen_fd_to_close = listen_fd;
         }
     }
     // 先 join 主 accept 线程：确保 accept 循环完全停止，不会再登记新 client fd。
     // 否则 stop 遍历 client_fds 之后若有新连接被 accept 但尚未登记，其 fd 不会被
     // shutdown，对应 client 线程永不退出，stop 会死锁。
+    // join 的有界性由 accept 循环的 poll 超时保证（KP_FORWARDER_ACCEPT_POLL_MS）：
+    // 该循环最多 500ms 就回到顶部看到 running==0 或 listen_fd==-1 并退出。
     if (fw->thread) {
         pthread_join(fw->thread, NULL);
         fw->thread = 0;
+    }
+    if (listen_fd_to_close >= 0) {
+        KP_CLOSESOCK(listen_fd_to_close);
     }
 
     pthread_mutex_lock(&fw->client_lock);

@@ -42,6 +42,43 @@
 | 0.5.54 | **同步退役转发器把 runtime apply 卡死 20 秒**（数据形态高度吻合）：重建分支先 `self.forwarder = NULL` 摘除旧的，再**同步** `kp_forwarder_stop` + `kp_forwarder_free`（stop 等待 client 线程，而它们可能正卡在同步取号网络等待里；grace 上限 10s，free 内部还会再 stop 一轮）| `LCProxyKing.m applyConfig` | ① `self.forwarder` 已是 NULL → `forwarderPort=0` / `running=false`；② 旧监听 fd 已关闭但 ObjC 层上次发布的 override 仍指向它 → **所有连接被拒**；③ 期间任何新 apply（看门狗每 5s、前台恢复、NWPath）全部堵在 `lifecycleLock` 上排队 → **彻底无法联网且永不恢复**。实测形态：`forwarderPort=0` / `proxyOverridePort=<旧端口>` / `desiredForwarderRunning=true` / `forwarderDiscardCount=0` / `lastForwarderLifecycle=""`（信号发生在埋点之前）|
 | 0.5.54 | ⚠️ **该修复已撤回（见 §2.1）**：把重建改成"先启动新的 → 原子替换 → 异步回收旧的" | `LCProxyKing.m applyConfig` | 与"签名 dylib 后控制台一打开就黑屏"同时出现；0.5.56 整段撤回至 0.5.53 的顺序 |
 | 0.5.55 | 生命周期通知未限频：转发器持续启动失败时 `notify → apply → notify` 紧循环烧 CPU | `LCProxyKing.m notifyForwarderLifecycle:` | 加 5s 限频（保留）|
+| 0.5.56 | 撤回 0.5.54 的重建顺序改动（见 §2.1）| `LCProxyKing.m applyConfig` | 修复"签名 dylib 后控制台一打开就黑屏" |
+| 0.5.57 | **accept 循环无界阻塞 → `pthread_join` 永久挂起 → 整个 runtime apply 永久卡死**（永久断网的根因）| `KPKIngCore.c kp_forwarder_run` / `kp_forwarder_stop` | 见 §2.2 |
+
+### 2.2 v0.5.57：accept 无界阻塞导致永久断网（真正的根因）
+
+**机制**：`kp_forwarder_run` 原实现在循环里直接 `accept()` 阻塞等待，依赖
+`kp_forwarder_stop` 里的 `shutdown()` + `close()` 把它唤醒。但 **Darwin 上对监听
+socket 调用 `shutdown()` 返回 `ENOTCONN`，`close()` 也不会唤醒 `accept()`** ——
+上游注释里"macOS 无副作用"说的正是这件事。于是当没有新连接到来时：
+
+1. accept 线程永远阻塞在 `accept()`；
+2. `kp_forwarder_stop` 的 `pthread_join(fw->thread, NULL)` **永久阻塞**；
+3. 而 `kp_forwarder_stop` 是在 `applyRuntimeSnapshot → [king applyConfig:]` **持有
+   `lifecycleLock`** 时被调用的，此时 `self.forwarder` 已被置 NULL；
+4. `applyConfig` 永不返回 → `applyRuntimeSnapshot` 永不返回（override 永不更新）→
+   `runtimeQueue`（串行）上后续**每一次** apply（看门狗每 5s、前台恢复、NWPath 变化）
+   全部堵死。
+
+**为什么没有自愈**：5s 看门狗虽然一直在触发（它走 `refreshCredentials` 路径，不在
+被堵的 `runtimeQueue` 上），但它触发的 `requestRuntimeApplyAsync` 同样排在被堵死的
+队列后面，因此永远轮不到。
+
+**实测形态完全吻合**（`forwarderPort=0` / `proxyOverridePort=53464` 从不更新 /
+`desiredForwarderRunning=true` / `forwarderDiscardCount=0` /
+`lastForwarderLifecycle=""` / `lastError` 被看门狗反复覆盖为空以外的固定值）。
+
+**修复**：
+- accept 前先用 `poll(listen_fd, POLLIN, KP_FORWARDER_ACCEPT_POLL_MS=500)` 做**有界
+  等待**，超时即回到循环顶部重新检查 `running` / `listen_fd`；`join` 因此有界（≤500ms）；
+- `kp_forwarder_stop` 改为 **先 `pthread_join`、再 `close`** 监听 fd（原来先 close，
+  会关闭一个仍被 accept 线程 poll/accept 的 fd，属未定义行为）。
+
+这样即使"唤醒"机制在某平台上失效，接受线程也会自行按时退出，`applyConfig` 不可能
+再被永久卡住。
+
+**未采取**：给 ObjC 层加"绕过被堵 runtimeQueue"的防御（例如把 apply 改成非串行或加
+超时）。C 层修好后该场景不应再出现，而增加并发复杂度会重新引入竞态（0.5.54 的教训）。
 
 ### 2.1 v0.5.54 的重建顺序改动已撤回（v0.5.56）
 

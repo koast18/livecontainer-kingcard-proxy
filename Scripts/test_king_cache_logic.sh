@@ -268,6 +268,30 @@ assert 'code == 822 || code == 824' in core, \
 assert core.count('kp_forwarder_record_direct_host(fw, host);') == 3, \
     'direct-path log calls changed (expect HTTP+CONNECT fallback + PBProxy bootstrap)'
 
+# accept 循环必须**有界等待**，不能无限期阻塞在 accept() 上。
+# Darwin 下对监听 socket 的 shutdown() 返回 ENOTCONN、close() 也不唤醒 accept，
+# 于是一旦没有新连接到来，kp_forwarder_stop 里的 pthread_join 会永久阻塞。而它是在
+# applyRuntimeSnapshot → applyConfig 持有 lifecycleLock 时被调用的，后果是：
+#   self.forwarder 已被置 NULL（forwarderPort=0 / running=false），上次发布的
+#   proxy override 永远停在旧端口（所有连接被拒），且 runtimeQueue 上后续每一次
+#   apply（看门狗每 5s / 前台恢复 / NWPath）全部堵死 → 彻底断网且永不恢复。
+# 实测形态：forwarderPort=0 / proxyOverridePort=<旧端口，从不更新> /
+# desiredForwarderRunning=true / forwarderDiscardCount=0 / lastForwarderLifecycle=""。
+assert 'define KP_FORWARDER_ACCEPT_POLL_MS' in core, \
+    'accept loop has no bounded wait (unbounded pthread_join can wedge applyConfig forever)'
+_run_start = core.index('static void *kp_forwarder_run(void *arg) {')
+# kp_forwarder_run 之后的下一个顶层定义是 kp_forwarder_new（kp_client_thread 在其之前）。
+_run = core[_run_start:core.index('kp_forwarder *kp_forwarder_new(', _run_start)]
+assert 'poll(&pfd, 1, KP_FORWARDER_ACCEPT_POLL_MS)' in _run, \
+    'accept loop does not wait on the listen fd with a bounded poll timeout'
+assert _run.index('poll(&pfd, 1, KP_FORWARDER_ACCEPT_POLL_MS)') < _run.index('accept(listen_fd'), \
+    'accept() is called before the bounded poll wait'
+# stop 必须"先 join 再 close"：不能在 accept 线程仍可能 poll/accept 该 fd 时就关掉它。
+_stop_start = core.index('int kp_forwarder_stop(kp_forwarder *fw) {')
+_stop = core[_stop_start:core.index('void kp_forwarder_free', _stop_start)]
+assert _stop.index('pthread_join(fw->thread, NULL)') < _stop.index('KP_CLOSESOCK(listen_fd_to_close)'), \
+    'listen fd is closed before the accept thread is joined'
+
 # WebKit 代理安装必须是同步的、fail-closed 的：livecontainer_install_webkit_proxy 由
 # C 构造函数调用，此时 ObjC 层还没设置 per-process override，KingCard 模式下只能拿到
 # conf 里的占位端口 127.0.0.1:18080（无人监听）。绝不能为了"避免指向死端口"而跳过或
