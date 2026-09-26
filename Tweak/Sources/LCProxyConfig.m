@@ -26,6 +26,9 @@ static nw_path_monitor_t g_networkMonitor;
 @property (nonatomic, copy) NSString *lastAppliedEffectiveMode;
 @property (nonatomic, copy) NSString *lastAppliedConfigPath;
 @property (nonatomic, assign) int lastAppliedForwarderPort;
+// WebKit 代理配置实际生效的转发器端口。必须独立跟踪：见 applyRuntimeSnapshot 里
+// 的说明——它不能依赖 needsRuntimeReload。
+@property (nonatomic, assign) int lastWebkitAppliedPort;
 @property (nonatomic, copy) NSString *lifecycleState;
 @property (nonatomic, assign) NSUInteger networkGeneration;
 @property (nonatomic, assign) BOOL hasLastPathState;
@@ -430,6 +433,21 @@ static nw_path_monitor_t g_networkMonitor;
         lcproxy_control_set_proxy_override("127.0.0.1", desiredForwarderPort);
     } else {
         lcproxy_control_set_proxy_override(NULL, 0);
+    }
+
+    // WebKit 的代理配置必须跟着转发器端口走，而且**不能挂在 needsRuntimeReload 上**：
+    // 首次应用时若 canonical conf 写入失败（configReady == NO），needsRuntimeReload
+    // 为假、下面那次 reload 不会发生，WebKit 就会一直停在启动时按 conf 装上的占位
+    // 端口 127.0.0.1:18080（无人监听）。后果是原生 socket 经 override 走转发器一切
+    // 正常，但 WKWebView（浏览器类 App 的几乎全部流量）网页加载全部失败 —— 表现为
+    // "彻底无法联网"，且与线协议层无关、极难从转发器日志看出。
+    // 这里独立跟踪端口并在变化时无条件重载，属于 fail-closed 安全操作：转发器没起来
+    // 时端口为 0，重载会回退到 conf 的占位端口，绝不会退化为直连。
+    if (self.lastWebkitAppliedPort != desiredForwarderPort) {
+        self.lastWebkitAppliedPort = desiredForwarderPort;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            livecontainer_reload_webkit_proxy();
+        });
     }
 
     BOOL enabled = [s[@"proxyEnabled"] boolValue];

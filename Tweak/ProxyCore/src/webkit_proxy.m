@@ -222,14 +222,31 @@ static id lc_nonPersistentDataStore(id self, SEL _cmd) {
     return store;
 }
 
-// swizzle 与端口无关，越早安装越能覆盖 App 自建的 data store，因此立即执行。
-static void lc_install_webkit_swizzles(void) {
-    Class wds = NSClassFromString(@"WKWebsiteDataStore");
+void livecontainer_install_webkit_proxy(void) {
+    Class wds;
     Class cfg;
     Method m;
+    id (*msg)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
 
+    proxychains_write_log("[proxychains] webkit proxy: install begin\n");
+
+    // 注意：此处由 C 构造函数调用，ObjC 层（设置 per-process override）尚未运行，
+    // 因此 KingCard 模式下这里只能拿到 conf 里的**占位端口** 127.0.0.1:18080。
+    // 这是刻意的 fail-closed：占位端口无人监听，WebKit 在此期间不会走直连、不会
+    // 消耗通用流量；真实的转发器端口由 ObjC 层在 applyRuntimeSnapshot 里
+    // livecontainer_reload_webkit_proxy() 覆盖上。绝不要为了"避免指向死端口"而在这里
+    // 跳过安装——那会让 WebKit 在启动窗口内退化为直连。
+    if (!lc_create_proxy_config()) {
+        proxychains_write_log("[proxychains] webkit proxy: no usable HTTP proxy found at install, WKWebView proxy will be cleared\n");
+    }
+
+    wds = NSClassFromString(@"WKWebsiteDataStore");
     if (wds) {
         proxychains_write_log("[proxychains] webkit proxy: WKWebsiteDataStore class found\n");
+        id defaultStore = msg(wds, sel_registerName("defaultDataStore"));
+        proxychains_write_log("[proxychains] webkit proxy: defaultDataStore=%s\n", object_getClassName(defaultStore));
+        lc_apply_proxy_to_store(defaultStore);
+
         m = class_getClassMethod(wds, sel_registerName("nonPersistentDataStore"));
         if (m) {
             orig_nonPersistentDataStore = method_getImplementation(m);
@@ -238,9 +255,10 @@ static void lc_install_webkit_swizzles(void) {
         } else {
             proxychains_write_log("[proxychains] webkit proxy: nonPersistentDataStore method NOT found\n");
         }
-    } else {
-        proxychains_write_log("[proxychains] webkit proxy: WKWebsiteDataStore unavailable\n");
     }
+
+    if (!wds)
+        proxychains_write_log("[proxychains] webkit proxy: WKWebsiteDataStore unavailable\n");
 
     cfg = NSClassFromString(@"WKWebViewConfiguration");
     if (cfg) {
@@ -255,45 +273,6 @@ static void lc_install_webkit_swizzles(void) {
     } else {
         proxychains_write_log("[proxychains] webkit proxy: WKWebViewConfiguration class NOT found\n");
     }
-}
-
-// 给 defaultDataStore 装代理配置。必须等 ObjC 层设好 per-process override 之后再执行，
-// 原因见 livecontainer_install_webkit_proxy 的注释。
-static void lc_install_webkit_default_store(void) {
-    id (*msg)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
-    Class wds = NSClassFromString(@"WKWebsiteDataStore");
-    if (!wds) {
-        proxychains_write_log("[proxychains] webkit proxy: WKWebsiteDataStore unavailable at apply\n");
-        return;
-    }
-    if (!lc_create_proxy_config()) {
-        proxychains_write_log("[proxychains] webkit proxy: no usable HTTP proxy found at install, WKWebView proxy will be cleared\n");
-    }
-    id defaultStore = msg(wds, sel_registerName("defaultDataStore"));
-    proxychains_write_log("[proxychains] webkit proxy: defaultDataStore=%s\n", object_getClassName(defaultStore));
-    lc_apply_proxy_to_store(defaultStore);
-}
-
-void livecontainer_install_webkit_proxy(void) {
-    proxychains_write_log("[proxychains] webkit proxy: install begin\n");
-
-    // swizzle 立即装：与端口无关，早装才能覆盖 App 启动早期自建的 data store。
-    lc_install_webkit_swizzles();
-
-    // 给 defaultDataStore 装配置则延后到主队列。本函数由 C 构造函数调用，而 ObjC 层
-    // （LCProxyControlConstructor -> applyToRuntime）在 C 构造函数之后才运行、才会通过
-    // lcproxy_control_set_proxy_override 设置真实的每进程转发器端口。若此刻就照
-    // proxychains.conf 装配置，KingCard 模式下 conf 的第一个 hop 是本地转发器的
-    // **占位端口** 127.0.0.1:18080（永远无人监听），于是 WebKit 的 defaultDataStore
-    // 会被指向一个死端口 —— 浏览器类 App（如 WKWebView）的所有网页加载都会失败，
-    // 而 WebKit 还可能缓存该网络配置。延后到主队列即可保证 override 已就绪：
-    // applyToRuntime 内是 dispatch_sync，ObjC 构造函数返回时 override 必然已设置。
-    // 自定义代理模式下 override 会被清空，此时 lc_create_proxy_config 会回退去读
-    // conf，行为与原先一致。
-    dispatch_async(dispatch_get_main_queue(), ^{
-        proxychains_write_log("[proxychains] webkit proxy: install (deferred) applying to defaultDataStore\n");
-        lc_install_webkit_default_store();
-    });
 }
 
 void livecontainer_reload_webkit_proxy(void) {
