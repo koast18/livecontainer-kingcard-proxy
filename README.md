@@ -60,6 +60,9 @@ AltStore/           AltStore 源
 
 完整的测试流程见 [`docs/TESTING.md`](docs/TESTING.md)。
 
+共享 App 无法联网的排查记录、已修复缺陷清单、**必须保留的不变量**、以及
+`/api/status` 诊断字段速查见 [`docs/SHARED-APP-PROXY-INVESTIGATION.md`](docs/SHARED-APP-PROXY-INVESTIGATION.md)。
+
 本地运行全部非 iOS 测试：
 
 ```bash
