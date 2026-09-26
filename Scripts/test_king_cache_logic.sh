@@ -241,6 +241,24 @@ assert 'code == 822 || code == 824' in core, \
 assert core.count('kp_forwarder_record_direct_host(fw, host);') == 3, \
     'direct-path log calls changed (expect HTTP+CONNECT fallback + PBProxy bootstrap)'
 
+# WebKit 代理安装的时序：本函数由 C 构造函数调用，而 ObjC 层（设置 per-process
+# override）在其之后才运行。KingCard 模式下 conf 的第一个 hop 是本地转发器的占位
+# 端口 127.0.0.1:18080（永远无人监听），若此刻就照 conf 装配置，WebKit 的
+# defaultDataStore 会被指向死端口 —— 浏览器类 App 所有网页加载失败，而 WebKit 还
+# 可能缓存该网络配置。因此：swizzle 立即装（与端口无关），给 defaultDataStore
+# 装配置必须延后到主队列（那时 override 必然已就绪）。
+webkit = Path('Tweak/ProxyCore/src/webkit_proxy.m').read_text(encoding='utf-8')
+assert 'lc_install_webkit_swizzles' in webkit and 'lc_install_webkit_default_store' in webkit, \
+    'webkit install is not split into swizzle vs default-store phases'
+_swz = webkit[webkit.index('static void lc_install_webkit_swizzles'):
+              webkit.index('static void lc_install_webkit_default_store')]
+assert 'dispatch_async' not in _swz, 'swizzle installation must not be deferred'
+_inst = webkit[webkit.index('void livecontainer_install_webkit_proxy(void)'):]
+assert 'dispatch_async(dispatch_get_main_queue()' in _inst, \
+    'default-store proxy config is applied before the per-process override exists'
+assert '占位端口' in _inst, \
+    'the KingCard placeholder hazard is not documented at the install site'
+
 # Foreground activation should not force a synchronous refresh on the main thread.
 assert 'refreshCredentials' not in control, 'foreground notification still forces refresh'
 
