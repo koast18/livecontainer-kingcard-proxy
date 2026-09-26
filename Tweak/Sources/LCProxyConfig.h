@@ -7,6 +7,15 @@ NS_ASSUME_NONNULL_BEGIN
 /// 绝不直连（直连会消耗通用流量）。
 extern NSString *const LCProxyForwarderUnavailableNotification;
 
+/// Posted by LCProxyKing whenever the local KingCard forwarder instance is
+/// created, replaced, stopped, or discarded. The previously published proxy
+/// override keeps pointing at the old ephemeral port, so observers MUST re-run
+/// the runtime apply pass; otherwise every TCP connect is refused against a dead
+/// loopback port while the UI still reports KingCard mode as active.
+/// userInfo: reason = lifecycle transition ("create-failed", "start-failed",
+/// "rebuild-discarded").
+extern NSString *const LCProxyForwarderLifecycleChangedNotification;
+
 @interface LCProxyConfig : NSObject
 
 + (instancetype)shared;

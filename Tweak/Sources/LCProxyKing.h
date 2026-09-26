@@ -2,13 +2,6 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
-/// Posted whenever the local KingCard forwarder instance is created, replaced,
-/// stopped, or discarded. The previously published proxy override keeps pointing
-/// at the old ephemeral port, so observers MUST re-run the runtime apply pass;
-/// otherwise every TCP connect is refused against a dead loopback port while the
-/// UI still reports KingCard mode as active.
-extern NSString *const LCProxyForwarderLifecycleChangedNotification;
-
 @interface LCProxyKing : NSObject
 
 + (instancetype)shared;
