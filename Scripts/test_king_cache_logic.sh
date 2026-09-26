@@ -76,11 +76,33 @@ assert 'removeObjectForKey:@"refreshLog"' in king, 'UI refresh log is persisted 
 store_start = king.index('- (NSString *)credentialLogPath {')
 store_end = king.index('- (NSMutableDictionary *)newestValidRecordFromLog {', store_start)
 store = king[store_start:store_end]
-assert 'return [local stringByAppendingPathComponent:@"kingcard-credentials.log"];' in store \
-    and 'if (!path.length) return;' in store, \
+assert 'resolved = [local stringByAppendingPathComponent:@"kingcard-credentials.log"];' in store, \
+    'credential log must fall back to the dylib-derived directory'
+assert 'if (!local.length) return nil;' in store, \
     'unwritable credential storage must degrade to in-memory operation'
 assert 'open(path.fileSystemRepresentation' in store, 'append must use a raw O_APPEND write'
 assert 'close(fd);' in store, 'append leaves the log file descriptor open'
+
+# Deadlock regression guard: self.lock critical sections must never call into
+# cacheLock-protected helpers. v0.5.47's console-save hang was exactly this:
+# status held self.lock while loadState (newly cache-backed) re-took it.
+_lock_depth = 0
+_lock_start = None
+_forbidden = ('[self loadState]', '[self credentialLogPath]', '[self appendCredentialRecord:',
+              '[self newestValidRecordFromLog]', '[self trimCredentialLogIfNeeded]')
+for _i, _line in enumerate(king.split('\n'), 1):
+    if '[self.lock lock]' in _line:
+        _lock_depth += 1
+        if _lock_depth == 1:
+            _lock_start = _i
+    if '[self.lock unlock]' in _line and _lock_depth > 0:
+        _lock_depth -= 1
+        if _lock_depth == 0:
+            _lock_start = None
+    if _lock_depth > 0 and _lock_start is not None:
+        for _f in _forbidden:
+            assert _f not in _line, \
+                f'lock-order deadlock risk at line {_i} (self.lock section from {_lock_start}): {_f}'
 
 # loadState prefers the in-process cache and only reads the log as a seed.
 load_start = king.index('- (NSMutableDictionary *)loadState {')
