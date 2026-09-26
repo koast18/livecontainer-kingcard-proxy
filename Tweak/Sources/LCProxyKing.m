@@ -927,6 +927,31 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
     if (force) [self clearForwarderKingState];
 
     NSDictionary *settings = [self settingsSnapshot];
+    // 看门狗：王卡模式已启用但转发器缺失/监听失效时，就地请求一次重建。
+    //
+    // 必要性：applyConfig 的重建分支会先 stopRefreshTimer；若这次重建失败（bind
+    // 失败）或在并发下被丢弃，进程就会**既没有可用转发器、也没有任何定时器或事件**
+    // 再触发 apply —— ObjC 层最后发布的 override 仍指向已死的端口，表现为"彻底
+    // 无法联网且永不恢复"，直到用户切后台/重启 App。这里用一条显式的 5 秒重试把
+    // 它接上，保证一定有人来重新 apply。
+    //
+    // 死锁安全性：本方法可能由转发器 client 线程经 refresh hook 调用，但那时转发器
+    // 必然在运行（isRunning 为真）→ 不会走重建分支；转发器不在运行时不存在 client
+    // 线程。且重建走的是异步 requestRuntimeApplyAsync，调用线程不会被阻塞。
+    if ([settings[@"proxyEnabled"] boolValue] &&
+        [[[LCProxyConfig shared] effectiveProxyModeForSettings:settings] isEqualToString:@"kingcard"] &&
+        ![self isRunning]) {
+        [self.lock lock];
+        self.refreshing = NO;
+        self.lastRefreshSuccess = NO;
+        self.lastRefresh = LCProxyKingNow();
+        self.lastError = @"王卡转发器缺失，正在自动重建";
+        [self.lock unlock];
+        [[LCProxyConfig shared] requestRuntimeApplyAsync];
+        [self scheduleRefreshRetryAfter:5.0];
+        return NO;
+    }
+
     NSMutableDictionary *state = [self loadState];
     if (!force && state.count && [self stateHasFreshCredentials:state matchingSettings:settings]) {
         // 缓存命中：无需取号。凭证有效期长达 2 小时，普通刷新只是确认仍然新鲜。

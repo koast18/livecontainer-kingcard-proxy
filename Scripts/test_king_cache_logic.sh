@@ -173,6 +173,16 @@ refresh_start = king.index('- (BOOL)refreshCredentialsWithForce:')
 assert 'if (!self.routePublished) {' not in king[refresh_start:king.index('- (BOOL)finishRefreshWithState:')], \
     'credential bootstrap is blocked before route publication'
 
+# 自愈看门狗：applyConfig 的重建分支会先 stopRefreshTimer，若重建失败或被并发丢弃，
+# 进程就既没有转发器也没有任何定时器/事件再触发 apply —— override 永久指向死端口
+# （"彻底无法联网且永不恢复"）。refreshCredentials 必须在转发器缺失时主动请求重建
+# 并安排一次有界重试。
+refresh = king[refresh_start:king.index('- (BOOL)finishRefreshWithState:', refresh_start)]
+assert '[self isRunning]' in refresh and 'requestRuntimeApplyAsync' in refresh, \
+    'refreshCredentials does not rebuild a missing forwarder (no self-heal watchdog)'
+assert 'scheduleRefreshRetryAfter:5.0' in refresh, \
+    'watchdog does not schedule a bounded retry after requesting a rebuild'
+
 # Explicit credentials always override remote refreshes, including forced ones.
 assert '!guidOverride && (force || !guid)' in king, \
     'forced refresh can overwrite kingGuidOverride'
