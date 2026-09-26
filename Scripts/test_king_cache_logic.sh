@@ -190,35 +190,25 @@ assert '[self isRunning]' in refresh and 'requestRuntimeApplyAsync' in refresh, 
 assert 'scheduleRefreshRetryAfter:5.0' in refresh, \
     'watchdog does not schedule a bounded retry after requesting a rebuild'
 
-# 转发器退役必须异步，且重建必须先启动新的再替换旧的。
-# kp_forwarder_stop 要等 client 线程退出（它们可能卡在同步取号 hook 的网络等待里，
-# 单次最长 15s；grace 上限 10s），kp_forwarder_free 内部还会再 stop 一轮 —— 在
-# runtime apply 路径上同步 stop/free 一个**正在运行**的转发器会把 apply 卡住最长
-# 20s：期间 self.forwarder 已是 NULL、旧监听 fd 已关闭，而 ObjC 层上次发布的
-# override 仍指向旧端口（所有连接被拒），后续 apply 还全部堵在 lifecycleLock 上排队。
-# 实测形态正是 forwarderPort=0 / running=false / proxyOverridePort=<旧端口> /
-# desiredForwarderRunning=true / forwarderDiscardCount=0 / lastForwarderLifecycle=""。
+# 【已撤回】转发器重建顺序（0.5.54 引入、0.5.56 撤回）
+#
+# 0.5.54 曾把重建改成"先启动新的、再原子替换、最后异步回收旧的"，以消除重建期间
+# self.forwarder 为 NULL、而 ObjC 层上次发布的 override 仍指向已关闭旧端口的窗口
+# （实测形态：forwarderPort=0 / running=false / proxyOverridePort=<旧端口> /
+# desiredForwarderRunning=true）。但该改动与"签名 dylib 后控制台一打开就黑屏"
+# 同时出现，且 0.5.53 的控制台经实测可用，故整段撤回至 0.5.53 的顺序。
+#
+# 因此这里不再断言异步退役；保留一条护栏：重建路径必须仍然是"先摘除引用 →
+# 再 stop/free → 最后新建"，即与 0.5.53 一致。重新启用异步退役前，必须先拿到
+# 崩溃/卡死日志确认病因（见 docs/SHARED-APP-PROXY-INVESTIGATION.md）。
 apply_start = king.index('- (void)applyConfig:(NSDictionary *)settings effectiveMode:')
-# 只取 applyConfig 自身的方法体（到紧随其后的 retireForwarder: 定义之前），
-# 否则会把异步回收方法里的 kp_forwarder_stop 误算进来。
 apply_cfg = king[apply_start:king.index('// 异步回收退役的转发器', apply_start)]
-assert 'kp_forwarder_stop(' not in apply_cfg, \
-    'applyConfig still synchronously stops a running forwarder (up to 20s block on the apply path)'
-assert 'dispatch_async(self.forwarderReaperQueue' in king, \
-    'forwarder retirement is not asynchronous'
-assert king.count('[self retireForwarder:') >= 2, \
-    'not all forwarder retirement paths are asynchronous'
-_reaper = king[king.index('- (void)retireForwarder:(kp_forwarder *)fw {'):]
-_reaper = _reaper[:_reaper.index('\n}\n') + 3]
-assert 'lifecycleLock' not in _reaper, \
-    'retirement re-acquires lifecycleLock, which would re-block the runtime apply path'
 assert 'kp_forwarder_start(newForwarder)' in apply_cfg, \
-    'the replacement forwarder is not started before the old one is retired'
-_rebuild = apply_cfg[apply_cfg.index('kp_forwarder_start(newForwarder)'):]
-assert '[self retireForwarder:' in _rebuild, \
-    'the old forwarder is not retired after the replacement is already running'
-assert 'self.forwarder = NULL' not in _rebuild, \
-    'self.forwarder is still nulled during a rebuild (stale-override outage window)'
+    'applyConfig no longer (re)starts a forwarder'
+assert 'kp_forwarder_stop(oldForwarder)' in apply_cfg, \
+    'applyConfig no longer retires the previous forwarder'
+assert apply_cfg.index('self.forwarder = NULL') < apply_cfg.index('kp_forwarder_start(newForwarder)'), \
+    'applyConfig no longer detaches the old forwarder before starting the new one (0.5.53 ordering)'
 
 # Explicit credentials always override remote refreshes, including forced ones.
 assert '!guidOverride && (force || !guid)' in king, \

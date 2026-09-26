@@ -207,32 +207,30 @@ static const NSTimeInterval LCProxyKingLifecycleNotifyMinInterval = 5.0;
         [self.lock unlock];
         // 不要在持有 self.lock 时 stop/free：kp_forwarder_stop 会等待所有 client
         // 线程退出，而 client 线程失败重试时可能正在等待 self.lock 做取号刷新，
-        // 持锁等待会形成死锁。退役一律交给 retireForwarder: 异步回收 —— 它连
-        // lifecycleLock 都不取，理由见其注释（同步退役会把 runtime apply 卡死 20s）。
-        [self retireForwarder:oldForwarder];
+        // 持锁等待会形成死锁。
+        if (oldForwarder) {
+            kp_forwarder_stop(oldForwarder);
+            kp_forwarder_free(oldForwarder);
+        }
         return;
     }
 
-    // shouldRun 但当前没有 running 的转发器：重建。
+    // shouldRun 但当前没有 running 的转发器：先摘除旧引用并释放锁，再安全 stop/free。
     //
-    // ★ 顺序至关重要：**先建好并启动新转发器，成功后再原子替换，最后异步回收旧的**。
-    //
-    // 旧实现是"先摘除旧引用（self.forwarder = NULL）→ 同步 stop/free 旧的 → 再建新的"，
-    // 而 kp_forwarder_stop 要等 client 线程退出：它们可能正卡在同步取号 hook 的网络
-    // 等待里（单次最长 15s），grace 上限 10s，随后的 kp_forwarder_free 内部还会再
-    // stop 一次 → 单次重建最长阻塞 20s。这段时间里：
-    //   · self.forwarder 已是 NULL（forwarderPort=0 / running=false）
-    //   · 旧转发器的监听 fd 已关闭，但 ObjC 层上次发布的 override 仍指向那个端口
-    //   · 任何新的 apply（看门狗每 5s、前台恢复、网络变化）都卡在 lifecycleLock 上排队
-    // 结果就是"彻底无法联网且永不恢复"，且 forwarderDiscardCount/lastError 都无从体现。
-    // 先启动新的再替换旧的可彻底消除该窗口：shouldRun 期间 self.forwarder 永不为 NULL，
-    // 且 apply 路径不再等待旧转发器的 client 线程。
-    // 先落定"应该运行"的意图与 settings 签名，再去锁外创建/启动新转发器。
-    // applyConfig 全程持有 lifecycleLock，因此这两者不可能被并发改写。
-    [self.lock lock];
-    self.desiredForwarderRunning = YES;
+    // v0.5.54 曾把这里改成"先启动新的、再原子替换、最后异步回收旧的"，以消除重建
+    // 期间 self.forwarder 为 NULL 造成的 override 悬空窗口。但该改动与"签名 dylib 后
+    // 控制台一打开就黑屏"同时出现，故整段撤回至本版本（0.5.53 的顺序，控制台已验证
+    // 可用）。若将来重新引入，必须先拿到崩溃/卡死日志确认不是它引起的。
+    oldForwarder = self.forwarder;
+    self.forwarder = NULL;
     self.lastSettingsSignature = signature;
+    self.desiredForwarderRunning = YES;
     [self.lock unlock];
+
+    if (oldForwarder) {
+        kp_forwarder_stop(oldForwarder);
+        kp_forwarder_free(oldForwarder);
+    }
 
     newForwarder = kp_forwarder_new("127.0.0.1", 0, "", 0);
     if (!newForwarder) {
@@ -254,15 +252,22 @@ static const NSTimeInterval LCProxyKingLifecycleNotifyMinInterval = 5.0;
         return;
     }
 
-    // 原子替换：新转发器立即生效，旧引用在同一临界区内摘除，不存在 NULL 窗口。
     [self.lock lock];
-    oldForwarder = self.forwarder;
-    self.forwarder = newForwarder;
-    [self.lock unlock];
+    // 创建/启动新转发器期间锁已释放，可能已有另一次 applyConfig 先装上了自己的
+    // 转发器——只有那种情况才允许丢弃本次成果。设置略有出入是可接受的：下一次
+    // applyConfig 会走 alreadyRunning 分支收敛签名并重新装载凭证。
+    if (self.forwarder == NULL && self.desiredForwarderRunning) {
+        self.forwarder = newForwarder;
+        [self.lock unlock];
+        [self loadCachedStateIntoForwarder];
+        return;
+    }
 
-    // 旧转发器交给专用串行队列回收，绝不阻塞 apply 路径。
-    [self retireForwarder:oldForwarder];
-    [self loadCachedStateIntoForwarder];
+    self.forwarderDiscardCount++;
+    [self.lock unlock];
+    kp_forwarder_stop(newForwarder);
+    kp_forwarder_free(newForwarder);
+    [self notifyForwarderLifecycle:@"rebuild-discarded"];
     } @finally {
         [self.lifecycleLock unlock];
     }
@@ -278,6 +283,11 @@ static const NSTimeInterval LCProxyKingLifecycleNotifyMinInterval = 5.0;
 // 摘除，回收只操作这个局部指针，与在建的新实例互不相干；若在这里拿 lifecycleLock，
 // 就会把最长 20s 的等待重新转嫁到 apply 路径上，等于没修。串行队列本身已保证同一
 // 时刻只回收一个实例。
+//
+// ⚠️ v0.5.56 起本方法与 forwarderReaperQueue 一并**停用**（保留但不再被调用）：
+// v0.5.54 引入的"先启动新的、再原子替换、最后异步回收"与"签名 dylib 后控制台一打开
+// 就黑屏"同时出现，故整段撤回。保留实现是为了不丢失这段分析，重新启用前必须先拿到
+// 崩溃/卡死日志确认病因。
 - (void)retireForwarder:(kp_forwarder *)fw {
     if (!fw) return;
     dispatch_async(self.forwarderReaperQueue, ^{

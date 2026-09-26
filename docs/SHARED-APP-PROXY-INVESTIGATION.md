@@ -39,17 +39,25 @@
 | 0.5.51 | **无自愈**：`applyConfig` 重建分支先 `stopRefreshTimer`；若重建失败/被丢弃，进程既无转发器也无定时器/事件再触发 apply | `LCProxyKing.m refreshCredentialsWithForce:` 加看门狗 | override 永久指向死端口 → 「彻底断网且永不恢复」，只能切后台/重启 |
 | 0.5.53 | **WebKit 可能永远停在占位端口**：`livecontainer_reload_webkit_proxy()` 挂在 `needsRuntimeReload` 上 | `LCProxyConfig.m applyRuntimeSnapshot` | 首次应用若 canonical conf 写入失败（`configReady == NO`），reload 永不发生 → **原生 socket 正常但 `WKWebView` 网页全挂**（浏览器类 App 的几乎全部流量） |
 
-| 0.5.54 | **同步退役转发器把 runtime apply 卡死 20 秒**（实测确认的根因）：重建分支先 `self.forwarder = NULL` 摘除旧的，再**同步** `kp_forwarder_stop` + `kp_forwarder_free`（stop 等待 client 线程，而它们可能正卡在同步取号网络等待里；grace 上限 10s，free 内部还会再 stop 一轮）| `LCProxyKing.m applyConfig` | ① `self.forwarder` 已是 NULL → `forwarderPort=0` / `running=false`；② 旧监听 fd 已关闭但 ObjC 层上次发布的 override 仍指向它 → **所有连接被拒**；③ 期间任何新 apply（看门狗每 5s、前台恢复、NWPath）全部堵在 `lifecycleLock` 上排队 → **彻底无法联网且永不恢复**。实测形态：`forwarderPort=0` / `proxyOverridePort=<旧端口>` / `desiredForwarderRunning=true` / `forwarderDiscardCount=0` / `lastForwarderLifecycle=""`（因为信号发生在埋点之前）|
+| 0.5.54 | **同步退役转发器把 runtime apply 卡死 20 秒**（数据形态高度吻合）：重建分支先 `self.forwarder = NULL` 摘除旧的，再**同步** `kp_forwarder_stop` + `kp_forwarder_free`（stop 等待 client 线程，而它们可能正卡在同步取号网络等待里；grace 上限 10s，free 内部还会再 stop 一轮）| `LCProxyKing.m applyConfig` | ① `self.forwarder` 已是 NULL → `forwarderPort=0` / `running=false`；② 旧监听 fd 已关闭但 ObjC 层上次发布的 override 仍指向它 → **所有连接被拒**；③ 期间任何新 apply（看门狗每 5s、前台恢复、NWPath）全部堵在 `lifecycleLock` 上排队 → **彻底无法联网且永不恢复**。实测形态：`forwarderPort=0` / `proxyOverridePort=<旧端口>` / `desiredForwarderRunning=true` / `forwarderDiscardCount=0` / `lastForwarderLifecycle=""`（信号发生在埋点之前）|
+| 0.5.54 | ⚠️ **该修复已撤回（见 §2.1）**：把重建改成"先启动新的 → 原子替换 → 异步回收旧的" | `LCProxyKing.m applyConfig` | 与"签名 dylib 后控制台一打开就黑屏"同时出现；0.5.56 整段撤回至 0.5.53 的顺序 |
+| 0.5.55 | 生命周期通知未限频：转发器持续启动失败时 `notify → apply → notify` 紧循环烧 CPU | `LCProxyKing.m notifyForwarderLifecycle:` | 加 5s 限频（保留）|
 
-### 0.5.54 的修法
+### 2.1 v0.5.54 的重建顺序改动已撤回（v0.5.56）
 
-重建顺序倒过来，并把退役移出 apply 路径：
+0.5.54 把重建顺序改为"先在锁外创建并启动新转发器 → 再原子替换 → 最后交专用串行队列异步回收"，用以消除重建期间 `self.forwarder` 为 NULL、而上次发布的 override 仍指向已关闭旧端口的窗口（§2 中 0.5.54 那行的机制分析）。
 
-1. **先**在锁外创建并启动新转发器；
-2. **再**在同一临界区内原子替换（`old = self.forwarder; self.forwarder = new;`）——`shouldRun` 期间 `self.forwarder` **永不为 NULL**；
-3. **最后**把旧实例交给专用串行队列（`forwarderReaperQueue`）异步回收。
+**但它与"签名 dylib 之后控制台一打开就黑屏"同时出现。** 判断依据：
 
-回收队列**不再获取 `lifecycleLock`**：退役实例已从 `self.forwarder` 摘除，只操作局部指针，与在建的新实例互不相干；若在这里重新拿 `lifecycleLock`，就会把最长 20s 的等待重新转嫁到 apply 路径上，等于没修。
+- 未签名时 LiveContainer 不加载 dylib，控制台正常；**签名后 dylib 真正加载，才黑屏** → 问题出在 dylib 加载/构造阶段；
+- 设备实测数据表明 **0.5.53 的 dylib 在 console 进程（pid 90508）加载正常，且 `/api/status` 可读**（`serverPort: 19092`）→ 0.5.53 的控制台可用；
+- 因此嫌疑集中在 0.5.54 唯一的行为改动上。
+
+v0.5.56 **整段撤回**该改动，恢复 0.5.53 的顺序（`先摘除引用 → 同步 stop/free → 再新建`）。撤回后行为差异仅剩 `LCProxyKing.m` 的限频与死代码：`LCProxyConfig.m` / `LCProxyControl.m` / `LCProxyServer.m` / `webkit_proxy.m` / `ConsoleApp` 相对 0.5.53 **逐字节相同**。
+
+`retireForwarder:` 与 `forwarderReaperQueue` 保留但**不再被调用**（保存这段分析），并在源码中标注了停用原因。
+
+**重新启用前必须先拿到崩溃/卡死日志**（LiveContainer 的崩溃记录，或控制台可复现时的系统日志），确认黑屏病因不是它。注意：撤回同时也使 §2 中 0.5.54 那行描述的"200ms–20s 悬空 override 窗口"重新存在 —— 这是为恢复可用控制台而做的取舍；真正修好它需要在 C 层把 `kp_forwarder_stop` 拆成"快速关闭监听 fd"与"慢速排空 client 线程"两段。
 
 ### 0.5.52 是一次错误改动（已完整撤回）
 
