@@ -133,6 +133,9 @@ static const NSUInteger LCProxyDefaultPort = 19092;
     // 按连接转发结果，无需再靠文件应用/受限于 App Group 不可见。
     d[@"kingRefreshLogShared"] = [self tailOfAppGroupLog:@"kingcard-refresh.log" maxLines:30];
     d[@"trafficLogTail"] = [self tailOfAppGroupLog:@"traffic.log" maxLines:60];
+    // 每个进程加载 dylib 的事实（时间/pid/版本/路径/bundle）。用于确认共享 App
+    // 到底加载了哪个版本 —— 这是"修复是否真的生效"的唯一可靠依据。
+    d[@"dylibLoadsTail"] = [self tailOfAppGroupLog:@"dylib-loads.log" maxLines:20];
     NSDictionary *runtimeDiag = [[LCProxyConfig shared] runtimeDiagnostics];
     if ([runtimeDiag isKindOfClass:[NSDictionary class]]) {
         d[@"runtime"] = runtimeDiag;

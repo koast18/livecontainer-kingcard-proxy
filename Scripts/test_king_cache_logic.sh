@@ -84,6 +84,12 @@ server = Path('Tweak/Sources/LCProxyServer.m').read_text(encoding='utf-8')
 assert 'kingRefreshLogShared' in server and 'trafficLogTail' in server, \
     '/api/status does not expose the cross-process refresh/traffic logs'
 assert 'tailOfAppGroupLog:' in server, 'no shared-log tail reader in the console server'
+# "共享 App 到底加载了哪个版本的 dylib" 必须有据可查：App Group 在文件应用里
+# 看不到，而每个进程的状态只反映自己。加载事实写入共享日志后，任意控制台都能
+# 确认修复是否真的生效。
+assert 'LCProxyRecordDylibLoad' in control and 'dylib-loads.log' in control, \
+    'dylib load is not recorded to the shared App Group log'
+assert 'dylibLoadsTail' in server, '/api/status does not expose dylib load records'
 
 # Persistence is best-effort: if the log is unwritable the process must keep
 # working purely in memory rather than failing closed for a write problem.

@@ -5,12 +5,58 @@
 #import "LCProxyServer.h"
 #import "LCProxyPaths.h"
 #import "lcproxy_bridge.h"
+#import "Version.h"
+#include <fcntl.h>
+#include <unistd.h>
 
 static id<NSObject> g_lcDidBecomeActiveObserver;
 static id<NSObject> g_lcDidEnterBackgroundObserver;
 static id<NSObject> g_lcWillEnterForegroundObserver;
 static id<NSObject> g_lcForwarderUnavailableObserver;
 static id<NSObject> g_lcForwarderLifecycleObserver;
+
+// 记录"本进程在什么时间、从哪个路径、加载了哪个版本的 dylib"到 App Group 共享日志。
+// 这是排查"共享 App 是否真的加载了新 dylib"的唯一可靠依据：App Group 在文件应用里
+// 看不到，而每个进程的 /api/status 只能反映它自己。控制台通过 dylibLoadsTail 读取
+// 该文件，即可看到所有进程（含共享 App）的加载记录。
+// O_APPEND 行级追加、无需加锁；任何失败都静默忽略（纯诊断，绝不能影响加载）。
+static void LCProxyRecordDylibLoad(void) {
+    NSString *dir = LCProxyCanonicalDataDirectory();
+    if (!dir.length) return;
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                              withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *path = [dir stringByAppendingPathComponent:@"dylib-loads.log"];
+    NSDictionary *record = @{
+        @"ts": @([[NSDate date] timeIntervalSince1970]),
+        @"pid": @(getpid()),
+        @"version": [NSString stringWithUTF8String:KPTWEAK_VERSION],
+        @"dylib": LCProxyDylibPath() ?: @"",
+        @"bundle": [[NSBundle mainBundle] bundleIdentifier] ?: @"",
+    };
+    NSData *line = [NSJSONSerialization isValidJSONObject:record]
+        ? [NSJSONSerialization dataWithJSONObject:record options:0 error:nil] : nil;
+    if (line.length) {
+        NSMutableData *payload = [line mutableCopy];
+        [payload appendData:[@"\n" dataUsingEncoding:NSUTF8StringEncoding]];
+        int fd = open(path.fileSystemRepresentation, O_WRONLY | O_APPEND | O_CREAT, 0644);
+        if (fd >= 0) {
+            ssize_t ignored = write(fd, payload.bytes, payload.length);
+            (void)ignored;
+            close(fd);
+        }
+    }
+    // 每次 App 启动都会追加一行，必须裁剪，否则文件无限增长。
+    NSString *text = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+    if (!text.length) return;
+    NSArray<NSString *> *all = [text componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
+    NSMutableArray<NSString *> *kept = [NSMutableArray array];
+    for (NSString *l in all) {
+        if (l.length) [kept addObject:l];
+    }
+    if (kept.count <= 80) return;
+    NSString *out = [[kept subarrayWithRange:NSMakeRange(kept.count - 40, 40)] componentsJoinedByString:@"\n"];
+    [out writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
 
 // 王卡转发器不可用时的强提示（不受 showProxyBanner 开关约束）：
 // 此刻进程保持 fail-closed 断网，必须让用户知道为什么没网、且不会偷跑直连流量。
@@ -88,6 +134,9 @@ static void LCProxyShowBanner(NSDictionary *settings) {
 __attribute__((constructor))
 static void LCProxyControlConstructor(void) {
     @autoreleasepool {
+        // 最优先记录加载事实：即便后面任何一步出问题，我们也知道这个进程在什么
+        // 时间加载了哪个版本的 dylib。
+        LCProxyRecordDylibLoad();
         // Apply persisted settings immediately. The proxychains C core is already
         // initialized by its own constructor; these calls update runtime flags.
         NSDictionary *initialSettings = [[LCProxyConfig shared] load];
