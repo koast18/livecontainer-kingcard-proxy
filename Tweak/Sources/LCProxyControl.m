@@ -10,6 +10,7 @@ static id<NSObject> g_lcDidBecomeActiveObserver;
 static id<NSObject> g_lcDidEnterBackgroundObserver;
 static id<NSObject> g_lcWillEnterForegroundObserver;
 static id<NSObject> g_lcForwarderUnavailableObserver;
+static id<NSObject> g_lcForwarderLifecycleObserver;
 
 // 王卡转发器不可用时的强提示（不受 showProxyBanner 开关约束）：
 // 此刻进程保持 fail-closed 断网，必须让用户知道为什么没网、且不会偷跑直连流量。
@@ -125,6 +126,18 @@ static void LCProxyControlConstructor(void) {
                                                       usingBlock:^(NSNotification * _Nonnull note) {
             NSString *msg = [note.userInfo[@"message"] isKindOfClass:[NSString class]] ? note.userInfo[@"message"] : nil;
             LCProxyShowUnavailableBanner(msg ?: @"王卡转发器不可用：已阻断联网，正在自动恢复…");
+        }];
+
+        // 转发器实例被创建/替换/丢弃时，先前发布的 proxy override 仍指向旧端口。
+        // 必须立刻重跑一次 runtime apply：清掉陈旧 override，并让恢复流程重建转发
+        // 器；否则所有连接都会被发往一个无人监听的回环端口——表现为“彻底断网，
+        // 但横幅仍显示王卡代理”，且 lastError 为空、无任何报错。
+        g_lcForwarderLifecycleObserver =
+        [[NSNotificationCenter defaultCenter] addObserverForName:LCProxyForwarderLifecycleChangedNotification
+                                                          object:nil
+                                                           queue:[NSOperationQueue mainQueue]
+                                                      usingBlock:^(NSNotification * _Nonnull note) {
+            [[LCProxyConfig shared] requestRuntimeApplyAsync];
         }];
 
         // Persist this process's cellular traffic in 10-minute buckets.

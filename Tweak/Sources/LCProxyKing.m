@@ -65,10 +65,16 @@ typedef NS_ENUM(NSInteger, LCProxyKingLeaseResult) {
     LCProxyKingLeaseResultPersistenceFailed,
 };
 
+NSString *const LCProxyForwarderLifecycleChangedNotification = @"LCProxyForwarderLifecycleChangedNotification";
+
 @interface LCProxyKing ()
 @property (nonatomic, strong) NSLock *lock;
 @property (nonatomic, strong) NSLock *lifecycleLock;
 @property (nonatomic, assign) void *forwarderPtr;
+@property (nonatomic, assign) BOOL desiredForwarderRunning;
+@property (nonatomic, assign) NSUInteger forwarderDiscardCount;
+@property (nonatomic, assign) NSUInteger refreshArbitrationLossStreak;
+@property (nonatomic, copy) NSString *lastForwarderLifecycle;
 @property (nonatomic, copy) NSString *lastRefresh;
 @property (nonatomic, copy) NSString *lastSource;
 @property (nonatomic, copy) NSString *lastError;
@@ -118,6 +124,7 @@ typedef NS_ENUM(NSInteger, LCProxyKingLeaseResult) {
                                     generation:(uint64_t)generation
                                    allowWrite:(BOOL)allowWrite;
 - (void)clearForwarderKingState;
+- (void)notifyForwarderLifecycle:(NSString *)reason;
 @end
 
 @implementation LCProxyKing
@@ -141,6 +148,9 @@ typedef NS_ENUM(NSInteger, LCProxyKingLeaseResult) {
         _lastHealthCheckAt = 0;
         _routePublished = NO;
         _publishedForwarderPort = 0;
+        _desiredForwarderRunning = NO;
+        _forwarderDiscardCount = 0;
+        _refreshArbitrationLossStreak = 0;
         _refreshOwnerID = [NSUUID UUID].UUIDString;
         _refreshLeaseValid = YES;
         kp_set_debug_logger(LCProxyKingLog);
@@ -154,6 +164,18 @@ typedef NS_ENUM(NSInteger, LCProxyKingLeaseResult) {
 
 - (void)setForwarder:(kp_forwarder *)fw {
     self.forwarderPtr = fw;
+}
+
+// 只在“转发器消失且配置仍需要它”的路径上调用。observer 会重跑一次 runtime apply，
+// 因此绝不能在持有 self.lock 时同步发通知（observer 会回到 applyConfig）。
+- (void)notifyForwarderLifecycle:(NSString *)reason {
+    self.lastForwarderLifecycle = reason ?: @"";
+    NSString *payload = reason ?: @"";
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[NSNotificationCenter defaultCenter] postNotificationName:LCProxyForwarderLifecycleChangedNotification
+                                                            object:self
+                                                          userInfo:@{@"reason": payload}];
+    });
 }
 
 - (BOOL)isRunning {
@@ -198,6 +220,7 @@ typedef NS_ENUM(NSInteger, LCProxyKingLeaseResult) {
         oldForwarder = self.forwarder;
         self.forwarder = NULL;
         self.lastSettingsSignature = nil;
+        self.desiredForwarderRunning = NO;
         [self.lock unlock];
         // 不要在持有 self.lock 时 stop/free：kp_forwarder_stop 会等待所有 client
         // 线程退出，而 client 线程失败重试时可能正在等待 self.lock 做取号刷新，
@@ -213,6 +236,7 @@ typedef NS_ENUM(NSInteger, LCProxyKingLeaseResult) {
     oldForwarder = self.forwarder;
     self.forwarder = NULL;
     self.lastSettingsSignature = signature;
+    self.desiredForwarderRunning = YES;
     [self.lock unlock];
 
     if (oldForwarder) {
@@ -226,6 +250,7 @@ typedef NS_ENUM(NSInteger, LCProxyKingLeaseResult) {
         self.lastError = @"转发器启动失败";
         self.lastRefreshSuccess = NO;
         [self.lock unlock];
+        [self notifyForwarderLifecycle:@"create-failed"];
         return;
     }
     kp_forwarder_set_refresh_hook(newForwarder, LCProxyKingRefreshHook, (__bridge void *)self);
@@ -235,22 +260,30 @@ typedef NS_ENUM(NSInteger, LCProxyKingLeaseResult) {
         self.lastError = @"转发器启动失败";
         self.lastRefreshSuccess = NO;
         [self.lock unlock];
+        [self notifyForwarderLifecycle:@"start-failed"];
         return;
     }
 
     [self.lock lock];
-    // 创建/启动新转发器期间锁已释放，可能已有另一次 applyConfig 改动了模式。
-    // 只有当前仍然应该运行、且还没有安装新转发器时，才把 newForwarder 装上。
-    if (self.forwarder == NULL && [self.lastSettingsSignature isEqualToString:signature]) {
+    // 创建/启动新转发器期间锁已释放，可能已有另一次 applyConfig 先装上了自己的
+    // 转发器——只有那种情况才允许丢弃本次成果。原先这里还要求 settings 签名
+    // 一致，但并发 applyConfig 会改写 lastSettingsSignature，导致“刚 start 成功的
+    // 转发器被 stop+free，self.forwarder 保持 NULL”，而 ObjC 层上次发布的
+    // override 仍指向旧端口：所有连接被拒、横幅照常显示王卡代理、且 lastError
+    // 为空（无任何报错），极难排查。设置略有出入是可接受的：下一次 applyConfig
+    // 会走 alreadyRunning 分支收敛签名并重新装载凭证。
+    if (self.forwarder == NULL && self.desiredForwarderRunning) {
         self.forwarder = newForwarder;
         [self.lock unlock];
         [self loadCachedStateIntoForwarder];
         return;
     }
 
+    self.forwarderDiscardCount++;
     [self.lock unlock];
     kp_forwarder_stop(newForwarder);
     kp_forwarder_free(newForwarder);
+    [self notifyForwarderLifecycle:@"rebuild-discarded"];
     } @finally {
         [self.lifecycleLock unlock];
     }
@@ -1380,25 +1413,43 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
         commitResult == LCProxyKingCommitResultFenced) {
         [self scheduleRefreshRetryAfterLockContention];
     }
+    // 仲裁失利 ≠ 凭证失效。取号本身已经成功（success == YES），只是提交时被其他
+    // 实例抢先（Fenced），或跨进程状态锁/写盘临时不可用。此前这里一律
+    // clearForwarderKingState()，会把一次瞬时的跨进程竞争放大成持续断网——多
+    // LiveContainer / 共享 App 场景下尤其致命——并立刻触发下一轮取号，形成 ~1s
+    // 一圈的抖动循环（上游能看到密集取号）。保留现有凭证继续服务：上游 820/821/823
+    // 与刷新定时器仍会兜底，绝不因此退化为直连。
+    BOOL arbitrationLostButUsable = success && !refreshAvailable &&
+        (commitResult == LCProxyKingCommitResultFenced ||
+         commitResult == LCProxyKingCommitResultLockUnavailable ||
+         commitResult == LCProxyKingCommitResultPersistenceFailed);
     if (refreshAvailable) {
         // Reload the winner from disk so this forwarder and concurrent guests
         // use the same credentials after cross-process arbitration.
         [self loadCachedStateIntoForwarder];
-    } else {
+    } else if (!arbitrationLostButUsable) {
         [self clearForwarderKingState];
     }
     [self.lock lock];
     self.refreshing = NO;
-    self.lastRefreshSuccess = refreshAvailable;
+    self.lastRefreshSuccess = refreshAvailable || arbitrationLostButUsable;
+    if (refreshAvailable) {
+        self.refreshArbitrationLossStreak = 0;
+    } else if (arbitrationLostButUsable) {
+        self.refreshArbitrationLossStreak++;
+    }
     self.lastRefresh = LCProxyKingNow();
     self.lastSource = peerCompletedRefresh ? @"cache-peer" : (src ?: @"");
-    self.lastError = refreshAvailable ? @"" : (commitResult == LCProxyKingCommitResultLockUnavailable
-        ? @"kingcard-state.json 正被其他实例锁定，稍后自动重试"
-        : (commitResult == LCProxyKingCommitResultPersistenceFailed
-            ? @"王卡状态无法持久化，已停止转发"
-            : (commitResult == LCProxyKingCommitResultFenced
-                ? @"王卡刷新租约已失效，已停止转发"
-                : (error ?: @""))));
+    self.lastError = refreshAvailable ? @""
+        : (arbitrationLostButUsable
+            ? @"王卡取号成功但提交被其他实例抢先，已沿用现有凭证继续转发"
+            : (commitResult == LCProxyKingCommitResultLockUnavailable
+                ? @"kingcard-state.json 正被其他实例锁定，稍后自动重试"
+                : (commitResult == LCProxyKingCommitResultPersistenceFailed
+                    ? @"王卡状态无法持久化，已停止转发"
+                    : (commitResult == LCProxyKingCommitResultFenced
+                        ? @"王卡刷新租约已失效，已停止转发"
+                        : (error ?: @"")))));
     [self.lock unlock];
     return refreshAvailable;
 }
@@ -1500,6 +1551,10 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
     d[@"lastSource"] = self.lastSource ?: @"";
     d[@"lastError"] = self.lastError ?: @"";
     d[@"lastDiagnostics"] = self.lastDiagnostics ?: @"";
+    d[@"desiredForwarderRunning"] = @(self.desiredForwarderRunning);
+    d[@"forwarderDiscardCount"] = @(self.forwarderDiscardCount);
+    d[@"refreshArbitrationLossStreak"] = @(self.refreshArbitrationLossStreak);
+    d[@"lastForwarderLifecycle"] = self.lastForwarderLifecycle ?: @"";
     d[@"refreshLog"] = [self.refreshLog copy];
     NSMutableDictionary *state = [self loadState];
     NSString *guid = [state[@"guid"] isKindOfClass:[NSString class]] ? state[@"guid"] : @"";
