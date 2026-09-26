@@ -53,6 +53,8 @@ NSString *const LCProxyForwarderLifecycleChangedNotification = @"LCProxyForwarde
 @property (nonatomic, strong) NSLock *lifecycleLock;
 @property (nonatomic, assign) void *forwarderPtr;
 @property (nonatomic, strong) NSMutableDictionary *cachedCredentialState;
+@property (nonatomic, strong) NSLock *cacheLock;
+@property (nonatomic, copy) NSString *resolvedCredentialLogPath;
 @property (nonatomic, assign) BOOL desiredForwarderRunning;
 @property (nonatomic, assign) NSUInteger forwarderDiscardCount;
 @property (nonatomic, assign) NSUInteger refreshArbitrationLossStreak;
@@ -103,6 +105,7 @@ NSString *const LCProxyForwarderLifecycleChangedNotification = @"LCProxyForwarde
     if (self) {
         _lock = [[NSLock alloc] init];
         _lifecycleLock = [[NSLock alloc] init];
+        _cacheLock = [[NSLock alloc] init];
         _refreshLog = [[NSMutableArray alloc] init];
         _lastHealthCheckOk = NO;
         _lastHealthCheckAt = 0;
@@ -557,19 +560,29 @@ NSString *const LCProxyForwarderLifecycleChangedNotification = @"LCProxyForwarde
 static const NSUInteger LCProxyKingCredentialLogMaxLines = 64;
 
 - (NSString *)credentialLogPath {
+    // 路径只取决于数据目录，解析一次即可缓存，避免每次都做目录创建 IO。
+    [self.cacheLock lock];
+    NSString *resolved = self.resolvedCredentialLogPath;
+    [self.cacheLock unlock];
+    if (resolved.length) return resolved;
     NSString *canonical = LCProxyCanonicalDataDirectory();
     if (canonical.length &&
         [[NSFileManager defaultManager] createDirectoryAtPath:canonical
                                   withIntermediateDirectories:YES attributes:nil error:nil]) {
-        return [canonical stringByAppendingPathComponent:@"kingcard-credentials.log"];
+        resolved = [canonical stringByAppendingPathComponent:@"kingcard-credentials.log"];
+    } else {
+        // canonical 不可写时退回 dylib 推导目录；再不行就返回 nil，纯内存运行。
+        // 持久化失败绝不影响转发：本进程照常取号、照常装载凭证。
+        NSString *local = LCProxyDataDirectory();
+        if (!local.length) return nil;
+        [[NSFileManager defaultManager] createDirectoryAtPath:local
+                                  withIntermediateDirectories:YES attributes:nil error:nil];
+        resolved = [local stringByAppendingPathComponent:@"kingcard-credentials.log"];
     }
-    // canonical 不可写时退回 dylib 推导目录；再不行就返回 nil，纯内存运行。
-    // 持久化失败绝不影响转发：本进程照常取号、照常装载凭证。
-    NSString *local = LCProxyDataDirectory();
-    if (!local.length) return nil;
-    [[NSFileManager defaultManager] createDirectoryAtPath:local
-                              withIntermediateDirectories:YES attributes:nil error:nil];
-    return [local stringByAppendingPathComponent:@"kingcard-credentials.log"];
+    [self.cacheLock lock];
+    self.resolvedCredentialLogPath = resolved;
+    [self.cacheLock unlock];
+    return resolved;
 }
 
 // 追加一行。单次 write() + O_APPEND 在行级别是原子的；即便与其他进程交错，
@@ -584,9 +597,9 @@ static const NSUInteger LCProxyKingCredentialLogMaxLines = 64;
     NSData *line = [NSJSONSerialization dataWithJSONObject:stored options:0 error:nil];
     if (!line.length) return;
     // 缓存替换必须在锁内：调用方拿到的是副本，可放心原地修改。
-    [self.lock lock];
+    [self.cacheLock lock];
     self.cachedCredentialState = [record mutableCopy];
-    [self.lock unlock];
+    [self.cacheLock unlock];
     NSString *path = [self credentialLogPath];
     if (!path.length) return;
     NSMutableData *payload = [line mutableCopy];
@@ -642,17 +655,19 @@ static const NSUInteger LCProxyKingCredentialLogMaxLines = 64;
 }
 
 - (NSMutableDictionary *)loadState {
-    [self.lock lock];
+    // 注意：这里只使用独立的 cacheLock，绝不碰 self.lock —— 本方法会在
+    // status 等持有 self.lock 的上下文里被调用，NSLock 不可重入，否则死锁。
+    [self.cacheLock lock];
     NSMutableDictionary *cached = self.cachedCredentialState;
-    [self.lock unlock];
+    [self.cacheLock unlock];
     // 必须返回副本：调用方（refreshCredentialsWithForce 等）会原地增删键，
     // 不能与缓存共享同一个可变对象。
     if (cached.count) return [cached mutableCopy];
     NSMutableDictionary *fromLog = [self newestValidRecordFromLog];
     if (fromLog.count) {
-        [self.lock lock];
+        [self.cacheLock lock];
         self.cachedCredentialState = [fromLog mutableCopy];
-        [self.lock unlock];
+        [self.cacheLock unlock];
         return fromLog;
     }
     return [NSMutableDictionary dictionary];
@@ -1183,6 +1198,11 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
 }
 
 - (NSDictionary *)status {
+    // loadState / credentialLogPath 会做文件 IO 并使用独立的 cacheLock，
+    // 绝不能在持有 self.lock 时调用（NSLock 不可重入，否则死锁——这正是
+    // v0.5.47 首版导致控制台保存挂死的原因）。
+    NSMutableDictionary *state = [self loadState];
+    NSString *logPath = [self credentialLogPath] ?: @"";
     [self.lock lock];
     NSMutableDictionary *d = [NSMutableDictionary dictionary];
     d[@"running"] = @([self isRunning]);
@@ -1200,10 +1220,9 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
     d[@"forwarderDiscardCount"] = @(self.forwarderDiscardCount);
     d[@"refreshArbitrationLossStreak"] = @(self.refreshArbitrationLossStreak);
     d[@"lastForwarderLifecycle"] = self.lastForwarderLifecycle ?: @"";
-    d[@"credentialLogPath"] = [self credentialLogPath] ?: @"";
+    d[@"credentialLogPath"] = logPath;
     d[@"credentialCacheCount"] = @(self.cachedCredentialState.count);
     d[@"refreshLog"] = [self.refreshLog copy];
-    NSMutableDictionary *state = [self loadState];
     NSString *guid = [state[@"guid"] isKindOfClass:[NSString class]] ? state[@"guid"] : @"";
     if (guid.length > 12) {
         d[@"guidMasked"] = [NSString stringWithFormat:@"%@...%@", [guid substringToIndex:6], [guid substringFromIndex:guid.length - 6]];
