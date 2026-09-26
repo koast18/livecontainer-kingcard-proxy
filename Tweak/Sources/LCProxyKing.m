@@ -16,8 +16,6 @@
 static const NSTimeInterval LCProxyKingRefreshInterval = 2 * 60;
 static const NSTimeInterval LCProxyKingRefreshLeeway = 30;
 static const NSTimeInterval LCProxyKingRefreshLeadTime = 2 * 60;
-static const NSTimeInterval LCProxyKingRefreshLeaseTTL = 75;
-static const NSTimeInterval LCProxyKingRefreshLeaseHeartbeatInterval = 20;
 static const NSTimeInterval LCProxyKingPBProxyBootstrapSetupAllowance = 2;
 
 static int LCProxyKingRefreshHook(void *ctx) {
@@ -48,29 +46,11 @@ static BOOL LCProxyKingHexStringValid(NSString *s) {
     return [s rangeOfCharacterFromSet:cs].location == NSNotFound;
 }
 
-typedef NS_ENUM(NSInteger, LCProxyKingCommitResult) {
-    LCProxyKingCommitResultLockUnavailable,
-    LCProxyKingCommitResultNotCommitted,
-    LCProxyKingCommitResultWroteState,
-    LCProxyKingCommitResultPeerState,
-    LCProxyKingCommitResultFenced,
-    LCProxyKingCommitResultPersistenceFailed,
-};
-
-typedef NS_ENUM(NSInteger, LCProxyKingLeaseResult) {
-    LCProxyKingLeaseResultLockUnavailable,
-    LCProxyKingLeaseResultFreshState,
-    LCProxyKingLeaseResultHeldByPeer,
-    LCProxyKingLeaseResultAcquired,
-    LCProxyKingLeaseResultPersistenceFailed,
-};
-
-NSString *const LCProxyForwarderLifecycleChangedNotification = @"LCProxyForwarderLifecycleChangedNotification";
-
 @interface LCProxyKing ()
 @property (nonatomic, strong) NSLock *lock;
 @property (nonatomic, strong) NSLock *lifecycleLock;
 @property (nonatomic, assign) void *forwarderPtr;
+@property (nonatomic, strong) NSMutableDictionary *cachedCredentialState;
 @property (nonatomic, assign) BOOL desiredForwarderRunning;
 @property (nonatomic, assign) NSUInteger forwarderDiscardCount;
 @property (nonatomic, assign) NSUInteger refreshArbitrationLossStreak;
@@ -90,9 +70,6 @@ NSString *const LCProxyForwarderLifecycleChangedNotification = @"LCProxyForwarde
 @property (nonatomic, assign) BOOL routePublished;
 @property (nonatomic, assign) int publishedForwarderPort;
 @property (nonatomic, copy) NSString *refreshOwnerID;
-@property (nonatomic, strong) dispatch_source_t refreshLeaseHeartbeat;
-@property (nonatomic, assign) uint64_t refreshLeaseHeartbeatGeneration;
-@property (nonatomic, assign) BOOL refreshLeaseValid;
 - (void)startRefreshTimer;
 - (void)stopRefreshTimer;
 - (void)scheduleRefreshRetryAfter:(NSTimeInterval)delay;
@@ -100,30 +77,11 @@ NSString *const LCProxyForwarderLifecycleChangedNotification = @"LCProxyForwarde
 - (BOOL)stateHasFreshCredentials:(NSDictionary *)state matchingSettings:(NSDictionary *)settings;
 - (NSArray<NSString *> *)validatedProxyPool:(id)value;
 - (NSString *)credentialInputSignatureForSettings:(NSDictionary *)settings;
-- (NSMutableDictionary *)canonicalState;
-- (NSMutableDictionary *)newestFallbackState;
-- (BOOL)saveState:(NSMutableDictionary *)state error:(NSError **)outError;
-- (LCProxyKingLeaseResult)acquireRefreshLeaseWithForce:(BOOL)force
-                                                settings:(NSDictionary *)settings
-                                                   state:(NSMutableDictionary **)outState
-                                           baseUpdatedAt:(double *)outBaseUpdatedAt
-                                              generation:(uint64_t *)outGeneration;
-- (BOOL)renewRefreshLeaseForOwnerID:(NSString *)ownerID
-                          generation:(uint64_t)generation
-                       baseUpdatedAt:(double)baseUpdatedAt;
-- (void)startRefreshLeaseHeartbeatForOwnerID:(NSString *)ownerID
-                                   generation:(uint64_t)generation
-                                baseUpdatedAt:(double)baseUpdatedAt;
-- (BOOL)renewActiveRefreshLeaseForOwnerID:(NSString *)ownerID
-                                generation:(uint64_t)generation
-                             baseUpdatedAt:(double)baseUpdatedAt;
-- (BOOL)stopRefreshLeaseHeartbeat;
-- (LCProxyKingCommitResult)commitRefreshState:(NSMutableDictionary *)state
-                                baseUpdatedAt:(double)baseUpdatedAt
-                                       ownerID:(NSString *)ownerID
-                                    generation:(uint64_t)generation
-                                   allowWrite:(BOOL)allowWrite;
 - (void)clearForwarderKingState;
+- (NSString *)credentialLogPath;
+- (void)appendCredentialRecord:(NSDictionary *)record;
+- (NSMutableDictionary *)newestValidRecordFromLog;
+- (void)trimCredentialLogIfNeeded;
 - (void)notifyForwarderLifecycle:(NSString *)reason;
 @end
 
@@ -152,7 +110,7 @@ NSString *const LCProxyForwarderLifecycleChangedNotification = @"LCProxyForwarde
         _forwarderDiscardCount = 0;
         _refreshArbitrationLossStreak = 0;
         _refreshOwnerID = [NSUUID UUID].UUIDString;
-        _refreshLeaseValid = YES;
+        _cachedCredentialState = [[NSMutableDictionary alloc] init];
         kp_set_debug_logger(LCProxyKingLog);
     }
     return self;
@@ -345,31 +303,8 @@ NSString *const LCProxyForwarderLifecycleChangedNotification = @"LCProxyForwarde
     });
 }
 
-// 锁竞争快速重试：另一个实例（往往是首次安装后长达几十秒的首次取号）持有
-// 状态锁时，本实例的刷新会失败。若只等 2 分钟周期定时器，期间所有请求都会
-// 拿不到凭证而 502 —— 用户看到“第二个 App 直接网络错误”。5 秒后重试一次，
-// 兜住绝大多数“对方即将释放锁”的场景。
-- (void)scheduleRefreshRetryAfterLockContention {
-    [self scheduleRefreshRetryAfter:5.0];
-}
-
-- (void)scheduleRefreshRetryAfter:(NSTimeInterval)delay {
-    [self.lock lock];
-    BOOL alreadyScheduled = self.lockRetryScheduled;
-    if (!alreadyScheduled) self.lockRetryScheduled = YES;
-    [self.lock unlock];
-    if (alreadyScheduled) return;
-    delay = MAX(1.0, MIN(delay, 30.0));
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
-                   dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        [self.lock lock];
-        self.lockRetryScheduled = NO;
-        [self.lock unlock];
-        [self refreshCredentials];
-    });
-}
-
-- (void)startRefreshTimer {
+// 取号失败后的退避重试：只影响本进程的重试节奏，与任何其他进程无关。
+- (void)scheduleRefreshRetryAfter:- (void)startRefreshTimer {
     [self stopRefreshTimer];
 
     NSTimeInterval interval = LCProxyKingRefreshInterval;
@@ -417,27 +352,6 @@ NSString *const LCProxyForwarderLifecycleChangedNotification = @"LCProxyForwarde
 
 - (void)loadCachedStateIntoForwarder {
     NSMutableDictionary *state = [self loadState];
-    // A fallback is useful only to seed missing/corrupt canonical storage. Do
-    // not put a private-only credential set into a running forwarder unless
-    // that migration has completed and been read back successfully.
-    if (![self canonicalState] && state.count) {
-        NSArray<NSNumber *> *fds = [self acquireStateLocks];
-        if (fds.count == 0) {
-            [self clearForwarderKingState];
-            return;
-        }
-        @try {
-            NSMutableDictionary *canonical = [self canonicalState];
-            if (canonical) {
-                state = canonical;
-            } else if (![self saveState:state error:nil]) {
-                [self clearForwarderKingState];
-                return;
-            }
-        } @finally {
-            [self releaseStateLocks:fds];
-        }
-    }
     // 无条件恢复历史取号日志：即便凭证尚不完整提前 return，控制台也能读到历史记录。
     NSArray *savedLog = [state[@"refreshLog"] isKindOfClass:[NSArray class]] ? state[@"refreshLog"] : nil;
     if (savedLog.count) {
@@ -537,11 +451,6 @@ NSString *const LCProxyForwarderLifecycleChangedNotification = @"LCProxyForwarde
 }
 
 - (BOOL)stateHasFreshCredentials:(NSDictionary *)state matchingSettings:(NSDictionary *)settings {
-    NSNumber *invalidatingGeneration = [state[@"refreshInvalidatingGeneration"] isKindOfClass:[NSNumber class]]
-        ? state[@"refreshInvalidatingGeneration"] : nil;
-    // A forced refresh invalidates the prior credential generation before it
-    // starts network work. A peer must not reactivate that stale generation.
-    if (invalidatingGeneration.unsignedLongLongValue != 0) return NO;
     NSString *guid = [state[@"guid"] isKindOfClass:[NSString class]] ? state[@"guid"] : nil;
     NSString *token = [state[@"token"] isKindOfClass:[NSString class]] ? state[@"token"] : nil;
     NSString *qkey = [state[@"key"] isKindOfClass:[NSString class]] ? state[@"key"] : nil;
@@ -612,309 +521,123 @@ NSString *const LCProxyForwarderLifecycleChangedNotification = @"LCProxyForwarde
 }
 
 // ---------------------------------------------------------------------------
-// 状态持久化与同步取号辅助
+// 凭证存取：进程内缓存 + 追加式共享日志
 // ---------------------------------------------------------------------------
-// All active state lives in one canonical App Group location. Private paths
-// remain migration inputs only, so they must never receive a state write or a
-// lock that could make their stale contents authoritative again.
-- (NSArray<NSString *> *)stateLockPaths {
-    NSMutableArray<NSString *> *paths = [NSMutableArray array];
-    for (NSString *dir in LCProxyAllDataDirectories()) {
-        if (!dir.length) continue;
-        NSString *p = [dir stringByAppendingPathComponent:@"kingcard-state.lock"];
-        if (![paths containsObject:p]) [paths addObject:p];
+// 设计原则：**没有跨进程锁、没有租约、没有围栏**。凭证有效期长达 2 小时
+// （Q-Token）/ 8 小时（代理池），为"省几次取号请求"而引入复杂跨进程同步并不
+// 值得 —— 那套机制在多 LiveContainer / 共享 App 场景下反而制造了持续断网。
+//
+// 每个进程维护自己的转发器与凭证。取号结果以**追加**方式写入一个日志文件，
+// 每行一条 JSON（含取号时间 ts 与有效期）。追加本身无需加锁：即便两个进程同时
+// 写入，文件里也只是多了一条记录，读取方永远取"最新且仍有效"的那条；损坏的行
+// 直接跳过。跨 App 因此仍能复用未过期凭证（省一次取号），而任何一步失败都只是
+// 退化为"自己重新取一个"，绝不会造成断网，更不会隐式直连。
+//
+// 进程内缓存 self.cachedCredentialState 是运行时的唯一权威；日志只在启动时
+// 读取一次用于种子，并在每次取号成功后追加。
+
+static const NSUInteger LCProxyKingCredentialLogMaxLines = 64;
+
+- (NSString *)credentialLogPath {
+    NSString *canonical = LCProxyCanonicalDataDirectory();
+    if (canonical.length &&
+        [[NSFileManager defaultManager] createDirectoryAtPath:canonical
+                                  withIntermediateDirectories:YES attributes:nil error:nil]) {
+        return [canonical stringByAppendingPathComponent:@"kingcard-credentials.log"];
     }
-    return paths;
+    // canonical 不可写时退回 dylib 推导目录；再不行就返回 nil，纯内存运行。
+    // 持久化失败绝不影响转发：本进程照常取号、照常装载凭证。
+    NSString *local = LCProxyDataDirectory();
+    if (!local.length) return nil;
+    [[NSFileManager defaultManager] createDirectoryAtPath:local
+                              withIntermediateDirectories:YES attributes:nil error:nil];
+    return [local stringByAppendingPathComponent:@"kingcard-credentials.log"];
 }
 
-- (NSArray<NSNumber *> *)acquireStateLocks {
-    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:8.0];
-    NSMutableArray<NSNumber *> *fds = [NSMutableArray array];
-    for (NSString *path in [self stateLockPaths]) {
-        [[NSFileManager defaultManager] createDirectoryAtPath:[path stringByDeletingLastPathComponent]
-                                  withIntermediateDirectories:YES attributes:nil error:nil];
-        int fd = open(path.UTF8String, O_CREAT | O_RDWR, 0644);
-        if (fd < 0) {
-            [self releaseStateLocks:fds];
-            return @[];
-        }
-        struct flock fl = {0};
-        fl.l_type = F_WRLCK;
-        fl.l_whence = SEEK_SET;
-        BOOL locked = NO;
-        while (YES) {
-            if (fcntl(fd, F_SETLK, &fl) == 0) {
-                locked = YES;
-                break;
-            }
-            int err = errno;
-            if (err != EACCES && err != EAGAIN) break;
-            if ([[NSDate date] timeIntervalSinceDate:deadline] >= 0) break;
-            [NSThread sleepForTimeInterval:0.1];
-        }
-        if (!locked) {
-            close(fd);
-            [self releaseStateLocks:fds];
-            return @[];
-        }
-        [fds addObject:@(fd)];
+// 追加一行。单次 write() + O_APPEND 在行级别是原子的；即便与其他进程交错，
+// 读取方也只是多看到一条记录，取最新有效的一条即可。
+- (void)appendCredentialRecord:(NSDictionary *)record {
+    if (!record.count) return;
+    NSMutableDictionary *stored = [record mutableCopy];
+    // refreshLog 是控制台 UI 用的历史记录，不落进凭证日志（否则每行都会带上
+    // 整个历史，文件迅速膨胀）。它只存在于进程内缓存。
+    [stored removeObjectForKey:@"refreshLog"];
+    if (![NSJSONSerialization isValidJSONObject:stored]) return;
+    NSData *line = [NSJSONSerialization dataWithJSONObject:stored options:0 error:nil];
+    if (!line.length) return;
+    // 缓存替换必须在锁内：调用方拿到的是副本，可放心原地修改。
+    [self.lock lock];
+    self.cachedCredentialState = [record mutableCopy];
+    [self.lock unlock];
+    NSString *path = [self credentialLogPath];
+    if (!path.length) return;
+    NSMutableData *payload = [line mutableCopy];
+    [payload appendData:[@"\n" dataUsingEncoding:NSUTF8StringEncoding]];
+    int fd = open(path.fileSystemRepresentation, O_WRONLY | O_APPEND | O_CREAT, 0644);
+    if (fd < 0) return;   // 写不进去就用进程内缓存，绝不因此报错或断网
+    ssize_t ignored = write(fd, payload.bytes, payload.length);
+    (void)ignored;
+    close(fd);
+    [self trimCredentialLogIfNeeded];
+}
+
+- (void)trimCredentialLogIfNeeded {
+    NSString *path = [self credentialLogPath];
+    if (!path.length) return;
+    NSString *text = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+    if (!text.length) return;
+    NSArray<NSString *> *all = [text componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
+    NSMutableArray<NSString *> *kept = [NSMutableArray array];
+    for (NSString *l in all) {
+        if (l.length) [kept addObject:l];
     }
-    return fds;
+    if (kept.count <= LCProxyKingCredentialLogMaxLines) return;
+    NSUInteger keep = LCProxyKingCredentialLogMaxLines / 2;
+    NSRange cut = NSMakeRange(kept.count - keep, keep);
+    NSString *out = [[kept subarrayWithRange:cut] componentsJoinedByString:@"\n"];
+    [out writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
 }
 
-- (void)releaseStateLocks:(NSArray<NSNumber *> *)fds {
-    for (NSNumber *n in fds) {
-        int fd = n.intValue;
-        if (fd < 0) continue;
-        struct flock fl = {0};
-        fl.l_type = F_UNLCK;
-        fl.l_whence = SEEK_SET;
-        (void)fcntl(fd, F_SETLK, &fl);
-        close(fd);
-    }
-}
-
- - (NSMutableDictionary *)stateInDirectory:(NSString *)directory {
-    if (!directory.length) return nil;
-    NSData *data = [NSData dataWithContentsOfFile:[directory stringByAppendingPathComponent:@"kingcard-state.json"]];
-    if (!data) return nil;
-    id decoded = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-    return [decoded isKindOfClass:[NSDictionary class]] ? [decoded mutableCopy] : nil;
-}
-
-- (NSMutableDictionary *)canonicalState {
-    return [self stateInDirectory:LCProxyCanonicalDataDirectory()];
-}
-
-- (NSMutableDictionary *)newestFallbackState {
+// 取"最新且仍有效"的一条。损坏行、过期行、与当前设置不匹配的行全部跳过；
+// 一条都找不到就返回 nil，由调用方走重新取号。
+- (NSMutableDictionary *)newestValidRecordFromLog {
+    NSString *path = [self credentialLogPath];
+    if (!path.length) return nil;
+    NSString *text = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+    if (!text.length) return nil;
+    NSArray<NSString *> *lines = [text componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
+    NSDictionary *settings = [self settingsSnapshot];
     NSMutableDictionary *best = nil;
-    NSDate *bestDate = nil;
-    NSString *canonicalDirectory = LCProxyCanonicalDataDirectory();
-    for (NSString *directory in LCProxyAllDataDirectories()) {
-        if ([directory isEqualToString:canonicalDirectory]) continue;
-        NSString *path = [directory stringByAppendingPathComponent:@"kingcard-state.json"];
-        NSDate *mtime = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil].fileModificationDate;
-        NSMutableDictionary *candidate = [self stateInDirectory:directory];
-        if (!candidate || !mtime) continue;
-        if (!bestDate || [mtime compare:bestDate] == NSOrderedDescending) {
-            best = candidate;
-            bestDate = mtime;
-        }
+    double bestTs = -1;
+    for (NSString *l in lines) {
+        if (!l.length) continue;
+        id obj = [NSJSONSerialization JSONObjectWithData:[l dataUsingEncoding:NSUTF8StringEncoding]
+                                                 options:0 error:nil];
+        if (![obj isKindOfClass:[NSDictionary class]]) continue;
+        double ts = [obj[@"ts"] isKindOfClass:[NSNumber class]] ? [obj[@"ts"] doubleValue] : -1;
+        if (ts <= bestTs) continue;
+        if (![self stateHasFreshCredentials:obj matchingSettings:settings]) continue;
+        best = [obj mutableCopy];
+        bestTs = ts;
     }
     return best;
 }
 
-// A valid canonical file always wins. Migration fallbacks are read only when
-// canonical storage is absent or corrupt, then the next locked refresh writes
-// the selected fallback to canonical storage.
 - (NSMutableDictionary *)loadState {
-    return [self canonicalState] ?: [self newestFallbackState] ?: [NSMutableDictionary dictionary];
-}
-
-- (BOOL)saveState:(NSMutableDictionary *)state error:(NSError **)outError {
-    if (!state) return NO;
-    state[@"updatedAt"] = @([[NSDate date] timeIntervalSince1970]);
-    NSError *error = nil;
-    NSData *data = [NSJSONSerialization dataWithJSONObject:state options:NSJSONWritingPrettyPrinted error:&error];
-    if (!data) {
-        if (outError) *outError = error;
-        return NO;
-    }
-    BOOL wroteAny = NO;
-    for (NSString *directory in LCProxyAllDataDirectories()) {
-        if (!directory.length) continue;
-        NSString *path = [directory stringByAppendingPathComponent:@"kingcard-state.json"];
-        if (![[NSFileManager defaultManager] createDirectoryAtPath:directory
-                                      withIntermediateDirectories:YES attributes:nil error:&error] ||
-            ![data writeToFile:path options:NSDataWritingAtomic error:&error]) {
-            continue;
-        }
-        NSData *written = [NSData dataWithContentsOfFile:path options:0 error:&error];
-        id decoded = written ? [NSJSONSerialization JSONObjectWithData:written options:0 error:&error] : nil;
-        if ([decoded isKindOfClass:[NSDictionary class]] &&
-            [(NSDictionary *)decoded isEqualToDictionary:state]) {
-            wroteAny = YES;
-        }
-    }
-    if (!wroteAny && outError && !error) {
-        error = [NSError errorWithDomain:@"LCProxyKing" code:-30 userInfo:@{
-            NSLocalizedDescriptionKey: @"王卡状态写入后完整性校验失败",
-        }];
-    }
-    if (outError) *outError = error;
-    return wroteAny;
-}
-
-- (LCProxyKingLeaseResult)acquireRefreshLeaseWithForce:(BOOL)force
-                                                settings:(NSDictionary *)settings
-                                                   state:(NSMutableDictionary **)outState
-                                           baseUpdatedAt:(double *)outBaseUpdatedAt
-                                              generation:(uint64_t *)outGeneration {
-    NSArray<NSNumber *> *fds = [self acquireStateLocks];
-    if (fds.count == 0) return LCProxyKingLeaseResultLockUnavailable;
-    @try {
-        NSMutableDictionary *latest = [self canonicalState] ?: [self newestFallbackState] ?: [NSMutableDictionary dictionary];
-        NSNumber *updatedAt = [latest[@"updatedAt"] isKindOfClass:[NSNumber class]] ? latest[@"updatedAt"] : nil;
-        double baseUpdatedAt = updatedAt.doubleValue;
-        if (!force && [self stateHasFreshCredentials:latest matchingSettings:settings]) {
-            // Canonical storage may have been missing while a fresh legacy cache
-            // existed. Migrate it before declaring the route ready.
-            if (![self canonicalState] && ![self saveState:latest error:nil]) {
-                return LCProxyKingLeaseResultPersistenceFailed;
-            }
-            if (outState) *outState = latest;
-            if (outBaseUpdatedAt) *outBaseUpdatedAt = baseUpdatedAt;
-            return LCProxyKingLeaseResultFreshState;
-        }
-
-        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-        NSString *leaseOwner = [latest[@"refreshLeaseOwner"] isKindOfClass:[NSString class]] ? latest[@"refreshLeaseOwner"] : nil;
-        NSNumber *leaseExpiresAt = [latest[@"refreshLeaseExpiresAt"] isKindOfClass:[NSNumber class]] ? latest[@"refreshLeaseExpiresAt"] : nil;
-        if (leaseOwner.length && ![leaseOwner isEqualToString:self.refreshOwnerID] && leaseExpiresAt.doubleValue > now) {
-            if (outState) *outState = latest;
-            return LCProxyKingLeaseResultHeldByPeer;
-        }
-
-        NSNumber *storedGeneration = [latest[@"refreshGeneration"] isKindOfClass:[NSNumber class]] ? latest[@"refreshGeneration"] : @0;
-        NSNumber *leaseGeneration = [latest[@"refreshLeaseGeneration"] isKindOfClass:[NSNumber class]] ? latest[@"refreshLeaseGeneration"] : @0;
-        uint64_t generation = MAX(storedGeneration.unsignedLongLongValue, leaseGeneration.unsignedLongLongValue) + 1;
-        if (generation == 0) generation = 1;
-        latest[@"refreshLeaseOwner"] = self.refreshOwnerID;
-        latest[@"refreshLeaseGeneration"] = @(generation);
-        latest[@"refreshLeaseBaseUpdatedAt"] = @(baseUpdatedAt);
-        latest[@"refreshLeaseExpiresAt"] = @(now + LCProxyKingRefreshLeaseTTL);
-        if (force) {
-            latest[@"refreshInvalidatingGeneration"] = @(generation);
-        }
-        if (![self saveState:latest error:nil]) return LCProxyKingLeaseResultPersistenceFailed;
-        if (outState) *outState = latest;
-        if (outBaseUpdatedAt) *outBaseUpdatedAt = baseUpdatedAt;
-        if (outGeneration) *outGeneration = generation;
-        return LCProxyKingLeaseResultAcquired;
-    } @finally {
-        [self releaseStateLocks:fds];
-    }
-}
-
-- (BOOL)renewRefreshLeaseForOwnerID:(NSString *)ownerID
-                          generation:(uint64_t)generation
-                       baseUpdatedAt:(double)baseUpdatedAt {
-    NSArray<NSNumber *> *fds = [self acquireStateLocks];
-    if (fds.count == 0) return NO;
-    @try {
-        NSMutableDictionary *latest = [self loadState];
-        NSString *leaseOwner = [latest[@"refreshLeaseOwner"] isKindOfClass:[NSString class]] ? latest[@"refreshLeaseOwner"] : nil;
-        NSNumber *leaseGeneration = [latest[@"refreshLeaseGeneration"] isKindOfClass:[NSNumber class]] ? latest[@"refreshLeaseGeneration"] : nil;
-        NSNumber *leaseBase = [latest[@"refreshLeaseBaseUpdatedAt"] isKindOfClass:[NSNumber class]] ? latest[@"refreshLeaseBaseUpdatedAt"] : nil;
-        if (![leaseOwner isEqualToString:ownerID] ||
-            leaseGeneration.unsignedLongLongValue != generation ||
-            leaseBase.doubleValue != baseUpdatedAt) {
-            return NO;
-        }
-        latest[@"refreshLeaseExpiresAt"] = @([[NSDate date] timeIntervalSince1970] + LCProxyKingRefreshLeaseTTL);
-        return [self saveState:latest error:nil];
-    } @finally {
-        [self releaseStateLocks:fds];
-    }
-}
-
-- (void)invalidateActiveRefreshLeaseForGeneration:(uint64_t)generation {
-    BOOL active = NO;
     [self.lock lock];
-    if (self.refreshing && self.refreshLeaseHeartbeatGeneration == generation) {
-        self.refreshLeaseValid = NO;
-        active = YES;
+    NSMutableDictionary *cached = self.cachedCredentialState;
+    [self.lock unlock];
+    // 必须返回副本：调用方（refreshCredentialsWithForce 等）会原地增删键，
+    // 不能与缓存共享同一个可变对象。
+    if (cached.count) return [cached mutableCopy];
+    NSMutableDictionary *fromLog = [self newestValidRecordFromLog];
+    if (fromLog.count) {
+        [self.lock lock];
+        self.cachedCredentialState = [fromLog mutableCopy];
+        [self.lock unlock];
+        return fromLog;
     }
-    [self.lock unlock];
-    if (active) [self clearForwarderKingState];
-}
-
-- (BOOL)renewActiveRefreshLeaseForOwnerID:(NSString *)ownerID
-                                generation:(uint64_t)generation
-                             baseUpdatedAt:(double)baseUpdatedAt {
-    BOOL renewed = [self renewRefreshLeaseForOwnerID:ownerID generation:generation baseUpdatedAt:baseUpdatedAt];
-    if (!renewed) [self invalidateActiveRefreshLeaseForGeneration:generation];
-    return renewed;
-}
-
-- (void)startRefreshLeaseHeartbeatForOwnerID:(NSString *)ownerID
-                                   generation:(uint64_t)generation
-                                baseUpdatedAt:(double)baseUpdatedAt {
-    dispatch_source_t heartbeat = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
-        dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0));
-    dispatch_source_set_timer(heartbeat,
-                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)(LCProxyKingRefreshLeaseHeartbeatInterval * NSEC_PER_SEC)),
-                              (uint64_t)(LCProxyKingRefreshLeaseHeartbeatInterval * NSEC_PER_SEC),
-                              (uint64_t)(NSEC_PER_SEC));
-    __weak LCProxyKing *weakSelf = self;
-    dispatch_source_set_event_handler(heartbeat, ^{
-        LCProxyKing *strongSelf = weakSelf;
-        if (strongSelf) {
-            [strongSelf renewActiveRefreshLeaseForOwnerID:ownerID generation:generation baseUpdatedAt:baseUpdatedAt];
-        }
-    });
-    [self.lock lock];
-    dispatch_source_t oldHeartbeat = self.refreshLeaseHeartbeat;
-    self.refreshLeaseHeartbeat = heartbeat;
-    self.refreshLeaseHeartbeatGeneration = generation;
-    self.refreshLeaseValid = YES;
-    [self.lock unlock];
-    if (oldHeartbeat) dispatch_source_cancel(oldHeartbeat);
-    dispatch_resume(heartbeat);
-}
-
-- (BOOL)stopRefreshLeaseHeartbeat {
-    [self.lock lock];
-    dispatch_source_t heartbeat = self.refreshLeaseHeartbeat;
-    BOOL valid = self.refreshLeaseValid;
-    self.refreshLeaseHeartbeat = nil;
-    self.refreshLeaseHeartbeatGeneration = 0;
-    self.refreshLeaseValid = YES;
-    [self.lock unlock];
-    if (heartbeat) dispatch_source_cancel(heartbeat);
-    return valid;
-}
-
-- (LCProxyKingCommitResult)commitRefreshState:(NSMutableDictionary *)state
-                                baseUpdatedAt:(double)baseUpdatedAt
-                                      ownerID:(NSString *)ownerID
-                                   generation:(uint64_t)generation
-                                   allowWrite:(BOOL)allowWrite {
-    NSArray<NSNumber *> *fds = [self acquireStateLocks];
-    if (fds.count == 0) return LCProxyKingCommitResultLockUnavailable;
-    @try {
-        NSMutableDictionary *latest = [self loadState];
-        NSString *leaseOwner = [latest[@"refreshLeaseOwner"] isKindOfClass:[NSString class]] ? latest[@"refreshLeaseOwner"] : nil;
-        NSNumber *leaseGeneration = [latest[@"refreshLeaseGeneration"] isKindOfClass:[NSNumber class]] ? latest[@"refreshLeaseGeneration"] : nil;
-        NSNumber *leaseBase = [latest[@"refreshLeaseBaseUpdatedAt"] isKindOfClass:[NSNumber class]] ? latest[@"refreshLeaseBaseUpdatedAt"] : nil;
-        if (![leaseOwner isEqualToString:ownerID] || leaseGeneration.unsignedLongLongValue != generation ||
-            leaseBase.doubleValue != baseUpdatedAt) {
-            return [self stateHasFreshCredentials:latest] ? LCProxyKingCommitResultPeerState : LCProxyKingCommitResultFenced;
-        }
-
-        NSMutableDictionary *committed = allowWrite ? [state mutableCopy] : [latest mutableCopy];
-        if (!allowWrite) {
-            // A failed refresh invalidates the control plane: no process may
-            // resurrect the previous route from persistent state.
-            for (NSString *key in @[
-                @"guid", @"qua2", @"token", @"key", @"qtype",
-                @"queen_http", @"queen_https", @"tokenExpireEpoch",
-                @"proxyExpireEpoch", @"credentialInputSignature"
-            ]) {
-                [committed removeObjectForKey:key];
-            }
-        }
-        [committed removeObjectForKey:@"refreshLeaseOwner"];
-        [committed removeObjectForKey:@"refreshLeaseGeneration"];
-        [committed removeObjectForKey:@"refreshLeaseBaseUpdatedAt"];
-        [committed removeObjectForKey:@"refreshLeaseExpiresAt"];
-        [committed removeObjectForKey:@"refreshInvalidatingGeneration"];
-        committed[@"refreshGeneration"] = @(generation);
-        if (![self saveState:committed error:nil]) return LCProxyKingCommitResultPersistenceFailed;
-        return allowWrite ? LCProxyKingCommitResultWroteState : LCProxyKingCommitResultNotCommitted;
-    } @finally {
-        [self releaseStateLocks:fds];
-    }
+    return [NSMutableDictionary dictionary];
 }
 
 - (void)clearForwarderKingState {
@@ -1084,7 +807,7 @@ static const NSUInteger KP_LATENCY_PROBE_MAX = 8;
 static const NSUInteger LCProxyKingRefreshLogMax = 20;
 
 // 取号日志：内存环形缓冲（新→旧，最多 LCProxyKingRefreshLogMax 条）。成功刷新
-// 会随完整状态提交到 kingcard-state.json；失败刷新只留在本进程，避免写入半成品状态。
+// 会随凭证记录追加到 kingcard-credentials.log；失败刷新只留在本进程，避免污染日志。
 - (void)pushRefreshLog:(BOOL)ok src:(NSString *)src ms:(double)ms msg:(NSString *)msg intoState:(NSMutableDictionary *)state {
     NSDictionary *entry = @{
         @"ts": @([[NSDate date] timeIntervalSince1970]),
@@ -1132,36 +855,9 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
     if (force) [self clearForwarderKingState];
 
     NSDictionary *settings = [self settingsSnapshot];
-    NSMutableDictionary *state = nil;
-    double baseUpdatedAt = 0;
-    uint64_t generation = 0;
-    LCProxyKingLeaseResult leaseResult = [self acquireRefreshLeaseWithForce:force
-                                                                     settings:settings
-                                                                        state:&state
-                                                                baseUpdatedAt:&baseUpdatedAt
-                                                                   generation:&generation];
-    if (leaseResult == LCProxyKingLeaseResultLockUnavailable) {
-        [self scheduleRefreshRetryAfterLockContention];
-        [self clearForwarderKingState];
-        [self.lock lock];
-        self.refreshing = NO;
-        self.lastRefreshSuccess = NO;
-        self.lastRefresh = LCProxyKingNow();
-        self.lastError = @"kingcard-state.json 正被其他实例锁定，稍后自动重试";
-        [self.lock unlock];
-        return NO;
-    }
-    if (leaseResult == LCProxyKingLeaseResultPersistenceFailed) {
-        [self clearForwarderKingState];
-        [self.lock lock];
-        self.refreshing = NO;
-        self.lastRefreshSuccess = NO;
-        self.lastRefresh = LCProxyKingNow();
-        self.lastError = @"王卡状态无法持久化，已停止转发";
-        [self.lock unlock];
-        return NO;
-    }
-    if (leaseResult == LCProxyKingLeaseResultFreshState) {
+    NSMutableDictionary *state = [self loadState];
+    if (!force && state.count && [self stateHasFreshCredentials:state matchingSettings:settings]) {
+        // 缓存命中：无需取号。凭证有效期长达 2 小时，普通刷新只是确认仍然新鲜。
         [self loadCachedStateIntoForwarder];
         [self.lock lock];
         self.refreshing = NO;
@@ -1172,28 +868,6 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
         [self.lock unlock];
         return YES;
     }
-    if (leaseResult == LCProxyKingLeaseResultHeldByPeer) {
-        NSNumber *expiresAt = [state[@"refreshLeaseExpiresAt"] isKindOfClass:[NSNumber class]] ? state[@"refreshLeaseExpiresAt"] : nil;
-        NSTimeInterval retryAfter = MAX(1.0, expiresAt.doubleValue - [[NSDate date] timeIntervalSince1970]);
-        if ([self stateHasFreshCredentials:state matchingSettings:settings]) {
-            [self loadCachedStateIntoForwarder];
-        } else {
-            [self clearForwarderKingState];
-        }
-        [self scheduleRefreshRetryAfter:retryAfter];
-        [self.lock lock];
-        self.refreshing = NO;
-        self.lastRefreshSuccess = NO;
-        self.lastRefresh = LCProxyKingNow();
-        self.lastSource = @"refresh-peer";
-        self.lastError = @"其他实例正在刷新王卡凭证，稍后自动重试";
-        [self.lock unlock];
-        return NO;
-    }
-
-    [self startRefreshLeaseHeartbeatForOwnerID:self.refreshOwnerID
-                                    generation:generation
-                                 baseUpdatedAt:baseUpdatedAt];
 
     NSDate *t0 = [NSDate date];
     NSMutableString *steps = [NSMutableString string];
@@ -1216,7 +890,7 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
     NSString *guidOverride = [settings[@"kingGuidOverride"] isKindOfClass:[NSString class]] && [settings[@"kingGuidOverride"] length] ? settings[@"kingGuidOverride"] : nil;
     if (guidOverride && !LCProxyKingHexStringValid(guidOverride)) {
         [steps appendString:@"GUID: 配置覆盖格式无效\n"];
-        return [self finishRefreshWithState:state success:NO src:source ms:-[t0 timeIntervalSinceNow] * 1000.0 steps:steps baseUpdatedAt:baseUpdatedAt error:@"GUID 配置覆盖必须是 32 位十六进制字符串"];
+        return [self finishRefreshWithState:state success:NO src:source ms:-[t0 timeIntervalSinceNow] * 1000.0 steps:steps error:@"GUID 配置覆盖必须是 32 位十六进制字符串"];
     }
     NSString *inputSignature = [self credentialInputSignatureForSettings:settings];
     NSString *storedInputSignature = [state[@"credentialInputSignature"] isKindOfClass:[NSString class]]
@@ -1239,9 +913,6 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
         if (LCProxyKingHexStringValid(stored)) guid = stored;
     }
     if (!guidOverride && (force || !guid)) {
-        if (![self renewActiveRefreshLeaseForOwnerID:self.refreshOwnerID generation:generation baseUpdatedAt:baseUpdatedAt]) {
-            return [self finishRefreshWithState:state success:NO src:source ms:-[t0 timeIntervalSinceNow] * 1000.0 steps:steps baseUpdatedAt:baseUpdatedAt error:@"王卡刷新租约续期失败"];
-        }
         NSError *guidErr = nil;
         guid = [self syncFetchGuid:qua2 timeout:timeout error:&guidErr];
         if (!guid) {
@@ -1267,7 +938,7 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
     NSString *qkey = nil;
     if ((tokenOverride != nil) != (keyOverride != nil)) {
         [steps appendString:@"Q-Token/Q-Key: 配置覆盖必须同时提供\n"];
-        return [self finishRefreshWithState:state success:NO src:source ms:-[t0 timeIntervalSinceNow] * 1000.0 steps:steps baseUpdatedAt:baseUpdatedAt error:@"Q-Token/Q-Key 配置覆盖不完整"];
+        return [self finishRefreshWithState:state success:NO src:source ms:-[t0 timeIntervalSinceNow] * 1000.0 steps:steps error:@"Q-Token/Q-Key 配置覆盖不完整"];
     }
     if (tokenOverride && keyOverride) {
         token = tokenOverride;
@@ -1283,14 +954,11 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
             token = storedToken;
             qkey = storedKey;
         } else {
-            if (![self renewActiveRefreshLeaseForOwnerID:self.refreshOwnerID generation:generation baseUpdatedAt:baseUpdatedAt]) {
-                return [self finishRefreshWithState:state success:NO src:source ms:-[t0 timeIntervalSinceNow] * 1000.0 steps:steps baseUpdatedAt:baseUpdatedAt error:@"王卡刷新租约续期失败"];
-            }
             NSError *tokErr = nil;
             NSDictionary *tokInfo = [self syncFetchToken:guid qua2:qua2 phone:phone timeout:timeout error:&tokErr];
             if (!tokInfo) {
                 [steps appendFormat:@"Q-Token: 失败 %@\n", tokErr.localizedDescription ?: @"unknown"];
-                return [self finishRefreshWithState:state success:NO src:source ms:-[t0 timeIntervalSinceNow] * 1000.0 steps:steps baseUpdatedAt:baseUpdatedAt error:[NSString stringWithFormat:@"Q-Token 获取失败: %@", tokErr.localizedDescription ?: @"unknown"]];
+                return [self finishRefreshWithState:state success:NO src:source ms:-[t0 timeIntervalSinceNow] * 1000.0 steps:steps error:[NSString stringWithFormat:@"Q-Token 获取失败: %@", tokErr.localizedDescription ?: @"unknown"]];
             }
             actuallyFetchedUpstream = YES;
             token = tokenOverride ?: tokInfo[@"token"];
@@ -1313,7 +981,7 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
     }
     if (!token.length || !qkey.length) {
         [steps appendString:@"Q-Token/Q-Key: 为空\n"];
-        return [self finishRefreshWithState:state success:NO src:source ms:-[t0 timeIntervalSinceNow] * 1000.0 steps:steps baseUpdatedAt:baseUpdatedAt error:@"Q-Token/Q-Key 为空"];
+        return [self finishRefreshWithState:state success:NO src:source ms:-[t0 timeIntervalSinceNow] * 1000.0 steps:steps error:@"Q-Token/Q-Key 为空"];
     }
     state[@"token"] = token;
     state[@"key"] = qkey;
@@ -1332,19 +1000,13 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
             @"mccmnc": [settings[@"kingMccmnc"] isKindOfClass:[NSString class]] ? settings[@"kingMccmnc"] : @"NULLNULL",
             @"cardType": [settings[@"kingCardType"] isKindOfClass:[NSNumber class]] ? settings[@"kingCardType"] : @1,
         };
-        if (![self renewActiveRefreshLeaseForOwnerID:self.refreshOwnerID generation:generation baseUpdatedAt:baseUpdatedAt]) {
-            return [self finishRefreshWithState:state success:NO src:source ms:-[t0 timeIntervalSinceNow] * 1000.0 steps:steps baseUpdatedAt:baseUpdatedAt error:@"王卡刷新租约续期失败"];
-        }
         NSError *proxyErr = nil;
         NSDictionary *proxyInfo = [self syncFetchProxies:guid qua2:qua2 params:params timeout:timeout error:&proxyErr];
         if (!proxyInfo) {
             [steps appendFormat:@"代理池: 失败 %@\n", proxyErr.localizedDescription ?: @"unknown"];
-            return [self finishRefreshWithState:state success:NO src:source ms:-[t0 timeIntervalSinceNow] * 1000.0 steps:steps baseUpdatedAt:baseUpdatedAt error:[NSString stringWithFormat:@"Queen 代理池获取失败: %@", proxyErr.localizedDescription ?: @"unknown"]];
+            return [self finishRefreshWithState:state success:NO src:source ms:-[t0 timeIntervalSinceNow] * 1000.0 steps:steps error:[NSString stringWithFormat:@"Queen 代理池获取失败: %@", proxyErr.localizedDescription ?: @"unknown"]];
         }
         actuallyFetchedUpstream = YES;
-        if (![self renewActiveRefreshLeaseForOwnerID:self.refreshOwnerID generation:generation baseUpdatedAt:baseUpdatedAt]) {
-            return [self finishRefreshWithState:state success:NO src:source ms:-[t0 timeIntervalSinceNow] * 1000.0 steps:steps baseUpdatedAt:baseUpdatedAt error:@"王卡刷新租约续期失败"];
-        }
         queenHttp = [self proxiesSortedByLatency:[self validatedProxyPool:proxyInfo[@"queen_http"]]];
         queenHttps = [self proxiesSortedByLatency:[self validatedProxyPool:proxyInfo[@"queen_https"]]];
         state[@"queen_http"] = queenHttp ?: @[];
@@ -1371,7 +1033,7 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
 
     if (!queenHttp.count && !queenHttps.count) {
         [steps appendString:@"代理池: 为空\n"];
-        return [self finishRefreshWithState:state success:NO src:source ms:-[t0 timeIntervalSinceNow] * 1000.0 steps:steps baseUpdatedAt:baseUpdatedAt error:@"Queen 代理池为空"];
+        return [self finishRefreshWithState:state success:NO src:source ms:-[t0 timeIntervalSinceNow] * 1000.0 steps:steps error:@"Queen 代理池为空"];
     }
 
     [steps appendFormat:@"提交凭证: http=%lu https=%lu\n",
@@ -1383,75 +1045,40 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
     state[@"qtype"] = qtype;
     state[@"credentialInputSignature"] = inputSignature;
     return [self finishRefreshWithState:state success:YES src:source
-                                      ms:-[t0 timeIntervalSinceNow] * 1000.0 steps:nil
-                           baseUpdatedAt:baseUpdatedAt error:nil];
+                                      ms:-[t0 timeIntervalSinceNow] * 1000.0 steps:nil error:nil];
 }
 
-- (BOOL)finishRefreshWithState:(NSMutableDictionary *)state success:(BOOL)success
-                           src:(NSString *)src ms:(double)ms
-                         steps:(NSString *)steps baseUpdatedAt:(double)baseUpdatedAt
-                          error:(NSString *)error {
-    if (![self stopRefreshLeaseHeartbeat]) {
-        success = NO;
-        error = @"王卡刷新租约续期失败";
-    }
+- (BOOL)finishRefreshWithState:(NSMutableDictionary *)state
+                       success:(BOOL)success
+                           src:(NSString *)src
+                            ms:(double)ms
+                         steps:(NSString *)steps
+                         error:(NSString *)error {
+    // 成功：写进程内缓存并追加到共享日志（无锁，其他 App 启动时可直接复用）。
+    // 失败：保留旧凭证继续服务。上游 820/821/823 会再次触发强制刷新；一次取号
+    // 失败绝不至于清空凭证——那会把瞬时故障放大成持续断网。也绝不退化直连。
+    state[@"ts"] = @([[NSDate date] timeIntervalSince1970]);
     if (steps.length) {
         [self pushRefreshLog:success src:src ms:ms msg:steps intoState:state];
     }
-    NSString *leaseOwner = [state[@"refreshLeaseOwner"] isKindOfClass:[NSString class]]
-        ? state[@"refreshLeaseOwner"] : self.refreshOwnerID;
-    NSNumber *leaseGeneration = [state[@"refreshLeaseGeneration"] isKindOfClass:[NSNumber class]]
-        ? state[@"refreshLeaseGeneration"] : @0;
-    LCProxyKingCommitResult commitResult = [self commitRefreshState:state
-                                                       baseUpdatedAt:baseUpdatedAt
-                                                             ownerID:leaseOwner
-                                                          generation:leaseGeneration.unsignedLongLongValue
-                                                          allowWrite:success];
-    BOOL peerCompletedRefresh = commitResult == LCProxyKingCommitResultPeerState;
-    BOOL refreshAvailable = (success && commitResult == LCProxyKingCommitResultWroteState) || peerCompletedRefresh;
-    if (commitResult == LCProxyKingCommitResultLockUnavailable ||
-        commitResult == LCProxyKingCommitResultFenced) {
-        [self scheduleRefreshRetryAfterLockContention];
-    }
-    // 仲裁失利 ≠ 凭证失效。取号本身已经成功（success == YES），只是提交时被其他
-    // 实例抢先（Fenced），或跨进程状态锁/写盘临时不可用。此前这里一律
-    // clearForwarderKingState()，会把一次瞬时的跨进程竞争放大成持续断网——多
-    // LiveContainer / 共享 App 场景下尤其致命——并立刻触发下一轮取号，形成 ~1s
-    // 一圈的抖动循环（上游能看到密集取号）。保留现有凭证继续服务：上游 820/821/823
-    // 与刷新定时器仍会兜底，绝不因此退化为直连。
-    BOOL arbitrationLostButUsable = success && !refreshAvailable &&
-        (commitResult == LCProxyKingCommitResultFenced ||
-         commitResult == LCProxyKingCommitResultLockUnavailable ||
-         commitResult == LCProxyKingCommitResultPersistenceFailed);
-    if (refreshAvailable) {
-        // Reload the winner from disk so this forwarder and concurrent guests
-        // use the same credentials after cross-process arbitration.
+    if (success) {
+        [self appendCredentialRecord:state];
         [self loadCachedStateIntoForwarder];
-    } else if (!arbitrationLostButUsable) {
+        [self startRefreshTimer];
+    } else if (![self stateHasFreshCredentials:[self loadState]
+                               matchingSettings:[self settingsSnapshot]]) {
+        // 确实没有任何可用凭证才清空转发器（fail-closed，但绝不直连）。
         [self clearForwarderKingState];
+        [self scheduleRefreshRetryAfter:15.0];
     }
     [self.lock lock];
     self.refreshing = NO;
-    self.lastRefreshSuccess = refreshAvailable || arbitrationLostButUsable;
-    if (refreshAvailable) {
-        self.refreshArbitrationLossStreak = 0;
-    } else if (arbitrationLostButUsable) {
-        self.refreshArbitrationLossStreak++;
-    }
+    self.lastRefreshSuccess = success;
     self.lastRefresh = LCProxyKingNow();
-    self.lastSource = peerCompletedRefresh ? @"cache-peer" : (src ?: @"");
-    self.lastError = refreshAvailable ? @""
-        : (arbitrationLostButUsable
-            ? @"王卡取号成功但提交被其他实例抢先，已沿用现有凭证继续转发"
-            : (commitResult == LCProxyKingCommitResultLockUnavailable
-                ? @"kingcard-state.json 正被其他实例锁定，稍后自动重试"
-                : (commitResult == LCProxyKingCommitResultPersistenceFailed
-                    ? @"王卡状态无法持久化，已停止转发"
-                    : (commitResult == LCProxyKingCommitResultFenced
-                        ? @"王卡刷新租约已失效，已停止转发"
-                        : (error ?: @"")))));
+    self.lastSource = src ?: @"";
+    self.lastError = success ? @"" : (error ?: @"取号失败，稍后自动重试");
     [self.lock unlock];
-    return refreshAvailable;
+    return success;
 }
 
 - (BOOL)performHealthCheck {
@@ -1555,6 +1182,8 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
     d[@"forwarderDiscardCount"] = @(self.forwarderDiscardCount);
     d[@"refreshArbitrationLossStreak"] = @(self.refreshArbitrationLossStreak);
     d[@"lastForwarderLifecycle"] = self.lastForwarderLifecycle ?: @"";
+    d[@"credentialLogPath"] = [self credentialLogPath] ?: @"";
+    d[@"credentialCacheCount"] = @(self.cachedCredentialState.count);
     d[@"refreshLog"] = [self.refreshLog copy];
     NSMutableDictionary *state = [self loadState];
     NSString *guid = [state[@"guid"] isKindOfClass:[NSString class]] ? state[@"guid"] : @"";

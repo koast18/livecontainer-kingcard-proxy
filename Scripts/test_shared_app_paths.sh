@@ -114,9 +114,13 @@ assert '[lcSharedUtils respondsToSelector:sel]' in updater, \
 
 # 王卡状态仍以 canonical 为权威，但同时写入/锁定所有可访问数据目录，
 # 避免共享 App 因 AppGroup 目录不可见/不可写而完全丢失状态。
-assert 'LCProxyCanonicalDataDirectory' in king, 'King state is not canonicalized'
-assert 'for (NSString *dir in LCProxyAllDataDirectories())' in king, \
-    'King state lock does not cover all writable data directories'
-assert 'saveState:(NSMutableDictionary *)state error:' in king, 'King state write does not report failure'
+# 王卡凭证以追加式共享日志持久化：跨 App 复用未过期凭证但**不加锁**。
+# canonical 目录不可写时退回 dylib 推导目录，再不行就纯内存运行——持久化失败
+# 绝不能变成断网。多 LiveContainer 场景下不再有跨进程锁/租约/围栏。
+assert 'LCProxyCanonicalDataDirectory' in king, 'King credential log has no canonical App Group path'
+assert 'kingcard-credentials.log' in king, 'King credential log path is missing'
+assert 'O_WRONLY | O_APPEND | O_CREAT' in king, 'credential log writes are not append-only'
+assert 'kingcard-state.json' not in king and 'acquireStateLocks' not in king, \
+    'King still carries the removed cross-process arbitration machinery'
 print('test_shared_app_paths: OK')
 PY

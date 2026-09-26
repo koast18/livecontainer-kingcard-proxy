@@ -33,36 +33,89 @@ assert 'refreshCredentialsAsync' in king, 'missing refreshCredentialsAsync'
 # Timer must schedule based on the earliest token/proxy expiry.
 assert 'earliestExpiry' in king, 'missing preemptive timer scheduling'
 
-# A valid App Group state is authoritative. Private copies may only seed a
-# missing/corrupt canonical file, never win simply because their mtime is newer.
-assert 'LCProxyCanonicalDataDirectory' in king, 'King state has no canonical App Group path'
-assert 'canonicalState' in king and 'newestFallbackState' in king, \
-    'King state does not distinguish canonical storage from migration fallback'
-assert 'return [self canonicalState] ?: [self newestFallbackState]' in king, \
-    'King load order permits a fallback to override canonical state'
-assert 'for (NSString *dir in LCProxyAllDataDirectories())' not in king[king.index('- (NSMutableDictionary *)loadState'):king.index('- (BOOL)saveState:', king.index('- (NSMutableDictionary *)loadState'))], \
-    'King state still arbitrates all copies instead of preferring canonical'
-assert 'NSDataWritingAtomic' in king and 'isEqualToDictionary:state' in king, \
-    'state writes are not atomically verified before success is reported'
+# ---------------------------------------------------------------------------
+# 凭证存取 = 进程内缓存 + 追加式共享日志。**没有跨进程锁、没有租约、没有围栏**。
+# Q-Token 有效期 2 小时、代理池 8 小时，跨进程仲裁换不来任何东西，只会在多
+# LiveContainer 场景下制造持续断网。这里固化"简单方案"的全部不变量。
+# ---------------------------------------------------------------------------
 
-# A persistent fencing lease keeps synchronous network work outside the lock
-# while ensuring only one instance can publish its result.
-assert 'refreshLeaseOwner' in king and 'refreshLeaseGeneration' in king, \
-    'King refresh lacks persistent owner/generation lease fields'
-assert 'refreshLeaseBaseUpdatedAt' in king and 'refreshLeaseExpiresAt' in king, \
-    'King refresh lease lacks fencing timestamp or TTL'
-assert 'refreshInvalidatingGeneration' in king, \
-    'forced refresh lacks a persistent invalidating generation marker'
-assert 'acquireRefreshLeaseWithForce' in king, 'missing refresh lease acquisition'
-assert 'renewRefreshLeaseForOwnerID' in king and 'startRefreshLeaseHeartbeatForOwnerID' in king, \
-    'slow refreshes lack a persistent lease heartbeat'
-assert 'LCProxyKingRefreshLeaseHeartbeatInterval = 20;' in king, \
-    'refresh lease heartbeat does not renew before the 75-second lease can expire'
-assert 'LCProxyKingCommitResultFenced' in king, 'expired lease results are not fenced'
-assert 'LCProxyKingCommitResultPersistenceFailed' in king, 'state persistence failure is reported as success'
-assert 'kp_forwarder_clear_king_state' in king, 'failed refresh does not clear stale forwarder state'
-assert 'scheduleRefreshRetryAfterLockContention' in king, 'no fast retry when the state lock is held by another instance'
-# - latency probing must be capped so the state lock is not held for tens of seconds
+# The whole arbitration machinery must be gone, not just bypassed.
+for gone in (
+    'acquireStateLocks', 'releaseStateLocks', 'stateLockPaths', 'stateInDirectory',
+    'acquireRefreshLeaseWithForce', 'renewRefreshLeaseForOwnerID',
+    'startRefreshLeaseHeartbeatForOwnerID', 'renewActiveRefreshLeaseForOwnerID',
+    'stopRefreshLeaseHeartbeat', 'commitRefreshState', 'LCProxyKingCommitResult',
+    'LCProxyKingLeaseResult', 'refreshLeaseOwner', 'refreshLeaseGeneration',
+    'refreshLeaseExpiresAt', 'refreshLeaseHeartbeat', 'refreshLeaseValid',
+    'refreshInvalidatingGeneration', 'baseUpdatedAt', 'baseUpdatedAt:baseUpdatedAt',
+    'scheduleRefreshRetryAfterLockContention', 'kingcard-state.json',
+    'kingcard-state.lock', 'LCProxyKingRefreshLeaseTTL', 'canonicalState',
+    'newestFallbackState', 'saveState:',
+):
+    assert gone not in king, f'arbitration machinery still present: {gone}'
+
+# The append-only credential log is the only cross-process artifact.
+assert 'kingcard-credentials.log' in king, 'missing append-only credential log path'
+assert 'O_WRONLY | O_APPEND | O_CREAT' in king, 'credential log writes are not append-only'
+assert 'appendCredentialRecord:' in king, 'missing append-only record writer'
+assert 'newestValidRecordFromLog' in king, 'missing newest-valid-record reader'
+assert 'LCProxyKingCredentialLogMaxLines = 64;' in king, 'credential log is not size capped'
+assert 'trimCredentialLogIfNeeded' in king, 'credential log is never trimmed'
+# A corrupted or truncated line must be skipped, never fatal.
+assert 'if (![NSJSONSerialization isValidJSONObject:stored]) return;' in king, \
+    'unserializable record aborts instead of falling back to memory'
+assert re.search(r'if \(!\[obj isKindOfClass:\[NSDictionary class\]\]\) continue;', king), \
+    'a corrupt log line is not skipped'
+# A refreshLog (UI-only history) must not bloat every persisted record.
+assert 'removeObjectForKey:@"refreshLog"' in king, 'UI refresh log is persisted per record'
+
+# Persistence is best-effort: if the log is unwritable the process must keep
+# working purely in memory rather than failing closed for a write problem.
+store_start = king.index('- (NSString *)credentialLogPath {')
+store_end = king.index('- (NSMutableDictionary *)newestValidRecordFromLog {', store_start)
+store = king[store_start:store_end]
+assert 'return [local stringByAppendingPathComponent:@"kingcard-credentials.log"];' in store \
+    and 'if (!path.length) return;' in store, \
+    'unwritable credential storage must degrade to in-memory operation'
+assert 'open(path.fileSystemRepresentation' in store, 'append must use a raw O_APPEND write'
+assert 'close(fd);' in store, 'append leaves the log file descriptor open'
+
+# loadState prefers the in-process cache and only reads the log as a seed.
+load_start = king.index('- (NSMutableDictionary *)loadState {')
+load_end = king.index('// ---------------------------------------------------------------------------', load_start)
+load = king[load_start:load_end]
+assert 'self.cachedCredentialState' in load and 'newestValidRecordFromLog' in load, \
+    'loadState does not prefer the in-process cache over the shared log'
+
+# Failure must not clear still-valid credentials: a lost race or a transient
+# write error must never escalate into a total outage.
+fin_start = king.index('- (BOOL)finishRefreshWithState:')
+fin_end = king.index('- (BOOL)performHealthCheck {', fin_start)
+fin = king[fin_start:fin_end]
+assert 'appendCredentialRecord:state' in fin, 'successful refresh is not persisted'
+assert re.search(r'if \(success\) \{', fin), 'finishRefresh does not branch on success'
+clear_at = fin.index('clearForwarderKingState')
+guard_at = fin.index('stateHasFreshCredentials:[self loadState]')
+assert guard_at < clear_at, \
+    'a failed refresh clears the forwarder without checking for still-valid credentials'
+assert 'scheduleRefreshRetryAfter:15.0' in fin, 'a failed refresh does not retry with backoff'
+
+# Cached-credential validity must not depend on any cross-process marker.
+fresh_start = king.index('- (BOOL)stateHasFreshCredentials:(NSDictionary *)state matchingSettings:')
+fresh_end = king.index('- (BOOL)stateHasFreshCredentials:(NSDictionary *)state {', fresh_start)
+freshness = king[fresh_start:fresh_end]
+for key in ('@"guid"', '@"qua2"', '@"token"', '@"key"', '@"queen_http"', '@"queen_https"',
+            '@"tokenExpireEpoch"', '@"proxyExpireEpoch"', '@"credentialInputSignature"'):
+    assert key in freshness, f'freshness check ignores {key}'
+assert 'refreshInvalidatingGeneration' not in freshness, \
+    'freshness still consults a removed cross-process poison flag'
+
+# Fail-closed routing is unchanged: no credentials means drop, never direct.
+assert 'kp_forwarder_clear_king_state' in king, 'stale forwarder state is not cleared'
+assert 'if (force) [self clearForwarderKingState];' in king, \
+    'a forced refresh leaves stale credentials in its forwarder'
+
+# Latency probing must stay capped so a refresh cannot stall for tens of seconds.
 assert 'KP_LATENCY_PROBE_MAX' in king, 'sequential latency probing is not capped'
 latency_sort_start = king.index('- (NSArray<NSString *> *)proxiesSortedByLatency:')
 latency_sort_end = king.index('- (NSString *)localRandomGuid', latency_sort_start)
@@ -70,64 +123,10 @@ latency_sort = king[latency_sort_start:latency_sort_end]
 assert latency_sort.count('tcpConnectMsForProxy:proxy') == 1, \
     'latency sort probes a proxy more than once'
 
-# Cross-process locks are only an arbitration boundary: a peer must never be
-# blocked behind the 15-second GUID/token/proxy requests or latency probes.
+# Credential bootstrap must not be gated on route publication.
 refresh_start = king.index('- (BOOL)refreshCredentialsWithForce:')
-refresh_end = king.index('- (BOOL)finishRefreshWithState:', refresh_start)
-refresh = king[refresh_start:refresh_end]
-first_network_request = refresh.index('syncFetchGuid')
-assert refresh.index('acquireRefreshLeaseWithForce') < first_network_request, \
-    'refresh starts PBProxy work before persistently claiming its lease'
-assert 'baseUpdatedAt' in refresh and 'generation' in refresh, \
-    'refresh does not retain fencing timestamp and generation'
-assert 'commitRefreshState:state' in king and 'generation:leaseGeneration.unsignedLongLongValue' in king, \
-    'refresh does not reacquire state locks for its atomic commit'
-assert 'LCProxyKingCommitResultPeerState' in king, \
-    'a newer peer state cannot win refresh arbitration'
-assert 'LCProxyKingCommitResultNotCommitted' in king, \
-    'a failed refresh does not clear its persistent lease'
-assert 'commitResult == LCProxyKingCommitResultFenced' in king and \
-       'scheduleRefreshRetryAfterLockContention' in king, \
-    'a fenced refresh does not retry after peer lease arbitration'
-commit_start = king.index('- (LCProxyKingCommitResult)commitRefreshState:', king.index('@implementation LCProxyKing'))
-commit_end = king.index('- (void)clearForwarderKingState', commit_start)
-commit = king[commit_start:commit_end]
-assert 'leaseExpiresAt.doubleValue <=' not in commit, \
-    'an unchallenged owner is fenced solely because a slow refresh crossed its TTL'
-assert 'removeObjectForKey:@"refreshInvalidatingGeneration"' in commit, \
-    'a completed refresh leaves its invalidating generation permanently active'
-freshness_start = king.index('- (BOOL)stateHasFreshCredentials:(NSDictionary *)state matchingSettings:')
-freshness_end = king.index('- (BOOL)stateHasFreshCredentials:(NSDictionary *)state {', freshness_start)
-freshness = king[freshness_start:freshness_end]
-assert 'refreshInvalidatingGeneration' in freshness and 'return NO' in freshness, \
-    'cached credentials remain usable while a forced refresh generation is in flight'
-acquire_start = king.index('- (LCProxyKingLeaseResult)acquireRefreshLeaseWithForce:', king.index('@implementation LCProxyKing'))
-acquire_end = king.index('- (BOOL)renewRefreshLeaseForOwnerID:', acquire_start)
-acquire = king[acquire_start:acquire_end]
-assert 'if (force)' in acquire and 'latest[@"refreshInvalidatingGeneration"] = @(generation);' in acquire, \
-    'force refresh does not publish its invalidation marker atomically with the lease'
-assert 'if (force) [self clearForwarderKingState];' in refresh, \
-    'the instance starting a forced refresh leaves stale credentials in its forwarder'
-assert 'renewActiveRefreshLeaseForOwnerID:self.refreshOwnerID' in refresh, \
-    'network requests and latency probes do not explicitly renew their lease'
-ready_start = king.index('- (BOOL)isReady {')
-ready_end = king.index('- (int)localForwarderPort', ready_start)
-ready = king[ready_start:ready_end]
-assert 'stateHasFreshCredentials:[self loadState]' in ready, \
-    'isReady ignores a peer\'s forced-refresh invalidation marker'
-for key in ('@"guid"', '@"qua2"', '@"token"', '@"key"', '@"qtype"',
-            '@"queen_http"', '@"queen_https"', '@"tokenExpireEpoch"',
-            '@"proxyExpireEpoch"'):
-    assert key in commit, \
-        f'failed refresh leaves persistent {key} available for a stale reload'
-network_refresh = refresh[refresh.index('if (!guidOverride && (force || !guid))'):]
-assert 'self.lastSource =' not in network_refresh, \
-    'network refresh writes status outside self.lock'
-assert '- (NSString *)syncFetchGuid:' in king, 'missing synchronous GetGuid bridge'
-assert 'guid = [self localRandomGuid];' in refresh, \
-    'PBProxy GetGuid failure must fall back to local GUID so token/proxy refresh can continue'
-assert 'if (!self.routePublished) {' not in refresh, \
-    'credential bootstrap must not be blocked before route publication'
+assert 'if (!self.routePublished) {' not in king[refresh_start:king.index('- (BOOL)finishRefreshWithState:')], \
+    'credential bootstrap is blocked before route publication'
 
 # Explicit credentials always override remote refreshes, including forced ones.
 assert '!guidOverride && (force || !guid)' in king, \
