@@ -192,8 +192,10 @@ NSString *const LCProxyForwarderLifecycleChangedNotification = @"LCProxyForwarde
         self.lastSettingsSignature = nil;
         self.desiredForwarderRunning = NO;
         [self.lock unlock];
-        // 不能在持有 self.lock 时 stop/free（client 线程可能正等 self.lock 做取号），
-        // 更不能在需要及时返回的路径上同步 stop/free —— 见 retireForwarder:。
+        // 不要在持有 self.lock 时 stop/free：kp_forwarder_stop 会等待所有 client
+        // 线程退出，而 client 线程失败重试时可能正在等待 self.lock 做取号刷新，
+        // 持锁等待会形成死锁。退役一律交给 retireForwarder: 异步回收 —— 它连
+        // lifecycleLock 都不取，理由见其注释（同步退役会把 runtime apply 卡死 20s）。
         [self retireForwarder:oldForwarder];
         return;
     }
