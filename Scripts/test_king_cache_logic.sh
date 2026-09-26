@@ -58,6 +58,12 @@ for gone in (
 # The append-only credential log is the only cross-process artifact.
 assert 'NSString *const LCProxyForwarderLifecycleChangedNotification =' in king, \
     'forwarder lifecycle notification has no definition (linker error)'
+# 生命周期通知必须限频：转发器持续无法启动时 notify→apply→notify 会形成紧循环烧 CPU
+# （observer 会立刻重跑 runtime apply，而 applyConfig 在无旧实例时会马上重试）。
+assert 'LCProxyKingLifecycleNotifyMinInterval' in king, \
+    'forwarder lifecycle notification is not rate limited (notify/apply spin risk)'
+assert re.search(r'if \(now - self\.lastLifecycleNotifyAt < LCProxyKingLifecycleNotifyMinInterval\) return;', king), \
+    'lifecycle notification rate-limit check is missing'
 assert 'kingcard-credentials.log' in king, 'missing append-only credential log path'
 assert 'O_WRONLY | O_APPEND | O_CREAT' in king, 'credential log writes are not append-only'
 assert 'appendCredentialRecord:' in king, 'missing append-only record writer'

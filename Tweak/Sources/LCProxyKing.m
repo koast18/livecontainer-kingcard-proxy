@@ -62,6 +62,8 @@ NSString *const LCProxyForwarderLifecycleChangedNotification = @"LCProxyForwarde
 @property (nonatomic, assign) NSUInteger forwarderDiscardCount;
 @property (nonatomic, assign) NSUInteger refreshArbitrationLossStreak;
 @property (nonatomic, copy) NSString *lastForwarderLifecycle;
+// 生命周期通知的限频时间戳；见 notifyForwarderLifecycle:。
+@property (nonatomic, assign) NSTimeInterval lastLifecycleNotifyAt;
 @property (nonatomic, copy) NSString *lastRefresh;
 @property (nonatomic, copy) NSString *lastSource;
 @property (nonatomic, copy) NSString *lastError;
@@ -137,9 +139,20 @@ NSString *const LCProxyForwarderLifecycleChangedNotification = @"LCProxyForwarde
 }
 
 // 只在“转发器消失且配置仍需要它”的路径上调用。observer 会重跑一次 runtime apply，
-// 因此绝不能在持有 self.lock 时同步发通知（observer 会回到 applyConfig）。
+// 因此有两条硬约束：
+//   ① 绝不能在持有 self.lock 时同步发通知（observer 会回到 applyConfig）；
+//   ② 必须限频 —— 若转发器持续无法启动，notify→apply→notify 会形成紧循环烧 CPU
+//      （实测过 applyConfig 在无旧实例时会立刻重试，而重试又失败）。
+// 限频下限取 5s，与看门狗的重试节奏一致。lastForwarderLifecycle 仍每次更新，
+// 诊断信息不受限频影响。所有调用点都在 applyConfig 内、由 lifecycleLock 串行化，
+// 因此 lastLifecycleNotifyAt 无需额外加锁。
+static const NSTimeInterval LCProxyKingLifecycleNotifyMinInterval = 5.0;
+
 - (void)notifyForwarderLifecycle:(NSString *)reason {
     self.lastForwarderLifecycle = reason ?: @"";
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    if (now - self.lastLifecycleNotifyAt < LCProxyKingLifecycleNotifyMinInterval) return;
+    self.lastLifecycleNotifyAt = now;
     NSString *payload = reason ?: @"";
     dispatch_async(dispatch_get_main_queue(), ^{
         [[NSNotificationCenter defaultCenter] postNotificationName:LCProxyForwarderLifecycleChangedNotification
