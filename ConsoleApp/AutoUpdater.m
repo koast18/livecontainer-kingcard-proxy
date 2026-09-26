@@ -334,13 +334,27 @@ static BOOL LCProxyCodeSignatureValid(NSString *path) {
         [self diag:@"[签名] %@ 尚未签名。请在 LiveContainer 的 Tweaks 页签名后重新打开本控制台。", asset];
     }
 
-    // 清理旧版本和未签名副本。
-    [self cleanOldDylibsIn:normalTweaks keep:asset];
+    // 清理策略：只清理"已被更新的已签名版本取代"的旧文件。
+    // 关键：新下载的版本在用户签名之前绝不能被当作可用的替代品——以前的写法是
+    // [self cleanOldDylibsIn:sharedTweaks keep:(sharedSigned ? asset : nil)]，当新版
+    // 尚未签名时 keep=nil 会把共享目录里**所有** LCProxyControl-*.dylib 删光；
+    // 私有目录同样会因为 keep:asset（未签名新版）而删掉旧的已签名版本。结果是
+    // 用户每次打开控制台下载新版后，共享 App 与私有 App 同时失去可用 dylib，
+    // 必须完成"签名 + 重开控制台"才恢复。现在未签名时什么都不删。
+    if (normalSigned) {
+        [self cleanOldDylibsIn:normalTweaks keep:asset];
+    } else {
+        [self diag:@"[清理] 新版尚未签名，保留私有目录中已有的已签名 dylib"];
+    }
     if (sharedTweaks) {
-        // 共享目录只保留已签名的当前版本。
+        // 共享目录只保留已签名的当前版本；当前版本未就位或未签名时保持原样。
         NSString *sharedDst = [sharedTweaks stringByAppendingPathComponent:asset];
         BOOL sharedSigned = [[NSFileManager defaultManager] fileExistsAtPath:sharedDst] && LCProxyCodeSignatureValid(sharedDst);
-        [self cleanOldDylibsIn:sharedTweaks keep:sharedSigned ? asset : nil];
+        if (sharedSigned) {
+            [self cleanOldDylibsIn:sharedTweaks keep:asset];
+        } else {
+            [self diag:@"[清理] 共享目录未就位/未签名，保留其中已有的已签名 dylib（共享 App 仍可加载）"];
+        }
     }
 
     if (!normalSigned) {

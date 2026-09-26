@@ -71,6 +71,20 @@ assert re.search(r'if \(!\[obj isKindOfClass:\[NSDictionary class\]\]\) continue
 # A refreshLog (UI-only history) must not bloat every persisted record.
 assert 'removeObjectForKey:@"refreshLog"' in king, 'UI refresh log is persisted per record'
 
+# 取号历史必须跨进程可见：共享 App 进程的内部状态此前完全不可见（App Group 在
+# 文件应用里看不到，而 console 只能读到自己的进程）。追加到 canonical 目录的
+# kingcard-refresh.log 后，任意实例的控制台都能读到全部进程的取号历史。
+assert 'kingcard-refresh.log' in king, 'missing cross-process refresh log'
+assert 'appendSharedRefreshLogEntry:' in king, 'refresh log entries are not shared across processes'
+assert 'LCProxyKingSharedRefreshLogMaxLines' in king, 'shared refresh log is not size capped'
+assert 'trimAppendLogAtPath:' in king, 'append-only logs are never trimmed'
+assert '[self appendSharedRefreshLogEntry:entry];' in king, \
+    'pushRefreshLog does not publish to the cross-process refresh log'
+server = Path('Tweak/Sources/LCProxyServer.m').read_text(encoding='utf-8')
+assert 'kingRefreshLogShared' in server and 'trafficLogTail' in server, \
+    '/api/status does not expose the cross-process refresh/traffic logs'
+assert 'tailOfAppGroupLog:' in server, 'no shared-log tail reader in the console server'
+
 # Persistence is best-effort: if the log is unwritable the process must keep
 # working purely in memory rather than failing closed for a write problem.
 store_start = king.index('- (NSString *)credentialLogPath {')
@@ -89,7 +103,8 @@ assert 'close(fd);' in store, 'append leaves the log file descriptor open'
 _lock_depth = 0
 _lock_start = None
 _forbidden = ('[self loadState]', '[self credentialLogPath]', '[self appendCredentialRecord:',
-              '[self newestValidRecordFromLog]', '[self trimCredentialLogIfNeeded]')
+              '[self newestValidRecordFromLog]', '[self trimCredentialLogIfNeeded]',
+              '[self trimAppendLogAtPath:', '[self appendSharedRefreshLogEntry:')
 for _i, _line in enumerate(king.split('\n'), 1):
     if '[self.lock lock]' in _line:
         _lock_depth += 1

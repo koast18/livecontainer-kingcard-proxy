@@ -112,6 +112,16 @@ assert '[cls respondsToSelector:selector]' in paths, \
 assert '[lcSharedUtils respondsToSelector:sel]' in updater, \
     'console updater can call an unavailable LCSharedUtils selector'
 
+# 未签名的新版绝不能清空私有/共享 tweak 目录里已签名的旧版：以前 keep:nil 会在新版
+# 未签名时把共享目录删空，导致共享 App 在"下载→签名→重开控制台"完成之前完全没有
+# dylib 可加载。清理必须只在当前版本已就位且已签名时进行。
+assert '[self cleanOldDylibsIn:sharedTweaks keep:sharedSigned ? asset : nil];' not in updater, \
+    'console updater still wipes the shared tweak folder when the new dylib is unsigned'
+assert 'if (sharedSigned) {\n            [self cleanOldDylibsIn:sharedTweaks keep:asset];' in updater, \
+    'shared tweak cleanup is not gated on the new dylib being signed and in place'
+assert 'if (normalSigned) {\n        [self cleanOldDylibsIn:normalTweaks keep:asset];' in updater, \
+    'private tweak cleanup is not gated on the new dylib being signed'
+
 # 王卡状态仍以 canonical 为权威，但同时写入/锁定所有可访问数据目录，
 # 避免共享 App 因 AppGroup 目录不可见/不可写而完全丢失状态。
 # 王卡凭证以追加式共享日志持久化：跨 App 复用未过期凭证但**不加锁**。

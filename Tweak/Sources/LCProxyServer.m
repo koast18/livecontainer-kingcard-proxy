@@ -79,6 +79,25 @@ static const NSUInteger LCProxyDefaultPort = 19092;
     return 0;
 }
 
+// 读取 App Group canonical 目录下某个日志文件的末尾若干行。这些文件由所有
+// LiveContainer 实例共同以 O_APPEND 追加，所以从**任何一个**进程的控制台都能看到
+// 其他进程（尤其是共享 App 进程）的活动 —— 共享 App 的进程内诊断此前完全不可见，
+// 这是排查"共享 App 无法联网"的关键入口。
+- (NSArray<NSString *> *)tailOfAppGroupLog:(NSString *)name maxLines:(NSUInteger)maxLines {
+    NSString *dir = LCProxyCanonicalDataDirectory();
+    if (!dir.length || !name.length) return @[];
+    NSString *path = [dir stringByAppendingPathComponent:name];
+    NSString *text = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+    if (!text.length) return @[];
+    NSArray<NSString *> *lines = [text componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
+    NSMutableArray<NSString *> *kept = [NSMutableArray array];
+    for (NSString *l in lines) {
+        if (l.length) [kept addObject:l];
+    }
+    if (kept.count <= maxLines) return kept;
+    return [kept subarrayWithRange:NSMakeRange(kept.count - maxLines, maxLines)];
+}
+
 - (NSDictionary *)configPayload {
     NSDictionary *cfg = [[LCProxyConfig shared] load];
     NSMutableDictionary *d = [NSMutableDictionary dictionaryWithDictionary:cfg];
@@ -109,6 +128,11 @@ static const NSUInteger LCProxyDefaultPort = 19092;
     d[@"dataDirectories"] = LCProxyAllDataDirectories();
     d[@"trafficLogPath"] = [LCProxyDataDirectory() stringByAppendingPathComponent:@"traffic.log"];
     d[@"king"] = [[LCProxyKing shared] status];
+    // 跨进程诊断：这两个文件位于 App Group canonical 目录，所有实例共同追加。
+    // 打开任意一个 App 的控制台即可看到全部进程（含共享 App）的取号历史与
+    // 按连接转发结果，无需再靠文件应用/受限于 App Group 不可见。
+    d[@"kingRefreshLogShared"] = [self tailOfAppGroupLog:@"kingcard-refresh.log" maxLines:30];
+    d[@"trafficLogTail"] = [self tailOfAppGroupLog:@"traffic.log" maxLines:60];
     NSDictionary *runtimeDiag = [[LCProxyConfig shared] runtimeDiagnostics];
     if ([runtimeDiag isKindOfClass:[NSDictionary class]]) {
         d[@"runtime"] = runtimeDiag;

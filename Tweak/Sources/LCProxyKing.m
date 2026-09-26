@@ -86,6 +86,8 @@ NSString *const LCProxyForwarderLifecycleChangedNotification = @"LCProxyForwarde
 - (void)appendCredentialRecord:(NSDictionary *)record;
 - (NSMutableDictionary *)newestValidRecordFromLog;
 - (void)trimCredentialLogIfNeeded;
+- (void)trimAppendLogAtPath:(NSString *)path maxLines:(NSUInteger)maxLines;
+- (void)appendSharedRefreshLogEntry:(NSDictionary *)entry;
 - (void)notifyForwarderLifecycle:(NSString *)reason;
 @end
 
@@ -558,6 +560,7 @@ NSString *const LCProxyForwarderLifecycleChangedNotification = @"LCProxyForwarde
 // 读取一次用于种子，并在每次取号成功后追加。
 
 static const NSUInteger LCProxyKingCredentialLogMaxLines = 64;
+static const NSUInteger LCProxyKingSharedRefreshLogMaxLines = 200;
 
 - (NSString *)credentialLogPath {
     // 路径只取决于数据目录，解析一次即可缓存，避免每次都做目录创建 IO。
@@ -613,8 +616,13 @@ static const NSUInteger LCProxyKingCredentialLogMaxLines = 64;
 }
 
 - (void)trimCredentialLogIfNeeded {
-    NSString *path = [self credentialLogPath];
-    if (!path.length) return;
+    [self trimAppendLogAtPath:[self credentialLogPath] maxLines:LCProxyKingCredentialLogMaxLines];
+}
+
+// 通用的"追加式日志裁剪"：超过上限就把后半段留下、前半段丢掉。写入失败静默忽略
+// ——这些日志纯属诊断，任何 IO 问题都不能影响转发。
+- (void)trimAppendLogAtPath:(NSString *)path maxLines:(NSUInteger)maxLines {
+    if (!path.length || maxLines == 0) return;
     NSString *text = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
     if (!text.length) return;
     NSArray<NSString *> *all = [text componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
@@ -622,11 +630,40 @@ static const NSUInteger LCProxyKingCredentialLogMaxLines = 64;
     for (NSString *l in all) {
         if (l.length) [kept addObject:l];
     }
-    if (kept.count <= LCProxyKingCredentialLogMaxLines) return;
-    NSUInteger keep = LCProxyKingCredentialLogMaxLines / 2;
+    if (kept.count <= maxLines) return;
+    NSUInteger keep = MAX((NSUInteger)1, maxLines / 2);
     NSRange cut = NSMakeRange(kept.count - keep, keep);
     NSString *out = [[kept subarrayWithRange:cut] componentsJoinedByString:@"\n"];
     [out writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
+
+// 把一行紧凑的取号记录追加到 App Group 共享日志文件，让任何 LiveContainer 实例
+// 的控制台都能看到本进程的取号历史 —— 共享 App 进程的内部状态此前完全不可见
+// （文件应用看不到 App Group，console 又只能读到自己的进程）。与凭证日志同一
+// 思路：O_APPEND 行级追加、无需加锁、任何失败静默忽略（纯诊断）。
+- (void)appendSharedRefreshLogEntry:(NSDictionary *)entry {
+    NSString *dir = [[self credentialLogPath] stringByDeletingLastPathComponent];
+    if (!dir.length) return;
+    NSString *path = [dir stringByAppendingPathComponent:@"kingcard-refresh.log"];
+    NSDictionary *compact = @{
+        @"ts": [entry[@"ts"] isKindOfClass:[NSNumber class]] ? entry[@"ts"] : @([[NSDate date] timeIntervalSince1970]),
+        @"pid": @(getpid()),
+        @"ok": [entry[@"ok"] isKindOfClass:[NSNumber class]] ? entry[@"ok"] : @NO,
+        @"src": [entry[@"src"] isKindOfClass:[NSString class]] ? entry[@"src"] : @"",
+        @"ms": [entry[@"ms"] isKindOfClass:[NSNumber class]] ? entry[@"ms"] : @0,
+        @"msg": [entry[@"msg"] isKindOfClass:[NSString class]] ? entry[@"msg"] : @"",
+    };
+    if (![NSJSONSerialization isValidJSONObject:compact]) return;
+    NSData *line = [NSJSONSerialization dataWithJSONObject:compact options:0 error:nil];
+    if (!line.length) return;
+    NSMutableData *payload = [line mutableCopy];
+    [payload appendData:[@"\n" dataUsingEncoding:NSUTF8StringEncoding]];
+    int fd = open(path.fileSystemRepresentation, O_WRONLY | O_APPEND | O_CREAT, 0644);
+    if (fd < 0) return;
+    ssize_t ignored = write(fd, payload.bytes, payload.length);
+    (void)ignored;
+    close(fd);
+    [self trimAppendLogAtPath:path maxLines:LCProxyKingSharedRefreshLogMaxLines];
 }
 
 // 取"最新且仍有效"的一条。损坏行、过期行、与当前设置不匹配的行全部跳过；
@@ -839,8 +876,9 @@ static const NSUInteger KP_LATENCY_PROBE_MAX = 8;
 
 static const NSUInteger LCProxyKingRefreshLogMax = 20;
 
-// 取号日志：内存环形缓冲（新→旧，最多 LCProxyKingRefreshLogMax 条）。成功刷新
-// 会随凭证记录追加到 kingcard-credentials.log；失败刷新只留在本进程，避免污染日志。
+// 取号日志：内存环形缓冲（新→旧，最多 LCProxyKingRefreshLogMax 条）供本进程控制台
+// 显示；同时把每条压缩后追加到 App Group 的 kingcard-refresh.log，让**其他**
+// LiveContainer 实例的控制台也能看到本进程（例如共享 App）的取号历史。
 - (void)pushRefreshLog:(BOOL)ok src:(NSString *)src ms:(double)ms msg:(NSString *)msg intoState:(NSMutableDictionary *)state {
     NSDictionary *entry = @{
         @"ts": @([[NSDate date] timeIntervalSince1970]),
@@ -857,6 +895,7 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
     NSArray *snapshot = [self.refreshLog copy];
     [self.lock unlock];
     if (state) state[@"refreshLog"] = snapshot;
+    [self appendSharedRefreshLogEntry:entry];
 }
 
 // ---------------------------------------------------------------------------
