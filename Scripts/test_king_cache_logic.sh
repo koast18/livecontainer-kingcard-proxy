@@ -189,6 +189,21 @@ assert '[self isRunning]' in refresh and 'requestRuntimeApplyAsync' in refresh, 
     'refreshCredentials does not rebuild a missing forwarder (no self-heal watchdog)'
 assert 'scheduleRefreshRetryAfter:5.0' in refresh, \
     'watchdog does not schedule a bounded retry after requesting a rebuild'
+# 看门狗必须有一条**不依赖 runtimeQueue** 的兜底自愈：applyRuntimeSnapshot 全程持有
+# lifecycleLock 且跑在串行 runtimeQueue 上，只要它在 applyConfig 里被任何无界等待
+# 卡住，常规 apply 路径（含看门狗发出的 requestRuntimeApplyAsync）就永久排队，
+# 表现为"彻底断网且永不恢复"。直接自愈在被堵队列之外新建转发器并就地钉住 override。
+assert 'healMissingForwarderDirectly' in refresh, \
+    'watchdog has no fallback heal independent of the (possibly wedged) runtimeQueue'
+assert 'lcproxy_control_set_proxy_override("127.0.0.1", port)' in king, \
+    'direct heal does not pin the proxy override to the new forwarder port'
+assert 'lcproxy_control_reload_config()' in king, \
+    'direct heal does not make the C layer re-read the pinned override'
+_heal = king[king.index('- (void)healMissingForwarderDirectly {'):]
+assert 'if ([self isRunning]) return;' in _heal, \
+    'direct heal lacks the already-healthy guard (would churn forwarders)'
+assert 'kp_forwarder_stop(old' not in _heal and 'kp_forwarder_free(old' not in _heal, \
+    'direct heal blocks on the old forwarder (defeats the purpose of bypassing the wedge)'
 
 # 【已撤回】转发器重建顺序（0.5.54 引入、0.5.56 撤回）
 #

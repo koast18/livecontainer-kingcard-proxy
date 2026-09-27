@@ -88,6 +88,7 @@ NSString *const LCProxyForwarderLifecycleChangedNotification = @"LCProxyForwarde
 - (NSString *)credentialInputSignatureForSettings:(NSDictionary *)settings;
 - (void)clearForwarderKingState;
 - (void)retireForwarder:(kp_forwarder *)fw;
+- (void)healMissingForwarderDirectly;
 - (NSString *)credentialLogPath;
 - (void)appendCredentialRecord:(NSDictionary *)record;
 - (NSMutableDictionary *)newestValidRecordFromLog;
@@ -284,9 +285,10 @@ static const NSTimeInterval LCProxyKingLifecycleNotifyMinInterval = 5.0;
 // 就会把最长 20s 的等待重新转嫁到 apply 路径上，等于没修。串行队列本身已保证同一
 // 时刻只回收一个实例。
 //
-// ⚠️ v0.5.56 起本方法与 forwarderReaperQueue 一并**停用**（保留但不再被调用）：
-// v0.5.54 引入的"先启动新的、再原子替换、最后异步回收"与"签名 dylib 后控制台一打开
-// 就黑屏"同时出现，故整段撤回。保留实现是为了不丢失这段分析，重新启用前必须先拿到
+// ⚠️ 注意：applyConfig 的重建顺序改动（0.5.54 的"先启动新的、再原子替换、最后异步
+// 回收"）已于 0.5.56 撤回，因为它与"签名 dylib 后控制台一打开就黑屏"同时出现。
+// 但本***回收***方法本身保留并被 healMissingForwarderDirectly 使用（紧急自愈时旧
+// 转发器只弃用、不做任何可能阻塞的等待）。重新启用"重建顺序"改动前必须先拿到
 // 崩溃/卡死日志确认病因。
 - (void)retireForwarder:(kp_forwarder *)fw {
     if (!fw) return;
@@ -295,6 +297,64 @@ static const NSTimeInterval LCProxyKingLifecycleNotifyMinInterval = 5.0;
         // stop 未完成时 kp_forwarder_free 会按契约故意泄漏（不 free），不会 UAF。
         kp_forwarder_free(fw);
     });
+}
+
+// 紧急自愈：绕过 LCProxyConfig 的串行 runtimeQueue，直接重建转发器并就地钉住
+// proxychains 的 per-process override。
+//
+// 只在"王卡已启用但转发器缺失"时使用。它存在的唯一理由是：applyRuntimeSnapshot
+// 全程持有 lifecycleLock 且跑在 runtimeQueue（串行）上，只要它在 applyConfig 里被
+// 任何无界等待卡住，整条常规 apply 路径就永久失效 —— 看门狗发出的
+// requestRuntimeApplyAsync 会排在被堵队列后面，永远轮不到，系统无法自愈。
+// 本方法因此在被堵队列之外完成"新建转发器 + 更新 override + 重载 C 配置"，
+// 从而无论 applyConfig 因何卡住都能恢复联网。
+//
+// 安全性：
+//  · 仅在 !isRunning 时调用，正常运行路径完全不受影响；
+//  · 旧转发器**不做任何可能阻塞的等待**，直接弃用并交给回收队列（0.5.57 起 accept
+//    循环有界等待，其线程 ≤500ms 自行退出，故回收不会长期占住队列）；
+//  · 重复调用安全：开头复查 isRunning，已被别人修好就直接返回。
+- (void)healMissingForwarderDirectly {
+    if ([self isRunning]) return;
+
+    kp_forwarder *fw = kp_forwarder_new("127.0.0.1", 0, "", 0);
+    if (!fw) return;
+    kp_forwarder_set_refresh_hook(fw, LCProxyKingRefreshHook, (__bridge void *)self);
+    if (kp_forwarder_start(fw) != 0) {
+        kp_forwarder_free(fw);
+        return;
+    }
+    int port = kp_forwarder_port(fw);
+    if (port <= 0) {
+        kp_forwarder_stop(fw);
+        kp_forwarder_free(fw);
+        return;
+    }
+
+    [self.lock lock];
+    if (self.forwarder != NULL) {
+        // 期间已有别人装上转发器：丢弃本次成果，避免两个实例并存。
+        [self.lock unlock];
+        [self retireForwarder:fw];
+        return;
+    }
+    kp_forwarder *old = self.forwarder;
+    self.forwarder = fw;
+    self.desiredForwarderRunning = YES;
+    [self.lock unlock];
+
+    [self retireForwarder:old];
+
+    // 直接钉住 override 并让 C 层按新端口重解析配置 —— 不等 runtimeQueue。
+    lcproxy_control_set_proxy_override("127.0.0.1", port);
+    lcproxy_control_reload_config();
+    [self loadCachedStateIntoForwarder];
+
+    [self.lock lock];
+    self.lastError = @"";
+    self.lastRefresh = LCProxyKingNow();
+    [self.lock unlock];
+    NSLog(@"[LCProxyKing] emergency heal: forwarder rebuilt on port %d", port);
 }
 
 - (void)beginRoutePublication {
@@ -990,7 +1050,19 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
         self.lastRefresh = LCProxyKingNow();
         self.lastError = @"王卡转发器缺失，正在自动重建";
         [self.lock unlock];
+        // 常规路径：请求一次 runtime apply（正常时由它重建并更新 override）。
         [[LCProxyConfig shared] requestRuntimeApplyAsync];
+        // 兜底路径：**不依赖 LCProxyConfig 的串行 runtimeQueue**。
+        // 之所以需要它：applyRuntimeSnapshot 全程持有 lifecycleLock，一旦它在
+        // applyConfig 里被某个无界等待（例如旧转发器 stop 的 pthread_join）卡住，
+        // runtimeQueue 上后续每一次 apply 都会永久排队。此时常规路径发出的
+        // requestRuntimeApplyAsync 同样永远轮不到，看门狗每 5s 触发也救不回来 ——
+        // 表现为"彻底断网且永不恢复"，且 override 永远停在旧端口。
+        // 本方法在被堵的队列之外直接重建转发器并就地钉住 override，因此无论
+        // applyConfig 因为什么原因卡住，系统都能自愈。
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            [self healMissingForwarderDirectly];
+        });
         [self scheduleRefreshRetryAfter:5.0];
         return NO;
     }
