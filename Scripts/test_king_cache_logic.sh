@@ -385,6 +385,18 @@ assert 'desiredForwarderRunning' in _hb, \
     'heartbeat does not use the in-memory kingcard-enabled flag'
 assert '[self requestBackgroundRefresh]' not in _hb, \
     'heartbeat prods a forced (cache-bypassing) network refresh every tick'
+# 但心跳**必须**校验"链里真正生效的端口"并限频自愈。
+#
+# apply_proxy_override 只在 reload_config 内部被调用，而重载只在 needsRuntimeReload 为真时
+# 发生；稳态下它不再重跑，于是链里烘焙的端口**再也没人校验**。一旦它与转发器端口不一致
+# （重载失败、链被清空、apply 被丢弃），所有连接都会打到别处（如 conf 里无人监听的占位
+# 端口 18080）→ 彻底无法联网，而 status 里 proxyOverridePort 依然"正确"、lastError 为空。
+assert 'lcproxy_control_get_applied_override_port' in _hb, \
+    'heartbeat does not verify the port actually baked into the proxy chain'
+assert 'LCProxyKingChainRepairMinInterval' in _hb, \
+    'heartbeat chain repair is not rate limited (would rewrite conf files every tick)'
+assert 'requestRuntimeApplyAsync' in _hb, \
+    'heartbeat does not request the runtime apply that repairs a stale chain port'
 
 # Explicit credentials always override remote refreshes, including forced ones.
 assert '!guidOverride && (force || !guid)' in king, \
@@ -489,6 +501,19 @@ assert 'lastWebkitAppliedPort' in config, \
 assert re.search(r'if \(self\.lastWebkitAppliedPort != desiredForwarderPort\)[\s\S]{0,400}?'
                  r'livecontainer_reload_webkit_proxy\(\)', config), \
     'WebKit proxy is not reloaded unconditionally when the forwarder port changes'
+
+# 自愈：链里**实际生效**的端口若与当前转发器端口不一致，必须触发一次重载。
+# 这是"status 全绿却完全连不上"（连接被发到无人监听的占位端口）的唯一自动修复路径。
+assert 'lcproxy_control_get_applied_override_port' in config, \
+    'LCProxyConfig never compares the applied chain port against the forwarder port'
+assert re.search(r'chainPortStale[\s\S]{0,120}?appliedChainPort != desiredForwarderPort', config), \
+    'the applied-chain-port staleness check is missing or miscomputed'
+assert re.search(r'needsRuntimeReload = configReady && \([\s\S]{0,400}?chainPortStale', config), \
+    'a stale chain port does not force a runtime reload'
+assert 'd[@"chainProxyPort"]' in server and 'd[@"chainPortMatches"]' in server, \
+    '/api/status does not expose the port actually baked into the proxy chain'
+assert 'heartbeatChainRepairCount' in king, \
+    'the heartbeat chain-repair counter is not exposed in status'
 
 # 健康检查失败时**不得**做强制恢复（它会 lcproxy_async_close_all +
 # shutdownActiveClients，把所有在飞连接一起杀掉），而应走限频异步的凭证刷新。

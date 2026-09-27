@@ -81,6 +81,51 @@
 心跳事件会写入 App Group 的 `kingcard-refresh.log`（`src=heartbeat-heal` /
 `heartbeat-repin` / `emergency-heal`），因此一次复现即可从任意控制台看到自愈全过程。
 
+### 2.10 v0.5.67：代理链端口陈旧导致「status 全绿却完全连不上」+ 心跳自愈
+
+**这是本轮定位到的、能解释"私有正常 / 共享失效"这一类症状的结构性缺陷。**
+
+**机制。** `lcproxy_control_apply_proxy_override()`（把 per-process override 真正**覆盖到
+代理链第一跳**）**只在 `lcproxy_control_reload_config()` 内部被调用**。而
+`needsRuntimeReload` 在稳态下为假（签名未变、端口未变、路径未变），因此：
+
+> **override 只在首次 apply 时被烘焙进代理链，之后再也没有任何机制校验
+> "链里真正生效的端口"是否等于当前转发器端口。**
+
+于是只要发生一次不匹配 —— 重载失败、链被清空（`reload_config` 会先把
+`proxychains_proxy_count` 清零再重解析）、apply 被丢弃、C 构造函数在 ObjC 之前跑完 ——
+链就会停在**别处**：
+
+- conf 里的**占位端口 `127.0.0.1:18080`**（无人监听，刻意 fail-closed）→ **所有连接被拒**；
+- 或链为空 → `lc_proxy_config_missing()` 为真 → `send`/`write` 对 direct-tracked socket
+  直接返回 `ECONNREFUSED`。
+
+而 `/api/status` 里 `proxyOverridePort`、`forwarderPort`、`running`、`listenFdValid`
+**全部正常** —— 因为它们读的是"我们想用哪个端口"，**不是链里真正生效的端口**；
+`lastError` 也为空。这正是"每个指标都健康，却完全无法联网"的成因，也解释了为什么此前
+怎么查都只有"转发器健康 + 取号成功 + 转发不出去"这种矛盾现象。
+
+**修复（自愈式，不依赖 ObjC 侧记账）：**
+
+1. C 层新增 `lcproxy_control_get_applied_override_port()` —— 记录**真正被烘焙进链**的端口。
+   所有提前返回路径（`pd == NULL`、`proxy_count == 0`、override 无效、`inet_pton` 失败）
+   都**必须把它清零**，否则"已生效"的假象会把故障永久掩盖。
+2. `LCProxyConfig` 在每次 apply 时比较它与当前转发器端口，不一致即 `chainPortStale`
+   → 强制 `needsRuntimeReload` → 重载并重新烘焙。
+3. **存活心跳每 5 秒校验一次链端口**并限频（`LCProxyKingChainRepairMinInterval = 20s`）
+   请求 `requestRuntimeApplyAsync` 自愈 —— 否则故障只能靠"碰巧来一次前台/切网事件
+   触发 apply"才可能恢复。同时`/api/status` 暴露 `chainProxyPort` / `chainPortMatches` /
+   `heartbeatChainRepairCount`，让这类故障**一眼可见**。
+
+副作用是正向的：若 conf 曾缺失/不可读（链为空 → `applied = 0`），心跳会每 20 秒重试一次
+apply；apply 会重写 conf 并重载，**从而自动修复"配置文件缺失"这一类共享 App 故障**。
+
+**验证。** C 侧逻辑由 `Scripts/test_proxy_override.sh` 真实执行（CI 在 macOS 上跑）；
+本次为其新增了 10 余条断言，覆盖：占位端口 18080 必须被 override 覆盖、空链/NULL 链/
+非法 IP 必须把 applied 清零、重新 apply 后 applied 必须更新。本地已用
+`python -m ziglang cc -target x86_64-linux-gnu`（与 CI 相同的编译参数）确认测试与源码
+**干净编译**；运行时断言由 CI 执行。
+
 ### 2.9 v0.5.66：崩溃加固（关键入口兜住 ObjC 异常）+ 暴露 swallowedExceptions
 
 **动机。** 用户报告"打开共享 App 就闪退，说是没有 entitlement"。经核对：

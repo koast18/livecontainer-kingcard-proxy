@@ -84,6 +84,9 @@ NSString *const LCProxyForwarderLifecycleChangedNotification = @"LCProxyForwarde
 @property (nonatomic, strong) dispatch_queue_t heartbeatQueue;
 @property (nonatomic, assign) NSUInteger heartbeatHealCount;
 @property (nonatomic, assign) NSUInteger heartbeatRepinCount;
+// 链端口自愈：见 heartbeatTick 里"链里真正生效的端口必须等于转发器端口"的说明。
+@property (nonatomic, assign) NSUInteger heartbeatChainRepairCount;
+@property (nonatomic, assign) NSTimeInterval lastChainRepairRequestAt;
 @property (nonatomic, assign) NSTimeInterval lastHeartbeatAt;
 @property (nonatomic, assign) void *forwarderPtr;
 @property (nonatomic, strong) NSMutableDictionary *cachedCredentialState;
@@ -441,16 +444,43 @@ static const NSTimeInterval LCProxyKingLifecycleNotifyMinInterval = 5.0;
         NSLog(@"[LCProxyKing] heartbeat repinned override %d -> %d", overridePort, port);
     }
 
-    // 心跳**不催取号**。它只负责自己做得到、别人做不到的那件事：在没有任何外部事件
-    // （前台/切网/定时器/流量）时发现"转发器缺失"或"override 指向别处"并就地修好。
+    // 心跳不催取号，但**必须**校验"链里真正生效的端口"。
     //
-    // 凭证续期已由两条路径覆盖，心跳再插一手只会造成稳态浪费：
-    //   · 正常续期：2 分钟主动定时器（提前 LCProxyKingRefreshLeadTime 续期）；
-    //   · 提前失效 / 池内节点全挂：连接失败会触发 C 层回调 → requestBackgroundRefresh
-    //     （限频 20s，且走 force 分支强制重取）。
-    // 而 requestBackgroundRefresh 用的是 force 路径，会**绕过缓存命中判断**，
-    // 因此若在这里调用，稳态下就会变成每 20 秒一次完整网络取号（实测即 3 次/分、
-    // 180 次/小时），纯属无谓。
+    // 先说为什么不催取号：心跳只做它独有、别人做不到的事（发现转发器缺失/override 失配/
+    // 链端口失配并就地修好）。凭证续期已由两条路径覆盖 —— 2 分钟主动定时器，以及
+    // "连接失败 → C 层回调 → requestBackgroundRefresh（限频 20s、走 force 分支）"。
+    // 而 requestBackgroundRefresh 会**绕过缓存命中判断**，若心跳调用它，稳态下就变成
+    // 每 20 秒一次完整网络取号（3 次/分、180 次/小时），纯属无谓。
+    //
+    // 为什么这条检查不可省：lcproxy_control_apply_proxy_override 只在
+    // lcproxy_control_reload_config 内部被调用，而重载只在 needsRuntimeReload 为真时发生。
+    // 稳态下它不再重跑，于是链里烘焙的端口**再也没有人校验**。一旦它与当前转发器端口
+    // 不一致（重载失败、链被清空、apply 被丢弃），所有连接都会打到别处（例如 conf 里
+    // 无人监听的占位端口 18080）→ 彻底无法联网，而 /api/status 里 proxyOverridePort
+    // 依然显示"正确"，lastError 为空，完全看不出问题。
+    //
+    // 之前该故障只能靠"碰巧来一次前台/切网事件触发 apply"才可能恢复。现在改成每 5 秒
+    // 主动校验并请求一次重载，形成自愈闭环。
+    //
+    // 限频：requestRuntimeApplyAsync 会重写多份配置文件，绝不能每 5 秒来一次。
+    int chainPort = lcproxy_control_get_applied_override_port();
+    if (chainPort != port) {
+        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+        if (now - self.lastChainRepairRequestAt >= LCProxyKingChainRepairMinInterval) {
+            self.lastChainRepairRequestAt = now;
+            self.heartbeatChainRepairCount++;
+            [self appendSharedRefreshLogEntry:@{
+                @"ok": @NO,
+                @"src": @"heartbeat-chain-repair",
+                @"ms": @0,
+                @"msg": [NSString stringWithFormat:@"代理链端口 %d != 转发器 %d，请求重载配置",
+                         chainPort, port],
+            }];
+            NSLog(@"[LCProxyKing] heartbeat: chain port %d != forwarder %d, requesting runtime apply",
+                  chainPort, port);
+            [[LCProxyConfig shared] requestRuntimeApplyAsync];
+        }
+    }
 }
 
 // 紧急自愈：绕过 LCProxyConfig 的串行 runtimeQueue，直接重建转发器并就地钉住
@@ -872,6 +902,9 @@ static const NSUInteger LCProxyKingCredentialLogMaxLines = 64;
 static const NSUInteger LCProxyKingSharedRefreshLogMaxLines = 200;
 // 存活心跳周期：见 startLivenessHeartbeat。
 static const NSTimeInterval LCProxyKingLivenessInterval = 5.0;
+// 心跳请求"重载配置以修复代理链端口"的最小间隔。apply 会重写多份配置文件，
+// 因此即使链端口持续不一致，也最多每 20 秒修一次。见 heartbeatTick。
+static const NSTimeInterval LCProxyKingChainRepairMinInterval = 20.0;
 
 - (NSString *)credentialLogPath {
     // 路径只取决于数据目录，解析一次即可缓存，避免每次都做目录创建 IO。
@@ -1652,6 +1685,7 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
     d[@"lastForwarderLifecycle"] = self.lastForwarderLifecycle ?: @"";
     d[@"heartbeatHealCount"] = @(self.heartbeatHealCount);
     d[@"heartbeatRepinCount"] = @(self.heartbeatRepinCount);
+    d[@"heartbeatChainRepairCount"] = @(self.heartbeatChainRepairCount);
     d[@"lastHeartbeatAt"] = @(self.lastHeartbeatAt);
     d[@"credentialLogPath"] = logPath;
     d[@"credentialCacheCount"] = @(self.cachedCredentialState.count);

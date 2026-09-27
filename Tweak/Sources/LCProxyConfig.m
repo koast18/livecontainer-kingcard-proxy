@@ -517,10 +517,17 @@ static nw_path_monitor_t g_networkMonitor;
         lcproxy_control_set_config_valid(0);
     }
 
+    // 端口**实际烘焙进代理链**的那一个（0 = 链里没有生效的 override）。
+    // 与 desiredForwarderPort 比较即可发现"链指向别处"的静默故障。
+    int appliedChainPort = lcproxy_control_get_applied_override_port();
+    BOOL chainPortStale = (proxyActive || desiredForwarderPort > 0) &&
+                          appliedChainPort != desiredForwarderPort;
+
     // Never reparse a stale file after a canonical write failed. A later
     // successful write must reload even when settings and port are unchanged.
     BOOL needsRuntimeReload = configReady && (forceRecovery || settingsChanged ||
                                               forwarderPortChanged || configPathChanged ||
+                                              chainPortStale ||
                                               (proxyActive && !wasConfigValid));
 
     lcproxy_control_set_enabled(proxyActive ? 1 : 0);

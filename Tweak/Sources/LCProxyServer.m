@@ -79,6 +79,13 @@ static const NSUInteger LCProxyDefaultPort = 19092;
     return 0;
 }
 
+// 端口**实际烘焙进代理链**的那一个。与 proxyOverridePort（"想要用的端口"）不同：
+// 前者才是真正决定连接去哪里的值。两者不一致 = 连接会打到别处（例如无人监听的占位
+// 端口 18080），表现为"彻底无法联网"而 status 里每项看起来都正常。
+- (int)chainProxyPort {
+    return lcproxy_control_get_applied_override_port();
+}
+
 // 读取 App Group canonical 目录下某个日志文件的末尾若干行。这些文件由所有
 // LiveContainer 实例共同以 O_APPEND 追加，所以从**任何一个**进程的控制台都能看到
 // 其他进程（尤其是共享 App 进程）的活动 —— 共享 App 的进程内诊断此前完全不可见，
@@ -117,6 +124,10 @@ static const NSUInteger LCProxyDefaultPort = 19092;
     d[@"dataDirectory"] = LCProxyDataDirectory();
     d[@"forwarderPort"] = @([[LCProxyKing shared] localForwarderPort]);
     d[@"proxyOverridePort"] = @([self proxyOverridePort]);
+    // 链里**实际生效**的端口。它必须等于 forwarderPort；不等就是"连接被发到别处"，
+    // 这是"status 全绿却完全连不上"的直接证据（此前无法从 status 看出）。
+    d[@"chainProxyPort"] = @([self chainProxyPort]);
+    d[@"chainPortMatches"] = @([self chainProxyPort] == [[LCProxyKing shared] localForwarderPort]);
     d[@"asyncRelayCount"] = @(lcproxy_async_active_count());
     d[@"proxychainsConfPath"] = [[LCProxyConfig shared] proxychainsConfPath];
     d[@"proxychainsConfExists"] = @([[NSFileManager defaultManager] fileExistsAtPath:[[LCProxyConfig shared] proxychainsConfPath]]);
