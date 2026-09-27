@@ -7,20 +7,20 @@
       "name": "LiveProxy 控制台",
       "bundleIdentifier": "com.liveproxy.console",
       "developerName": "koast18",
-      "version": "0.5.72",
-      "versionDate": "2026-09-27T14:26:00Z",
+      "version": "0.5.73",
+      "versionDate": "2026-09-27T14:45:00Z",
       "versionDescription": "LiveProxy 控制台：LiveContainer 任意 App HTTP 代理开关、非 TCP 丢弃、10 分钟粒度蜂窝流量统计。首次打开自动下载 dylib。",
-      "downloadURL": "https://gh-proxy.com/https://github.com/koast18/livecontainer-kingcard-proxy/releases/download/v0.5.72/LiveProxyConsole-0.5.72.ipa",
+      "downloadURL": "https://gh-proxy.com/https://github.com/koast18/livecontainer-kingcard-proxy/releases/download/v0.5.73/LiveProxyConsole-0.5.73.ipa",
       "localizedDescription": "LiveContainer 内任意 App 走 HTTP 代理的控制台 IPA。依赖 LCProxyControl dylib（自动下载到 LiveContainer Tweaks 目录），支持代理开关、丢弃非 TCP、蜂窝网络上传/下载流量统计（10 分钟时段）。",
       "iconURL": "https://raw.githubusercontent.com/koast18/livecontainer-kingcard-proxy/master/AltStore/icon.png",
       "tintColor": "2E7D32",
       "size": 19474,
       "versions": [
         {
-          "version": "0.5.72",
-          "date": "2026-09-27T14:26:00Z",
-          "downloadURL": "https://gh-proxy.com/https://github.com/koast18/livecontainer-kingcard-proxy/releases/download/v0.5.72/LiveProxyConsole-0.5.72.ipa",
-          "localizedDescription": "修复闪退：控制台现在保证 Tweaks 目录里最多只有一个已启用的 dylib（新版以 .disabled 暂存，签名后自动切换并清理旧版），并会就地清理已经共存的多份 dylib。"
+          "version": "0.5.73",
+          "date": "2026-09-27T14:45:00Z",
+          "downloadURL": "https://gh-proxy.com/https://github.com/koast18/livecontainer-kingcard-proxy/releases/download/v0.5.73/LiveProxyConsole-0.5.73.ipa",
+          "localizedDescription": "新增一键重置凭证（/api/king/reset-credentials）：丢弃共享凭证缓存并重新领取整套身份，用于验证/修复「共享凭证失效导致连不上」。含闪退修复与跨进程状态可见。"
         }
       ]
     }
