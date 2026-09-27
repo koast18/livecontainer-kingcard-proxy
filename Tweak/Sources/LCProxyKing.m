@@ -4,6 +4,7 @@
 #import "LCProxyPaths.h"
 #import "LCProxyConfig.h"
 #import "LCProxyKingClient.h"
+#import "Version.h"
 #import "lcproxy_bridge.h"
 #import <errno.h>
 #import <fcntl.h>
@@ -1082,7 +1083,7 @@ static const NSTimeInterval LCProxyKingChainRepairMinInterval = 20.0;
         d[@"connects"] = @(stats.https_connects);
         d[@"reject"] = @(stats.client_rejections);
         d[@"poolEmpty"] = @(stats.pool_empty);
-        d[@"clients"] = @([[self activeClientCount] intValue]);
+        d[@"clients"] = @([self activeClientCount]);
         d[@"up"] = @{
             @"connectFail": @(stats.up_connect_fail),
             @"sendFail": @(stats.up_send_fail),

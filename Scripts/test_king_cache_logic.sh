@@ -607,5 +607,14 @@ _hb2 = king[king.index('- (void)heartbeatTick {'):]
 assert _hb2.index('appendSharedStatusSnapshot') < _hb2.index('if (!shouldRun) return;'), \
     'the shared snapshot runs after an early return, so a broken process stays invisible'
 
+# 编译期错误的前置守卫：任何使用 KPTWEAK_VERSION 的源文件都必须导入 Version.h。
+# 这类错误只能由 macОS 上的 clang 暴露（本机无法编译 ObjC），因此曾让 CI + Build 双双
+# 变红、并把一个坏 tag 推到远端。用一条廉价的源码检查把这类错误挡在推送之前。
+for _src in sorted(Path('Tweak/Sources').glob('*.m')) + sorted(Path('Tweak/Sources').glob('*.c')):
+    _t = _src.read_text(encoding='utf-8')
+    if 'KPTWEAK_VERSION' in _t or 'KPTWEAK_GIT_COMMIT' in _t:
+        assert '#import "Version.h"' in _t or '#include "Version.h"' in _t, \
+            f'{_src} uses KPTWEAK_* but does not include Version.h (compile error on CI)'
+
 print('king cache/refresh logic static checks OK')
 PY
