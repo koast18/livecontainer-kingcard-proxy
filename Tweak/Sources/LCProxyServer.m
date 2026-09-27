@@ -146,6 +146,12 @@ static const NSUInteger LCProxyDefaultPort = 19092;
     // 打开任意一个 App 的控制台即可看到全部进程（含共享 App）的取号历史与
     // 按连接转发结果，无需再靠文件应用/受限于 App Group 不可见。
     d[@"kingRefreshLogShared"] = [self tailOfAppGroupLog:@"kingcard-refresh.log" maxLines:30];
+    // 每个进程定期写入的紧凑状态快照（新增）。
+    //
+    // 为什么需要它：/api/status 只能由抢到本端口的进程提供，其他进程"保持无头"，因此
+    // **别的进程的内部状态读不到**。要判断"私有正常 / 共享不正常"，就必须能同时看到
+    // 两边的现场 —— 否则只能靠推断。这里按 pid/bundle 汇总，含各自的 upstreamDiag 摘要。
+    d[@"statusTail"] = [self tailOfAppGroupLog:@"kingcard-status.log" maxLines:24];
     d[@"trafficLogTail"] = [self tailOfAppGroupLog:@"traffic.log" maxLines:60];
     // 每个进程加载 dylib 的事实（时间/pid/版本/路径/bundle）。用于确认共享 App
     // 到底加载了哪个版本 —— 这是"修复是否真的生效"的唯一可靠依据。

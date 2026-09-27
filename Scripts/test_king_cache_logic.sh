@@ -587,5 +587,25 @@ assert 'kp_forwarder_note_credential_rejection' in core, \
 assert 'kp_forwarder_take_credential_rejection' in Path('Tweak/Sources/KPKIngCore.h').read_text(encoding='utf-8'), \
     'the credential-rejection handshake is not declared in the C header'
 
+# ★ 跨进程可见性：每个进程必须定期把自己的状态写进 App Group 共享日志。
+#
+# /api/status 只能由抢到 19092 的进程提供，其余进程"保持无头" → 别的进程的内部状态
+# 读不到。而"私有正常 / 共享不正常"本质上是一个**跨进程对比**问题：看不到两边的现场
+# 就只能靠推断（本项目此前正是如此，代价是多轮反复）。
+assert 'appendSharedStatusSnapshot' in king, \
+    'processes no longer publish their status to the shared App Group log'
+assert 'kingcard-status.log' in king, \
+    'the shared status log filename changed or was dropped'
+assert 'LCProxyKingSharedSnapshotMinInterval' in king, \
+    'the shared status snapshot is not rate limited (would spam the log)'
+assert 'd[@"statusTail"]' in server, \
+    '/api/status no longer exposes statusTail (cross-process comparison not possible)'
+assert re.search(r'if \(now - self\.lastSharedSnapshotAt >= LCProxyKingSharedSnapshotMinInterval\)', king), \
+    'the heartbeat no longer schedules shared status snapshots'
+# 快照必须写在心跳最前面：出问题的进程恰恰最需要被看见（后面可能提前 return）。
+_hb2 = king[king.index('- (void)heartbeatTick {'):]
+assert _hb2.index('appendSharedStatusSnapshot') < _hb2.index('if (!shouldRun) return;'), \
+    'the shared snapshot runs after an early return, so a broken process stays invisible'
+
 print('king cache/refresh logic static checks OK')
 PY

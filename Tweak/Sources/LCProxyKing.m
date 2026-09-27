@@ -88,6 +88,8 @@ NSString *const LCProxyForwarderLifecycleChangedNotification = @"LCProxyForwarde
 @property (nonatomic, assign) NSUInteger heartbeatChainRepairCount;
 @property (nonatomic, assign) NSTimeInterval lastChainRepairRequestAt;
 @property (nonatomic, assign) NSTimeInterval lastHeartbeatAt;
+// 上次向共享日志写状态快照的时间；见 appendSharedStatusSnapshot。
+@property (nonatomic, assign) NSTimeInterval lastSharedSnapshotAt;
 @property (nonatomic, assign) void *forwarderPtr;
 @property (nonatomic, strong) NSMutableDictionary *cachedCredentialState;
 @property (nonatomic, strong) NSLock *cacheLock;
@@ -133,6 +135,14 @@ NSString *const LCProxyForwarderLifecycleChangedNotification = @"LCProxyForwarde
 - (void)healMissingForwarderDirectly;
 - (void)startLivenessHeartbeat;
 - (void)heartbeatTick;
+
+// 把本进程的**紧凑状态快照**追加到 App Group 共享日志，供任何进程的控制台查看。
+//
+// 为什么必须这么做：/api/status 只能由抢到 19092 端口的那个进程提供，其他进程
+// "保持无头" —— 于是**另一个进程的内部状态根本读不到**。排查"私有正常 / 共享不正常"
+// 这种**跨进程对比**问题时，这等于瞎了一只眼：我此前从未拿到过一份私有进程的数据。
+// 共享日志是唯一出路（与 kingRefreshLogShared / dylibLoadsTail 同一思路）。
+- (void)appendSharedStatusSnapshot;
 - (NSString *)credentialLogPath;
 - (void)appendCredentialRecord:(NSDictionary *)record;
 - (NSMutableDictionary *)newestValidRecordFromLog;
@@ -405,6 +415,17 @@ static const NSTimeInterval LCProxyKingLifecycleNotifyMinInterval = 5.0;
 
 - (void)heartbeatTick {
     self.lastHeartbeatAt = [[NSDate date] timeIntervalSince1970];
+
+    // 周期性把状态快照写进共享日志（让其他进程的控制台也能看到本进程）。
+    // 放在最前面：即使转发器缺失、后面提前 return，本进程的状态也必须可见 ——
+    // 恰恰是"出问题的进程"最需要被看到。
+    {
+        NSTimeInterval now = self.lastHeartbeatAt;
+        if (now - self.lastSharedSnapshotAt >= LCProxyKingSharedSnapshotMinInterval) {
+            self.lastSharedSnapshotAt = now;
+            [self appendSharedStatusSnapshot];
+        }
+    }
 
     // 只读内存状态，**不做任何磁盘/配置读取** —— 本方法每 5 秒跑一次，必须足够省。
     // desiredForwarderRunning 由 applyConfig 在王卡模式启用时置位，语义与
@@ -900,8 +921,11 @@ static const NSTimeInterval LCProxyKingLifecycleNotifyMinInterval = 5.0;
 
 static const NSUInteger LCProxyKingCredentialLogMaxLines = 64;
 static const NSUInteger LCProxyKingSharedRefreshLogMaxLines = 200;
+static const NSUInteger LCProxyKingSharedStatusLogMaxLines = 120;
 // 存活心跳周期：见 startLivenessHeartbeat。
 static const NSTimeInterval LCProxyKingLivenessInterval = 5.0;
+// 向 App Group 共享日志写"本进程状态快照"的最小间隔。见 appendSharedStatusSnapshot。
+static const NSTimeInterval LCProxyKingSharedSnapshotMinInterval = 30.0;
 // 心跳请求"重载配置以修复代理链端口"的最小间隔。apply 会重写多份配置文件，
 // 因此即使链端口持续不一致，也最多每 20 秒修一次。见 heartbeatTick。
 static const NSTimeInterval LCProxyKingChainRepairMinInterval = 20.0;
@@ -1008,6 +1032,89 @@ static const NSTimeInterval LCProxyKingChainRepairMinInterval = 20.0;
     (void)ignored;
     close(fd);
     [self trimAppendLogAtPath:path maxLines:LCProxyKingSharedRefreshLogMaxLines];
+}
+
+// 把本进程的紧凑状态快照追加到 App Group 共享日志 kingcard-status.log。
+//
+// 存在的唯一理由：/api/status 只能由抢到 19092 端口的进程提供，其余进程"保持无头" ——
+// 于是**别的进程的内部状态根本读不到**。排查"私有正常 / 共享不正常"这类**跨进程对比**
+// 问题时，这等于只有一只眼：此前始终拿不到一份私有进程的现场数据，只能靠推断。
+//
+// 记录内容刻意只含**判定所必需的字段**（端口/链端口、池大小、上游分步计数、最后一次
+// 失败的现场与请求结构快照），不含任何凭证。同为 O_APPEND 行级追加、无锁、失败静默。
+- (void)appendSharedStatusSnapshot {
+    NSString *dir = [[self credentialLogPath] stringByDeletingLastPathComponent];
+    if (!dir.length) return;
+
+    [self.lock lock];
+    int fwdPort = self.forwarder ? kp_forwarder_port(self.forwarder) : 0;
+    BOOL running = self.forwarder != NULL && kp_forwarder_is_running(self.forwarder) == 1;
+    BOOL listenOk = self.forwarder ? (kp_forwarder_listen_fd_valid(self.forwarder) == 1) : NO;
+    kp_forwarder *fw = self.forwarder;
+    BOOL ready = self.lastRefreshSuccess;
+    NSString *err = self.lastError ?: @"";
+    [self.lock unlock];
+
+    char ovHost[64] = {0};
+    int ovPort = 0;
+    if (!lcproxy_control_get_proxy_override(ovHost, sizeof(ovHost), &ovPort)) ovPort = 0;
+
+    kp_forwarder_stats stats;
+    memset(&stats, 0, sizeof(stats));
+    NSMutableDictionary *d = [NSMutableDictionary dictionary];
+    d[@"ts"] = @([[NSDate date] timeIntervalSince1970]);
+    d[@"pid"] = @(getpid());
+    d[@"bundle"] = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
+    d[@"ver"] = [NSString stringWithUTF8String:KPTWEAK_VERSION];
+    d[@"isSharedTweaks"] = @([LCProxyDylibPath() containsString:@"/LiveContainer/Tweaks/"]);
+    d[@"home"] = NSHomeDirectory() ?: @"";
+    d[@"port"] = @(fwdPort);
+    d[@"chainPort"] = @(lcproxy_control_get_applied_override_port());
+    d[@"overridePort"] = @(ovPort);
+    d[@"running"] = @(running);
+    d[@"listenOk"] = @(listenOk);
+    d[@"ready"] = @(ready);
+    d[@"vErr"] = err.length > 80 ? [err substringToIndex:80] : err;
+
+    if (fw) {
+        kp_forwarder_get_stats(fw, &stats);
+        d[@"pool"] = @[@(stats.live_http_pool), @(stats.live_https_pool)];
+        d[@"connects"] = @(stats.https_connects);
+        d[@"reject"] = @(stats.client_rejections);
+        d[@"poolEmpty"] = @(stats.pool_empty);
+        d[@"clients"] = @([[self activeClientCount] intValue]);
+        d[@"up"] = @{
+            @"connectFail": @(stats.up_connect_fail),
+            @"sendFail": @(stats.up_send_fail),
+            @"recvFail": @(stats.up_recv_fail),
+            @"recvEof": @(stats.up_recv_eof),
+            @"recvRst": @(stats.up_recv_rst),
+            @"recvTimeout": @(stats.up_recv_timeout),
+            @"credCode": @(stats.up_cred_code),
+            @"otherCode": @(stats.up_other_code),
+            @"tunnelNoData": @(stats.up_tunnel_no_data),
+            @"fakeOk": @(stats.up_fake_ok),
+            @"lastStage": [NSString stringWithUTF8String:stats.last_up_stage] ?: @"",
+            @"lastProxy": [NSString stringWithUTF8String:stats.last_up_proxy] ?: @"",
+            @"lastCode": @(stats.last_up_code),
+            @"lastErrno": @(stats.last_up_errno),
+            @"lastResp": [NSString stringWithUTF8String:stats.last_up_resp] ?: @"",
+            @"req": [NSString stringWithUTF8String:stats.last_creq] ?: @"",
+        };
+    }
+
+    if (![NSJSONSerialization isValidJSONObject:d]) return;
+    NSData *line = [NSJSONSerialization dataWithJSONObject:d options:0 error:nil];
+    if (!line.length) return;
+    NSString *path = [dir stringByAppendingPathComponent:@"kingcard-status.log"];
+    NSMutableData *payload = [line mutableCopy];
+    [payload appendData:[@"\n" dataUsingEncoding:NSUTF8StringEncoding]];
+    int fd = open(path.fileSystemRepresentation, O_WRONLY | O_APPEND | O_CREAT, 0644);
+    if (fd < 0) return;
+    ssize_t ignored = write(fd, payload.bytes, payload.length);
+    (void)ignored;
+    close(fd);
+    [self trimAppendLogAtPath:path maxLines:LCProxyKingSharedStatusLogMaxLines];
 }
 
 // 取"最新且仍有效"的一条。损坏行、过期行、与当前设置不匹配的行全部跳过；
