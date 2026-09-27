@@ -7,20 +7,20 @@
       "name": "LiveProxy 控制台",
       "bundleIdentifier": "com.liveproxy.console",
       "developerName": "koast18",
-      "version": "0.5.59",
-      "versionDate": "2026-09-27T03:23:34Z",
+      "version": "0.5.60",
+      "versionDate": "2026-09-27T07:37:13Z",
       "versionDescription": "LiveProxy 控制台：LiveContainer 任意 App HTTP 代理开关、非 TCP 丢弃、10 分钟粒度蜂窝流量统计。首次打开自动下载 dylib。",
-      "downloadURL": "https://gh-proxy.com/https://github.com/koast18/livecontainer-kingcard-proxy/releases/download/v0.5.59/LiveProxyConsole-0.5.59.ipa",
+      "downloadURL": "https://gh-proxy.com/https://github.com/koast18/livecontainer-kingcard-proxy/releases/download/v0.5.60/LiveProxyConsole-0.5.60.ipa",
       "localizedDescription": "LiveContainer 内任意 App 走 HTTP 代理的控制台 IPA。依赖 LCProxyControl dylib（自动下载到 LiveContainer Tweaks 目录），支持代理开关、丢弃非 TCP、蜂窝网络上传/下载流量统计（10 分钟时段）。",
       "iconURL": "https://raw.githubusercontent.com/koast18/livecontainer-kingcard-proxy/master/AltStore/icon.png",
       "tintColor": "2E7D32",
-      "size": 19475,
+      "size": 19474,
       "versions": [
         {
-          "version": "0.5.59",
-          "date": "2026-09-27T03:23:34Z",
-          "downloadURL": "https://gh-proxy.com/https://github.com/koast18/livecontainer-kingcard-proxy/releases/download/v0.5.59/LiveProxyConsole-0.5.59.ipa",
-          "localizedDescription": "复用健康转发器（切前后台/切网不再中断转发）+ 独立存活心跳（每5s 校验 override 是否指向在监听的转发器并就地修复）。"
+          "version": "0.5.60",
+          "date": "2026-09-27T07:37:13Z",
+          "downloadURL": "https://gh-proxy.com/https://github.com/koast18/livecontainer-kingcard-proxy/releases/download/v0.5.60/LiveProxyConsole-0.5.60.ipa",
+          "localizedDescription": "修复强制刷新清空在用凭证引发的正反馈雪崩（表现为取号次次成功却转发不出去）；含转发器复用与独立存活心跳。"
         }
       ]
     }
