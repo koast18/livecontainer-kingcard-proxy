@@ -570,5 +570,22 @@ if _verify.exists():
     assert re.search(r'`king` 内', _doc), \
         'verification doc lost the explicit king-nested path'
 
+# ★ 重新申请 GUID 身份**不得**由 force 触发（共享 App 下会造成身份互相作废）。
+#
+# 凭证日志在 App Group 里被所有 LiveContainer 进程共享（0.5.47 起刻意去掉跨进程锁），
+# 而共享 App 必然与启动它的 LiveContainer 进程、控制台等同时存在。若每次强制刷新都去
+# 领新 GUID，且运营商对同一张 SIM 只保留一个有效身份，那么每个进程刷新都会作废其他进程
+# （以及自己上一次）的身份 → 连接失败 → 又强制刷新 → 又换身份，形成自我维持的循环。
+# 实测形态吻合：上游 TCP 连得上、请求发得出，然后一个字节都不回就关闭
+# （recvFail 1224、lastResp 空），而 connectFail/sendFail 全为 0。
+assert 'if (!guidOverride && (force || !guid))' not in king, \
+    'a forced refresh mints a brand-new GUID identity again (cross-process invalidation loop)'
+assert 'kp_forwarder_take_credential_rejection' in king, \
+    'GUID re-minting is no longer gated on an explicit server credential rejection'
+assert 'kp_forwarder_note_credential_rejection' in core, \
+    'the C layer no longer signals 820/821/823 credential rejection to the ObjC layer'
+assert 'kp_forwarder_take_credential_rejection' in Path('Tweak/Sources/KPKIngCore.h').read_text(encoding='utf-8'), \
+    'the credential-rejection handshake is not declared in the C header'
+
 print('king cache/refresh logic static checks OK')
 PY

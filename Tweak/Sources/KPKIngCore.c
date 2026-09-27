@@ -645,7 +645,13 @@ static int kp_recv_until(int fd, char *buf, size_t cap, size_t *got, int timeout
     size_t off = 0;
     while (off < cap - 1) {
         ssize_t r = recv(fd, buf + off, cap - 1 - off, 0);
-        if (r <= 0) break;
+        // 明确区分三种"没收到数据"的原因 —— 它们的含义完全不同：
+        //   · 对端干净关闭（FIN，recv 返回 0）：代理主动拒绝了这个请求；
+        //   · 错误（recv < 0）：errno=ECONNRESET(54) 是被硬重置，EAGAIN(35) 是读超时；
+        //   · 读到部分数据后关闭：至少对端说了一部分话。
+        // recv 返回 0 时不会设置 errno，因此显式置 0，让调用方能区分 EOF 与错误。
+        if (r == 0) { errno = 0; break; }
+        if (r < 0) break;
         off += (size_t)r;
         buf[off] = '\0';
         if (strstr(buf, "\r\n\r\n")) break;
@@ -1301,6 +1307,20 @@ struct kp_forwarder {
     uint64_t last_tunnel_client_to_up;
     uint64_t last_tunnel_up_to_client;
     uint64_t last_tunnel_ms;
+    // 上游"零字节响应"的三种成因分开计数。含义完全不同：
+    //   eof     = 对端干净关闭(FIN) → 代理主动拒绝该请求；
+    //   rst     = 硬重置(ECONNRESET) → 被对端/中间设备强行切断；
+    //   timeout = 读超时(EAGAIN) → 对端既不应答也不关闭。
+    uint64_t stat_up_recv_eof;
+    uint64_t stat_up_recv_rst;
+    uint64_t stat_up_recv_timeout;
+    // 最后一次实际发出的王卡 CONNECT 请求的**结构快照**（不含凭证明文，只留字段名与长度）。
+    char last_creq[256];
+    // 上游是否**明确**说过"你的凭证不行"（回 820/821/823）。
+    //
+    // 这个信号决定"要不要向运营商重新申请一个 GUID 身份"。必须由服务端显式拒绝来触发，
+    // 绝不能因为"某次连接失败"就重新领身份 —— 换身份只有服务端要求时才安全。
+    int credential_rejected;
     int last_up_code;                // 最后一次失败时解析到的状态码（0 = 未解析）
     int last_up_errno;               // 最后一次失败时的 errno
     char last_up_stage[16];          // connect / send / recv / cred / code / pick
@@ -1413,6 +1433,62 @@ static int kp_up_open(kp_forwarder *fw, const char *host, int port, int timeout_
     return fd;
 }
 
+// 把"我们实际发出的王卡 CONNECT 请求"压成一段**不含凭证明文**的结构快照。
+//
+// 用途：实测形态是"TCP 连上、请求发出、对端回 0 字节并 RST(ECONNRESET)"，即请求被对端
+// 拒绝。要判断"是我们发的请求不对"还是"服务端/账号侧拒绝"，唯一办法是看请求本身。
+// 但凭证不能进 /api/status，因此这里只保留**结构**：请求行 + 各 Q-* 字段的**名字与长度**。
+// 长度本身极有诊断价值（例如 Q-Token(0) 立刻说明凭证明明是空的）。
+static void kp_describe_request(const char *req, char *out, size_t cap) {
+    if (!out || cap == 0) return;
+    out[0] = '\0';
+    if (!req) return;
+    size_t total = strlen(req);
+    const char *eol = strstr(req, "\r\n");
+    size_t linelen = eol ? (size_t)(eol - req) : total;
+    if (linelen > 120) linelen = 120;
+
+    size_t o = (size_t)snprintf(out, cap, "%.*s", (int)linelen, req);
+    if (o >= cap) { out[cap - 1] = '\0'; return; }
+
+    const char *auth = strstr(req, "Proxy-Authorization: ");
+    if (auth) {
+        auth += strlen("Proxy-Authorization: ");
+        const char *ae = strstr(auth, "\r\n");
+        size_t alen = ae ? (size_t)(ae - auth) : 0;
+        int n = snprintf(out + o, cap - o, " | authKeys:");
+        if (n > 0 && (size_t)n < cap - o) o += (size_t)n;
+        size_t i = 0;
+        while (i < alen) {
+            size_t j = i;
+            while (j < alen && auth[j] != ',') j++;
+            const char *bar = (const char *)memchr(auth + i, '|', j - i);
+            if (bar && o + 32 < cap) {
+                size_t klen = (size_t)(bar - (auth + i));
+                size_t vlen = (size_t)((auth + j) - (bar + 1));
+                if (klen > 20) klen = 20;
+                int m = snprintf(out + o, cap - o, " %.*s(%zu)", (int)klen, auth + i, vlen);
+                if (m > 0 && (size_t)m < cap - o) o += (size_t)m;
+            }
+            i = j + 1;
+        }
+    }
+    if (o + 16 < cap) {
+        snprintf(out + o, cap - o, " | len=%zu", total);
+    }
+    out[cap - 1] = '\0';
+}
+
+// 保存最后一次发出的请求的结构快照（见 kp_describe_request 的说明）。
+static void kp_store_last_request(kp_forwarder *fw, const char *req) {
+    if (!fw || !req) return;
+    char desc[256];
+    kp_describe_request(req, desc, sizeof(desc));
+    pthread_mutex_lock(&fw->cred_mutex);
+    snprintf(fw->last_creq, sizeof(fw->last_creq), "%s", desc);
+    pthread_mutex_unlock(&fw->cred_mutex);
+}
+
 // 记录一次"上游节点失败"的现场。纯诊断，绝不改变控制流。
 //
 // 必须在 cred_mutex 下写：多个 client 线程会并发失败。锁序与既有代码一致
@@ -1451,8 +1527,19 @@ static void kp_forwarder_shutdown_upstreams_locked(kp_forwarder *fw) {
     }
 }
 
-void kp_forwarder_shutdown_upstreams(kp_forwarder *fw) {
+// 服务端明确回 820/821/823 时置位：语义是"这个身份/凭证不被接受"。
+void kp_forwarder_note_credential_rejection(kp_forwarder *fw) {
     if (!fw) return;
+    __atomic_store_n(&fw->credential_rejected, 1, __ATOMIC_RELEASE);
+}
+
+// 读并清除该标志。ObjC 层用它决定"是否需要向运营商重新申请 GUID 身份"。
+int kp_forwarder_take_credential_rejection(kp_forwarder *fw) {
+    if (!fw) return 0;
+    return __atomic_exchange_n(&fw->credential_rejected, 0, __ATOMIC_ACQ_REL);
+}
+
+void kp_forwarder_shutdown_upstreams(kp_forwarder *fw) {    if (!fw) return;
     pthread_mutex_lock(&fw->client_lock);
     kp_forwarder_shutdown_upstreams_locked(fw);
     pthread_mutex_unlock(&fw->client_lock);
@@ -2320,6 +2407,17 @@ https_retry:
         size_t rgot = 0;
         if (kp_recv_until(up, resp, sizeof(resp), &rgot, 10000) != 0) {
             kp_stat_increment(&fw->stat_up_recv_fail);
+            // 分类"零字节响应"的成因：EOF(干净关闭) / RST(硬重置) / 读超时。
+            if (errno == 0) {
+                kp_stat_increment(&fw->stat_up_recv_eof);
+            } else if (errno == ECONNRESET) {
+                kp_stat_increment(&fw->stat_up_recv_rst);
+            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                kp_stat_increment(&fw->stat_up_recv_timeout);
+            } else {
+                kp_stat_increment(&fw->stat_up_recv_rst);
+            }
+            kp_store_last_request(fw, creq);
             kp_record_upstream_failure(fw, "recv", proxy_host, proxy_port, 0,
                                        resp, rgot);
             kp_upstream_close(fw, &up);
@@ -2330,6 +2428,7 @@ https_retry:
 
         if (kp_code_needs_credential_refresh(code)) {
             kp_stat_increment(&fw->stat_up_cred_code);
+            kp_forwarder_note_credential_rejection(fw);
             kp_record_upstream_failure(fw, "cred", proxy_host, proxy_port, code,
                                        resp, rgot);
             kp_upstream_close(fw, &up);
@@ -2871,6 +2970,10 @@ void kp_forwarder_get_stats(kp_forwarder *fw, kp_forwarder_stats *stats) {
     stats->last_tunnel_client_to_up = fw->last_tunnel_client_to_up;
     stats->last_tunnel_up_to_client = fw->last_tunnel_up_to_client;
     stats->last_tunnel_ms = fw->last_tunnel_ms;
+    stats->up_recv_eof = __atomic_load_n(&fw->stat_up_recv_eof, __ATOMIC_RELAXED);
+    stats->up_recv_rst = __atomic_load_n(&fw->stat_up_recv_rst, __ATOMIC_RELAXED);
+    stats->up_recv_timeout = __atomic_load_n(&fw->stat_up_recv_timeout, __ATOMIC_RELAXED);
+    memcpy(stats->last_creq, fw->last_creq, sizeof(stats->last_creq));
     pthread_mutex_unlock(&fw->cred_mutex);
     // 实时池大小必须在 cred_mutex 下读取。锁序与既有代码一致：
     // loadCachedStateIntoForwarder 就是"持有 self.lock 时调用 kp_forwarder_set_king_state

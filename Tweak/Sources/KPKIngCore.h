@@ -228,6 +228,11 @@ void kp_forwarder_shutdown_clients(kp_forwarder *fw);
 /// worker thread closes under the registry lock). Used by stop/recovery paths.
 void kp_forwarder_shutdown_upstreams(kp_forwarder *fw);
 
+/// 服务端明确回 820/821/823（"你的身份/凭证不被接受"）时置位。
+/// 与"连接失败"严格区分：只有服务端显式拒绝，才应该去换一个新身份。
+void kp_forwarder_note_credential_rejection(kp_forwarder *fw);
+/// 读并清除该标志。ObjC 层据此决定是否重新申请 GUID 身份。
+int kp_forwarder_take_credential_rejection(kp_forwarder *fw);
 /// Number of currently registered client workers.
 int kp_forwarder_active_clients(kp_forwarder *fw);
 
@@ -277,6 +282,13 @@ typedef struct {
     uint64_t last_tunnel_client_to_up;
     uint64_t last_tunnel_up_to_client;
     uint64_t last_tunnel_ms;
+    /// 上游"零字节响应"的三种成因（含义完全不同，必须分开看）：
+    /// eof = 对端干净关闭(FIN)；rst = 硬重置(ECONNRESET)；timeout = 读超时(EAGAIN)。
+    uint64_t up_recv_eof;
+    uint64_t up_recv_rst;
+    uint64_t up_recv_timeout;
+    /// 最后一次实际发出的王卡 CONNECT 请求的**结构快照**（字段名 + 值长度，无凭证明文）。
+    char last_creq[256];
     /// 最后一次失败的现场，便于一次复现即定性。
     int last_up_code;           ///< 解析到的状态码（0 = 未解析到）
     int last_up_errno;          ///< 当时的 errno

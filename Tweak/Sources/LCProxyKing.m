@@ -1399,7 +1399,35 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
         NSString *stored = [state[@"guid"] isKindOfClass:[NSString class]] ? state[@"guid"] : nil;
         if (LCProxyKingHexStringValid(stored)) guid = stored;
     }
-    if (!guidOverride && (force || !guid)) {
+    // ★ 是否重新向运营商申请 GUID 身份，**不能**由 force 决定。
+    //
+    // 原实现在 guidOverride 为空时，只要 force 为真或没有缓存 guid 就重新申请 ——
+    // 于是一次连接失败触发的强制刷新就会去领一个全新身份。这在共享 App 场景下会形成
+    // 自我维持的"身份互相作废"：
+    //   · 凭证日志在 App Group 里被**所有** LiveContainer 进程共享（0.5.47 起刻意去掉了
+    //     跨进程锁），而共享 App 必然与启动它的 LiveContainer 进程、控制台等同时存在；
+    //   · 每个进程各自独立强制刷新、各自领一个新 GUID；
+    //   · 若运营商对同一张 SIM 只保留一个有效身份，则每次领新身份都会**作废其他进程
+    //     （以及自己上一次）的身份**；
+    //   · 身份一失效，连接就失败 → 又触发强制刷新 → 又领新身份 → 循环。
+    // 实测形态完全吻合：上游 TCP 连得上、请求发得出，然后**一个字节都不回就关闭**
+    // （recvFail 1224 次、lastResp 为空），而 connectFail/sendFail 全为 0。
+    //
+    // 正确语义：**只有服务端明确说"凭证不行"（820/821/823，由 C 层置位）时才换身份**；
+    // 没有身份时当然要申请。单纯"连接失败"不构成换身份的理由 —— 那多半正是别人换过
+    // 身份造成的。
+    BOOL credsRejected = NO;
+    {
+        // self.forwarder 在别处一律持锁访问；这里也照做，避免指针撕裂。
+        [self.lock lock];
+        kp_forwarder *fwForFlag = self.forwarder;
+        [self.lock unlock];
+        credsRejected = kp_forwarder_take_credential_rejection(fwForFlag) ? YES : NO;
+    }
+    if (credsRejected) {
+        [steps appendString:@"身份: 服务端拒绝凭证(820/821/823)，重新申请 GUID\n"];
+    }
+    if (!guidOverride && (!guid || credsRejected)) {
         NSError *guidErr = nil;
         guid = [self syncFetchGuid:qua2 timeout:timeout error:&guidErr];
         if (!guid) {
@@ -1733,6 +1761,13 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
             @"lastTunnelClientToUp": @(stats.last_tunnel_client_to_up),
             @"lastTunnelUpToClient": @(stats.last_tunnel_up_to_client),
             @"lastTunnelMs": @(stats.last_tunnel_ms),
+            // 零字节响应的三种成因：EOF(对端干净关闭) / RST(硬重置) / 超时。
+            @"recvEof": @(stats.up_recv_eof),
+            @"recvRst": @(stats.up_recv_rst),
+            @"recvTimeout": @(stats.up_recv_timeout),
+            // 我们实际发出的请求长什么样（结构快照，无凭证明文）。
+            // 长度本身就是诊断：例如 Q-Token(0) 直接说明凭证是空的。
+            @"lastRequest": [NSString stringWithUTF8String:stats.last_creq] ?: @"",
         };
 
         NSMutableArray *directHosts = [NSMutableArray array];
