@@ -132,11 +132,14 @@ grep -q "statClientRejections" "Tweak/Sources/LCProxyKing.m" \
 # （连接/发送/无响应/820-823/其它状态码），外加最隐蔽的一种 —— **隧道已建立(200)却
 # 上游一个字节都不回**（客户端拿到 200、浏览器认为可用，TLS 握手永远完不成，而转发器
 # 这边既无 errno 也无非 2xx）。必须各自计数并保留现场。
-for marker in stat_up_pick_fail stat_up_connect_fail stat_up_send_fail stat_up_recv_fail \
-              stat_up_cred_code stat_up_other_code stat_up_tunnel_no_data stat_up_fake_ok; do
-    grep -q "$marker" "$CORE" || fail "KPKIngCore.c lost upstream diagnostic counter: $marker"
-done
-grep -q "kp_record_upstream_failure" "$CORE" \
+grep -q "stat_up_pick_fail" "$CORE" || fail "KPKIngCore.c lost counter: stat_up_pick_fail"
+grep -q "stat_up_connect_fail" "$CORE" || fail "KPKIngCore.c lost counter: stat_up_connect_fail"
+grep -q "stat_up_send_fail" "$CORE" || fail "KPKIngCore.c lost counter: stat_up_send_fail"
+grep -q "stat_up_recv_fail" "$CORE" || fail "KPKIngCore.c lost counter: stat_up_recv_fail"
+grep -q "stat_up_cred_code" "$CORE" || fail "KPKIngCore.c lost counter: stat_up_cred_code"
+grep -q "stat_up_other_code" "$CORE" || fail "KPKIngCore.c lost counter: stat_up_other_code"
+grep -q "stat_up_tunnel_no_data" "$CORE" || fail "KPKIngCore.c lost counter: stat_up_tunnel_no_data"
+grep -q "stat_up_fake_ok" "$CORE" || fail "KPKIngCore.c lost counter: stat_up_fake_ok"grep -q "kp_record_upstream_failure" "$CORE" \
     || fail "KPKIngCore.c no longer records the last upstream failure context"
 grep -q "stat_up_tunnel_no_data" "Tweak/Sources/KPKIngCore.h" \
     || fail "kp_forwarder_stats no longer exposes the tunnel-no-data counter"
