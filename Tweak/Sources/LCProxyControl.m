@@ -153,6 +153,16 @@ static void LCProxyControlConstructor(void) {
         // 真正该做的消除重复：AutoUpdater 未签名时不再清空已签名副本（v0.5.49 起），
         // 以及升级时在 Tweaks 页手动删除旧版 dylib。
 
+        // 崩溃加固：整个构造体包在 @try/@catch 里。
+        //
+        // 这是**最关键的加固点**：构造器运行在 dylib 初始化阶段（dyld），此处抛出的
+        // ObjC 异常无法被任何人接住，会直接终止进程 —— 症状就是"一打开就闪退"，而且
+        // 因为发生在任何日志/控制台起来之前，用户看不到任何解释。
+        //
+        // 本 tweak 是注入到第三方 App 里的，最高优先级是**绝不弄崩宿主**：宁可这一步
+        // 整个失效（fail-closed，绝不直连、不消耗通用流量），也不能让 App 挂掉。
+        // 异常会被记入共享日志并由 /api/status 的 swallowedExceptions 暴露。
+        @try {
         // 最优先记录加载事实：即便后面任何一步出问题，我们也知道这个进程在什么
         // 时间加载了哪个版本的 dylib。
         LCProxyRecordDylibLoad();
@@ -216,5 +226,9 @@ static void LCProxyControlConstructor(void) {
         // port, this instance stays headless but still records stats.
         BOOL web = [[LCProxyServer shared] start];
         NSLog(@"[LCProxy] control loaded, data=%@ web=%d", LCProxyDataDirectory(), web);
+        } @catch (NSException *e) {
+            NSLog(@"[LCProxy] constructor exception (swallowed, host kept alive): %@: %@", e.name, e.reason);
+            LCProxyRecordSwallowedException(@"constructor", e);
+        }
     }
 }

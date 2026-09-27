@@ -2,6 +2,8 @@
 #import <dlfcn.h>
 #import <objc/message.h>
 #include <stdlib.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 NSString * _Nullable LCProxySharedRootFromDylibPath(NSString *dylibPath) {
     if (!dylibPath.length) return nil;
@@ -104,4 +106,76 @@ NSArray<NSString *> *LCProxyAllDataDirectories(void) {
     // Legacy copies are only migration fallbacks, but keep their iteration
     // order deterministic for callers that inspect them concurrently.
     return [dirs sortedArrayUsingSelector:@selector(compare:)];
+}
+
+// ---------------------------------------------------------------------------
+// 崩溃加固：兜住并记录 ObjC 异常
+// ---------------------------------------------------------------------------
+
+// 只保留最近若干条：这是诊断信息，不需要无限增长（也就不会占内存）。
+#define LC_PROXY_SWALLOWED_MAX 8
+static NSMutableArray<NSString *> *g_lcSwallowed;   // 新→旧
+static NSLock *g_lcSwallowedLock;
+
+void LCProxyRecordSwallowedException(NSString *context, NSException *e) {
+    NSString *name = e.name ?: @"(nil)";
+    NSString *reason = e.reason ?: @"";
+    if (reason.length > 300) reason = [reason substringToIndex:300];
+    NSString *entry = [NSString stringWithFormat:@"%.0f %@: %@: %@",
+                       [[NSDate date] timeIntervalSince1970],
+                       context ?: @"?",
+                       name,
+                       reason];
+
+    // 进程内记录：用独立锁，避免与任何既有锁发生顺序问题（本函数可能在任何
+    // 上下文被调用，包括已持有其他锁的路径 —— 所以绝不调用任何可能回头的代码）。
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        g_lcSwallowed = [NSMutableArray array];
+        g_lcSwallowedLock = [[NSLock alloc] init];
+    });
+    [g_lcSwallowedLock lock];
+    [g_lcSwallowed insertObject:entry atIndex:0];
+    while (g_lcSwallowed.count > LC_PROXY_SWALLOWED_MAX) {
+        [g_lcSwallowed removeLastObject];
+    }
+    [g_lcSwallowedLock unlock];
+
+    // 共享日志：让任何 LiveContainer 实例的控制台都能看到（共享 App 的现场尤其如此）。
+    // 纯诊断，任何失败都必须静默 —— 本函数本身就在处理异常，绝不能再次抛出。
+    @try {
+        NSString *dir = LCProxyCanonicalDataDirectory();
+        if (!dir.length) return;
+        [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                                  withIntermediateDirectories:YES attributes:nil error:nil];
+        NSString *path = [dir stringByAppendingPathComponent:@"kingcard-refresh.log"];
+        NSDictionary *record = @{
+            @"ts": @([[NSDate date] timeIntervalSince1970]),
+            @"pid": @(getpid()),
+            @"ok": @NO,
+            @"src": @"exception",
+            @"ms": @0,
+            @"msg": entry,
+        };
+        if (![NSJSONSerialization isValidJSONObject:record]) return;
+        NSData *line = [NSJSONSerialization dataWithJSONObject:record options:0 error:nil];
+        if (!line.length) return;
+        NSMutableData *payload = [line mutableCopy];
+        [payload appendData:[@"\n" dataUsingEncoding:NSUTF8StringEncoding]];
+        int fd = open(path.fileSystemRepresentation, O_WRONLY | O_APPEND | O_CREAT, 0644);
+        if (fd < 0) return;
+        ssize_t ignored = write(fd, payload.bytes, payload.length);
+        (void)ignored;
+        close(fd);
+    } @catch (__unused NSException *ignored) {
+        // 兜底中的兜底：记录失败绝不能再抛。
+    }
+}
+
+NSArray<NSString *> *LCProxySwallowedExceptions(void) {
+    if (!g_lcSwallowed) return @[];
+    [g_lcSwallowedLock lock];
+    NSArray<NSString *> *copy = [g_lcSwallowed copy];
+    [g_lcSwallowedLock unlock];
+    return copy;
 }

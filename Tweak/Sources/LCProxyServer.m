@@ -111,6 +111,9 @@ static const NSUInteger LCProxyDefaultPort = 19092;
     d[@"pid"] = @(getpid());
     d[@"bundleId"] = [self currentBundleId];
     d[@"dylibPath"] = LCProxyDylibPath();
+    // 崩溃加固：被兜住的 ObjC 异常。非空说明我们的代码出过错（但宿主 App 仍活着）。
+    // 这是"是否由本 tweak 导致闪退"的唯一直接证据。
+    d[@"swallowedExceptions"] = LCProxySwallowedExceptions() ?: @[];
     d[@"dataDirectory"] = LCProxyDataDirectory();
     d[@"forwarderPort"] = @([[LCProxyKing shared] localForwarderPort]);
     d[@"proxyOverridePort"] = @([self proxyOverridePort]);

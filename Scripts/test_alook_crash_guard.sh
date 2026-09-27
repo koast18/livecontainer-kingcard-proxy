@@ -78,4 +78,26 @@ grep -q "不要在持有 self.lock 时 stop/free" "$KING" \
 grep -q "lifecycleLock" "$KING"     || fail "LCProxyKing.m lost the forwarder lifecycle serialization lock"
 grep -q "@finally" "$KING"     || fail "LCProxyKing.m applyConfig no longer releases lifecycleLock on all exits"
 
+# --- 崩溃加固：关键入口必须兜住 ObjC 异常 ---
+#
+# 本 tweak 注入到第三方 App 里，最高优先级是"绝不弄崩宿主"。构造器与配置应用路径一旦
+# 抛出 ObjC 异常，异常会穿透 dylib 初始化（__attribute__((constructor))）或 GCD 边界
+# 直接终止进程 —— 在构造器阶段就是"一打开就闪退"，且发生在任何日志起来之前。
+CONTROL="Tweak/Sources/LCProxyControl.m"
+CONFIG="Tweak/Sources/LCProxyConfig.m"
+PATHS="Tweak/Sources/LCProxyPaths.m"
+SERVER="Tweak/Sources/LCProxyServer.m"
+grep -q "LCProxyRecordSwallowedException" "$PATHS" \
+    || fail "LCProxyPaths.m lost the swallowed-exception recorder"
+grep -q "@catch (NSException" "$CONTROL" \
+    || fail "LCProxyControl.m constructor no longer swallows ObjC exceptions (crash on launch)"
+grep -q "LCProxyRecordSwallowedException(@\"constructor\"" "$CONTROL" \
+    || fail "LCProxyControl.m constructor does not record a swallowed exception"
+grep -q "applyRuntimeSnapshotUnsafe" "$CONFIG" \
+    || fail "LCProxyConfig.m lost the crash-hardened applyRuntimeSnapshot wrapper"
+grep -q "LCProxyRecordSwallowedException(@\"applyRuntimeSnapshot\"" "$CONFIG" \
+    || fail "LCProxyConfig.m applyRuntimeSnapshot does not record a swallowed exception"
+grep -q "swallowedExceptions" "$SERVER" \
+    || fail "/api/status no longer exposes swallowedExceptions"
+
 echo "Alook crash guard static checks OK"

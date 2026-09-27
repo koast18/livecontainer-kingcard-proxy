@@ -48,6 +48,8 @@ static nw_path_monitor_t g_networkMonitor;
 - (void)handleNetworkPath:(nw_path_t)path;
 - (NSString *)runtimeSignatureForSettings:(NSDictionary *)settings effectiveMode:(NSString *)effectiveMode;
 - (void)enqueueRuntimeApplyForceRecovery:(BOOL)forceRecovery reason:(NSString *)reason;
+/// 实际实现；公开入口 applyRuntimeSnapshot:... 只负责 @try/@catch 崩溃加固。
+- (void)applyRuntimeSnapshotUnsafe:(NSDictionary *)s effectiveMode:(NSString *)effectiveMode forceRecovery:(BOOL)forceRecovery;
 - (void)startNetworkMonitorOnRuntimeQueue;
 - (void)createPathMonitorOnQueue:(dispatch_queue_t)queue;
 - (void)restartNetworkMonitorOnRuntimeQueue;
@@ -409,6 +411,21 @@ static nw_path_monitor_t g_networkMonitor;
 }
 
 - (void)applyRuntimeSnapshot:(NSDictionary *)s effectiveMode:(NSString *)effectiveMode forceRecovery:(BOOL)forceRecovery {
+    // 崩溃加固：本方法会在构造器路径（applyToRuntime → dispatch_sync）、主线程通知回调、
+    // 以及串行 runtimeQueue 上运行。ObjC 异常一旦穿透 dispatch_sync / GCD 边界就会终止
+    // 进程；构造器路径上更是 dylib 初始化阶段崩溃 = "一打开就闪退"。
+    //
+    // 注入式 tweak 的最高优先级是"绝不弄崩宿主"：这一步失败只是代理不生效
+    // （fail-closed，绝不直连），而进程必须活着。
+    @try {
+        [self applyRuntimeSnapshotUnsafe:s effectiveMode:effectiveMode forceRecovery:forceRecovery];
+    } @catch (NSException *e) {
+        NSLog(@"[LCProxy] applyRuntimeSnapshot exception (swallowed): %@: %@", e.name, e.reason);
+        LCProxyRecordSwallowedException(@"applyRuntimeSnapshot", e);
+    }
+}
+
+- (void)applyRuntimeSnapshotUnsafe:(NSDictionary *)s effectiveMode:(NSString *)effectiveMode forceRecovery:(BOOL)forceRecovery {
     NSString *signature = [self runtimeSignatureForSettings:s effectiveMode:effectiveMode];
     BOOL settingsChanged = !self.lastAppliedRuntimeSignature || ![signature isEqualToString:self.lastAppliedRuntimeSignature];
 

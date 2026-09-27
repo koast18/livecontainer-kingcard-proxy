@@ -81,6 +81,49 @@
 心跳事件会写入 App Group 的 `kingcard-refresh.log`（`src=heartbeat-heal` /
 `heartbeat-repin` / `emergency-heal`），因此一次复现即可从任意控制台看到自愈全过程。
 
+### 2.9 v0.5.66：崩溃加固（关键入口兜住 ObjC 异常）+ 暴露 swallowedExceptions
+
+**动机。** 用户报告"打开共享 App 就闪退，说是没有 entitlement"。经核对：
+
+- 本 tweak **没有任何 entitlement 查询代码**（全树只有一处 `NSClassFromString(@"LCSharedUtils")`），
+  因此那条 entitlement 报错来自 LiveContainer 本身或其签名流程，不是本 dylib 主动查询的结果；
+- 但"闪退"这件事本身必须从我们的角度彻底排除 —— 本 tweak 是**注入到第三方 App** 里的，
+  **最高优先级是"绝不弄崩宿主"**。
+
+**风险点。** 构造器运行在 **dylib 初始化阶段（dyld）**：此处抛出的 ObjC 异常无法被任何人
+接住，会直接终止进程 —— 症状正是"一打开就闪退"，而且发生在任何日志/控制台起来之前，
+用户看不到任何解释。`applyRuntimeSnapshot:` 同样危险：它跑在构造器路径
+（`applyToRuntime` → `dispatch_sync`）、主线程通知回调与串行 `runtimeQueue` 上，异常一旦
+穿透 GCD 边界就会终止进程。
+
+**改动。**
+
+1. `LCProxyControlConstructor` 整体包在 `@try/@catch` 中；
+2. `applyRuntimeSnapshot:` 拆成"加固外壳 + `applyRuntimeSnapshotUnsafe:` 实现"，外壳
+   只负责 `@try/@catch`；
+3. 新增 `LCProxyRecordSwallowedException()` / `LCProxySwallowedExceptions()`：把被兜住的
+   异常**同时**写入进程内环形缓冲（上限 8 条，独立 `NSLock`，绝不回头调用可能持锁的
+   代码）和 App Group 共享日志（`src=exception`）；
+4. `/api/status` 新增 **`swallowedExceptions`** —— **非空即说明我们的代码确实出过错**
+   （但宿主 App 仍活着）。这是判断"闪退是否由本 tweak 造成"的唯一直接证据，且用户无需
+   读取设备日志即可看到。
+
+**设计原则（新增）**：tweak 里的异常处理不是"容错"，而是**安全边界**。这一步失败只是
+代理不生效（fail-closed，绝不直连、不消耗通用流量），而进程必须活着。
+
+**同时核对了路径与其它潜在清空点（结论：均无问题）**：
+
+- 共享 App 的 dylib 位于 `<AppGroup>/LiveContainer/Tweaks`，`LCProxySharedRootFromDylibPath`
+  反推出 `<AppGroup>/LiveContainer/LCProxy`，与 `LCProxySharedDataDirectory()` 结果一致
+  → **用户最初的"路径不同"假设可以排除**；
+- `credentialInputSignature` 只包含 `settings.json` 字段（所有进程读同一份），**不含进程
+  相关信息**，因此不会"拒绝别的进程写的有效凭证"；
+- 空代理池会返回 `success:NO`（`KPKIngCore`/`LCProxyKing` 第 1488-1491 行），因此
+  **不存在"取号报 ok:true 但池是空的"**；
+- 凭证日志有轮转（`LCProxyKingCredentialLogMaxLines = 64`），不会无限增长；
+- 全树只有 3 处清空点（`loadCachedStateIntoForwarder`、`finishRefreshWithState` 失败分支、
+  方法定义），且前两处已于 v0.5.65 改为 `leadTime:0`。
+
 ### 2.8 v0.5.65：修正 leadTime 语义混用（提前清空代理池）+ 撤回重复映像守卫 + 实时池大小
 
 **(a) leadTime 语义混用 —— 与 §2.5 同族的"提前清空"。**
