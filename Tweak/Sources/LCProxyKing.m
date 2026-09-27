@@ -1574,6 +1574,7 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
         d[@"directFallbacks"] = @(stats.direct_fallbacks);
         d[@"refreshCalls"] = @(stats.refresh_calls);
         d[@"proxyErrors"] = @(stats.proxy_errors);
+        d[@"poolEmpty"] = @(stats.pool_empty);
         NSMutableArray *hosts = [NSMutableArray array];
         int hostCount = kp_forwarder_direct_host_count(self.forwarder);
         for (int i = 0; i < hostCount && i < 16; i++) {
@@ -1633,6 +1634,8 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
         d[@"statDirectFallbacks"] = @(stats.direct_fallbacks);
         d[@"statRefreshCalls"] = @(stats.refresh_calls);
         d[@"statProxyErrors"] = @(stats.proxy_errors);
+        // 决定性判据：连接到达时代理池为空的次数。
+        d[@"statPoolEmpty"] = @(stats.pool_empty);
 
         NSMutableArray *directHosts = [NSMutableArray array];
         int hostCount = kp_forwarder_direct_host_count(self.forwarder);

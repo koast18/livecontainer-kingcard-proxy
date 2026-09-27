@@ -256,6 +256,10 @@ typedef struct {
     uint64_t direct_fallbacks;
     uint64_t refresh_calls;
     uint64_t proxy_errors;
+    /// 连接到达时代理池为空的次数。区分两类"无法联网"：
+    /// 高 → 完全没有可用凭证/代理池（凭证被清空或从未装载）；
+    /// 为 0 而连接仍失败 → 池内有节点但都被拒（上游/凭证失效）。
+    uint64_t pool_empty;
 } kp_forwarder_stats;
 
 void kp_forwarder_get_stats(kp_forwarder *fw, kp_forwarder_stats *stats);

@@ -209,6 +209,39 @@ v0.5.60 修对了"强制刷新不得清空在用凭证"，但**给并发刷新�
 > 都是真实缺陷且必须保留；但它们只是让转发器**对象**恢复健康，并未触及本条"凭证在
 > 刷新期间被清空"的逻辑，因此单独修它们不足以恢复转发。本版本与它们叠加后才完整。
 
+#### 2.5.1 已验证的完整因果链（含一处此前的误读更正）
+
+对 v0.5.59 的实测数据做算术核对后，整条链**逐环节可验证**：
+
+`kp_forwarder_clear_king_state` 会把 `http_pool` / `https_pool` 的计数置为 **0**
+（`KPKIngCore.c:2471-2472`）。而 v0.5.59 的 `refreshCredentialsWithForce:` 开头有一行
+`if (force) [self clearForwarderKingState];`（已确认存在于 `v0.5.59` tag，当前 master
+为 0 处）。于是：
+
+1. 任何一次强制刷新 → **代理池立即变空**（此时取号还要 1~2 秒网络往返）；
+2. 连接到达 → `https_pool_count = fw->https_pool.count` 读到 **0** →
+   `for (attempt = 0; attempt < 0; ...)` **循环体一次都不执行** → 直接落到
+   `kp_forwarder_refresh_retry(fw, 3, 500)` → **3 次 hook 调用**；
+3. 这解释了实测的那个比值：`statRefreshCalls(1341) ÷ statHttpsConnects(477) ≈ 2.8 ≈ 3`；
+4. 而旧版 hook 内部是**同步强制取号**，它又会清空一次池 → 37 个并发连接使清空窗口
+   几乎连续覆盖 → **任何连接都找不到可用代理 → 永远无法联网**；
+5. `lastRefreshSuccess:false`、`lastHealthCheckOk:false`（探测同样遇到空池）、
+   `statHttpRequests:0` 全部由此解释。
+
+**误读更正**：`trafficLogTail` 里只有十几小时前的旧记录，我一度当成"连接全部失败"的
+证据。实际上实测快照中 **`trafficLogging:false`** —— 该开关关闭时 `kp_traffic_log`
+直接返回，**根本不会写任何新记录**。因此空日志不是失败证据，请勿据此判断。
+
+**如何一眼区分两类"无法联网"**（v0.5.64 起提供 `statPoolEmpty`）：
+
+| `statPoolEmpty` | 含义 |
+|---|---|
+| 高（且 `statRefreshCalls / statHttpsConnects ≈ 重试次数`）| **完全没有可用凭证/池** —— 即本条这一类（凭证被清空/从未装载）|
+| 0，但连接仍失败 | 池内有节点但都被拒 → 上游或凭证失效，是**另一类**问题 |
+
+其中"池为空时 for 循环体不执行"这一步是 C 层的既有结构；v0.5.60 移除了强制刷新开头的
+清空，使池不再被无谓清空；v0.5.64 补上该计数器，让这一类问题下次可被直接确认。
+
 ### 2.4 私有 App 正常、转共享后失效 —— 结构性差异排查结论
 
 对照上游 `LiveContainer/LiveContainer@4dbe0f9` 逐处核对了 `isSharedBundle` 影响的

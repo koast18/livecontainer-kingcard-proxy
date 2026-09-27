@@ -1202,6 +1202,14 @@ struct kp_forwarder {
     uint64_t stat_direct_fallbacks;
     uint64_t stat_refresh_calls;
     uint64_t stat_proxy_errors;
+    // 连接到达时**代理池为空**的次数。这是区分两类故障的决定性指标：
+    //   · pool_empty_count 高 → 完全没有可用凭证/代理池（凭证被清空或从未装载）。
+    //     实测特征：stat_refresh_calls / stat_https_connects ≈ 重试次数（旧版为 3），
+    //     因为池为空时 for 循环体一次都不执行、直接落到刷新重试。
+    //     根因曾是 refreshCredentialsWithForce 开头的 clearForwarderKingState
+    //     （v0.5.60 已移除）。
+    //   · pool_empty_count 为 0 而连接仍失败 → 池内有节点但都被拒（上游/凭证失效）。
+    uint64_t stat_pool_empty;
 
     char direct_host_log[KP_DIRECT_HOST_LOG_MAX][128];
     int direct_host_log_count;
@@ -2001,6 +2009,8 @@ static void kp_handle_client(kp_forwarder *fw, int client) {
         pthread_mutex_lock(&fw->cred_mutex);
         http_pool_count = fw->http_pool.count;
         pthread_mutex_unlock(&fw->cred_mutex);
+        // 连接到达时池为空：这正是"完全无法联网"的决定性签名（见 stat_pool_empty）。
+        if (http_pool_count == 0) kp_stat_increment(&fw->stat_pool_empty);
 
     http_retry:
         for (int attempt = 0; attempt < http_pool_count; attempt++) {
@@ -2147,6 +2157,8 @@ static void kp_handle_client(kp_forwarder *fw, int client) {
     pthread_mutex_lock(&fw->cred_mutex);
     https_pool_count = fw->https_pool.count;
     pthread_mutex_unlock(&fw->cred_mutex);
+    // 连接到达时池为空：这正是"完全无法联网"的决定性签名（见 stat_pool_empty）。
+    if (https_pool_count == 0) kp_stat_increment(&fw->stat_pool_empty);
 
 https_retry:
     for (int attempt = 0; attempt < https_pool_count; attempt++) {
@@ -2689,6 +2701,7 @@ void kp_forwarder_get_stats(kp_forwarder *fw, kp_forwarder_stats *stats) {
     stats->direct_fallbacks = __atomic_load_n(&fw->stat_direct_fallbacks, __ATOMIC_RELAXED);
     stats->refresh_calls = __atomic_load_n(&fw->stat_refresh_calls, __ATOMIC_RELAXED);
     stats->proxy_errors = __atomic_load_n(&fw->stat_proxy_errors, __ATOMIC_RELAXED);
+    stats->pool_empty = __atomic_load_n(&fw->stat_pool_empty, __ATOMIC_RELAXED);
 }
 
 int kp_forwarder_direct_host_count(kp_forwarder *fw) {

@@ -235,6 +235,21 @@ assert re.search(r'if \(self\.refreshing\) \{\s*\[self\.lock unlock\];', king), 
 assert king.count('[self clearForwarderKingState]') >= 2, \
     'clearForwarderKingState was removed entirely (no fail-closed path left)'
 
+# 决定性诊断计数器：连接到达时代理池为空的次数。
+# 这是区分两类"完全无法联网"的唯一可靠指标：
+#   高 → 完全没有可用凭证/池（凭证被清空或从未装载）——曾由强制刷新开头清空导致，
+#        其特征是 stat_refresh_calls / stat_https_connects ≈ 重试次数（池为空时
+#        for 循环体一次都不执行、直接落到刷新）；
+#   为 0 而连接仍失败 → 池内有节点但都被拒（上游/凭证失效），是另一类问题。
+assert 'stat_pool_empty' in core, 'the pool-empty diagnostic counter is missing'
+assert core.count('kp_stat_increment(&fw->stat_pool_empty)') == 2, \
+    'pool-empty is not counted on both the HTTP and HTTPS connection paths'
+assert 'uint64_t pool_empty;' in Path('Tweak/Sources/KPKIngCore.h').read_text(encoding='utf-8'), \
+    'pool_empty is not exposed in kp_forwarder_stats'
+assert 'stats->pool_empty = __atomic_load_n(&fw->stat_pool_empty' in core, \
+    'pool_empty is not populated by kp_forwarder_get_stats'
+assert 'd[@"statPoolEmpty"]' in king, '/api/status does not expose statPoolEmpty'
+
 # Latency probing must stay capped so a refresh cannot stall for tens of seconds.
 assert 'KP_LATENCY_PROBE_MAX' in king, 'sequential latency probing is not capped'
 latency_sort_start = king.index('- (NSArray<NSString *> *)proxiesSortedByLatency:')
