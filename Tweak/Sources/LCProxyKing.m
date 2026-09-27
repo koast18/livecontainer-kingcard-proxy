@@ -1469,6 +1469,8 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
 
     NSMutableDictionary *state = [self loadState];
     // 用户触发的"重置凭证"：丢弃一切缓存状态，本次必须重新领 GUID + Q-Token + 代理池。
+    // 注意：steps 在下面才声明，所以这里只置标志，稍后再写日志。
+    BOOL didResetCredentials = NO;
     {
         [self.lock lock];
         BOOL wantNew = self.newIdentityRequested;
@@ -1478,7 +1480,7 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
             state = [NSMutableDictionary dictionary];
             force = YES;
             if (!settings) settings = [self settingsSnapshot];
-            [steps appendString:@"重置: 用户触发，丢弃缓存凭证并重新领取\n"];
+            didResetCredentials = YES;
         }
     }
     if (!force && state.count && [self stateHasFreshCredentials:state matchingSettings:settings]) {
@@ -1496,6 +1498,9 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
 
     NSDate *t0 = [NSDate date];
     NSMutableString *steps = [NSMutableString string];
+    if (didResetCredentials) {
+        [steps appendString:@"重置: 用户触发，丢弃缓存凭证并重新领取\n"];
+    }
     // 记录是否真的向上游发起了取号/取代理池请求；纯缓存命中时不写取号日志。
     BOOL actuallyFetchedUpstream = NO;
 
