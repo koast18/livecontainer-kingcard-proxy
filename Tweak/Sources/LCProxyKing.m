@@ -17,13 +17,27 @@ static const NSTimeInterval LCProxyKingRefreshInterval = 2 * 60;
 static const NSTimeInterval LCProxyKingRefreshLeeway = 30;
 static const NSTimeInterval LCProxyKingRefreshLeadTime = 2 * 60;
 static const NSTimeInterval LCProxyKingPBProxyBootstrapSetupAllowance = 2;
+// 被动刷新（转发失败触发）的最小间隔。见 requestBackgroundRefresh。
+static const NSTimeInterval LCProxyKingMinRefreshInterval = 60.0;
 
+// C 层回调：在**转发失败**时被调用（它已先试完所有代理节点）。
+//
+// 必须满足两条硬约束，否则会变成灾难：
+//   ① **零阻塞** —— 它跑在 C 层 client 线程上（KPKIngCore.c: kp_forwarder_refresh），
+//      而 kp_forwarder_refresh_retry 对每个失败请求最多重试 3 次、client 线程上限 64。
+//      任何阻塞式等待都会被放大：20s/次 × 3 次 × 64 线程足以让进程被系统杀掉（闪退）。
+//   ② **强限频** —— C 层把"连接失败"一律当成"凭证问题"，而失败在共享 App 的高并发下
+//      是成批出现的。不加限制时每个失败连接都要一次取号，实测打出 1341 次取号、
+//      45 秒内 30 次完整取号，把 client 线程全占满。
+//
+// 因此这里只做一件事：投递一个限频的异步刷新信号，并**立即返回 0**。
+// 返回 0 的含义是"本轮重试到此为止" —— 让 C 层停止重试，避免风暴；
+// 真正的取号在后台队列完成，完成后新凭证会装进转发器，后续连接自然恢复。
+// 当前这次连接会失败（客户端拿到 502），但这是可接受的：它换来的是不雪崩、不闪退。
 static int LCProxyKingRefreshHook(void *ctx) {
     LCProxyKing *king = (__bridge LCProxyKing *)ctx;
-    // 被动刷新是由实际转发失败触发的，不能信任本地缓存的 tokenExpireEpoch：
-    // 服务器宣称的有效期可能比真实有效期更长，普通 refreshCredentials 会误以为
-    // 凭证仍新鲜而继续复用已失效的 Q-Token。这里强制重新取号。
-    return [king refreshCredentialsForce] ? 0 : -1;
+    [king requestBackgroundRefresh];
+    return 0;
 }
 
 static void LCProxyKingLog(const char *line) {
@@ -77,6 +91,8 @@ NSString *const LCProxyForwarderLifecycleChangedNotification = @"LCProxyForwarde
 @property (nonatomic, assign) BOOL lastRefreshSuccess;
 @property (nonatomic, strong) dispatch_source_t refreshTimer;
 @property (nonatomic, assign) BOOL refreshing;
+// 上一次真正开始取号的时间戳。用于给被动刷新限频（见 requestBackgroundRefresh）。
+@property (nonatomic, assign) NSTimeInterval lastRefreshStartedAt;
 @property (nonatomic, assign) BOOL lockRetryScheduled;
 @property (nonatomic, copy) NSString *lastSettingsSignature;
 @property (nonatomic, strong) NSMutableArray<NSDictionary *> *refreshLog;
@@ -93,6 +109,7 @@ NSString *const LCProxyForwarderLifecycleChangedNotification = @"LCProxyForwarde
 - (NSArray<NSString *> *)validatedProxyPool:(id)value;
 - (NSString *)credentialInputSignatureForSettings:(NSDictionary *)settings;
 - (void)clearForwarderKingState;
+- (void)requestBackgroundRefresh;
 - (void)retireForwarder:(kp_forwarder *)fw;
 - (void)healMissingForwarderDirectly;
 - (void)startLivenessHeartbeat;
@@ -370,9 +387,13 @@ static const NSTimeInterval LCProxyKingLifecycleNotifyMinInterval = 5.0;
 - (void)heartbeatTick {
     self.lastHeartbeatAt = [[NSDate date] timeIntervalSince1970];
 
-    NSDictionary *settings = [self settingsSnapshot];
-    if (![settings[@"proxyEnabled"] boolValue]) return;
-    if (![[[LCProxyConfig shared] effectiveProxyModeForSettings:settings] isEqualToString:@"kingcard"]) return;
+    // 只读内存状态，**不做任何磁盘/配置读取** —— 本方法每 5 秒跑一次，必须足够省。
+    // desiredForwarderRunning 由 applyConfig 在王卡模式启用时置位，语义与
+    // "王卡已启用" 等价，因此无需每 5 秒重新解析 settings.json。
+    [self.lock lock];
+    BOOL shouldRun = self.desiredForwarderRunning;
+    [self.lock unlock];
+    if (!shouldRun) return;
 
     int port = [self localForwarderPort];
     if (port <= 0 || ![self isRunning]) {
@@ -405,11 +426,9 @@ static const NSTimeInterval LCProxyKingLifecycleNotifyMinInterval = 5.0;
     }
 
     // 凭证陈旧同样会造成"转发器在跑、但所有请求都失败"（上游 407/403 → 转发器回 502），
-    // 症状与端口不一致一样是"无法联网"。这里顺带催促一次刷新：refreshCredentials
-    // 内部有 refreshing 去重，重复调用不会堆积，也不会阻塞心跳线程。
-    if (![self hasFreshCachedState]) {
-        [self refreshCredentialsAsync];
-    }
+    // 症状与端口不一致一样是"无法联网"。这里走与被动刷新同一个**限频异步**入口，
+    // 因此即使凭证持续拿不到，也绝不会变成每 5 秒一次的风暴。
+    [self requestBackgroundRefresh];
 }
 
 // 紧急自愈：绕过 LCProxyConfig 的串行 runtimeQueue，直接重建转发器并就地钉住
@@ -529,6 +548,31 @@ static const NSTimeInterval LCProxyKingLifecycleNotifyMinInterval = 5.0;
 - (void)refreshCredentialsAsync {
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         [self refreshCredentials];
+    });
+}
+
+// 被动刷新入口，由 C 层转发失败回调（LCProxyKingRefreshHook）触发。
+//
+// 特点：**零阻塞 + 限频 + 异步**。它是整套取号逻辑里唯一的"按需"入口，因此必须
+// 足够克制 —— 否则一次网络抖动就会变成取号风暴（实测 1341 次取号、45 秒内 30 次
+// 完整取号），把 client 线程耗尽并导致闪退。
+//
+//   · 已有取号在飞 → 直接返回，不排队、不等待、不阻塞调用线程。
+//   · 距上次取号不足 LCProxyKingMinRefreshInterval → 直接返回。
+//   · 允许时才把真正的取号丢到后台队列执行，调用线程立即返回。
+//
+// 真正的取号过程绝不会先清空在用凭证（见 refreshCredentialsWithForce:），
+// 因此在它完成之前，转发仍可用旧凭证继续服务。
+- (void)requestBackgroundRefresh {
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    [self.lock lock];
+    BOOL busy = self.refreshing;
+    BOOL tooSoon = self.lastRefreshStartedAt > 0 &&
+                   (now - self.lastRefreshStartedAt) < LCProxyKingMinRefreshInterval;
+    [self.lock unlock];
+    if (busy || tooSoon) return;
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        [self refreshCredentialsForce];
     });
 }
 
@@ -785,9 +829,6 @@ static const NSUInteger LCProxyKingCredentialLogMaxLines = 64;
 static const NSUInteger LCProxyKingSharedRefreshLogMaxLines = 200;
 // 存活心跳周期：见 startLivenessHeartbeat。
 static const NSTimeInterval LCProxyKingLivenessInterval = 5.0;
-// 并发刷新合并的等待上限：在飞的刷新结束前，其他调用方最多等这么久再按当前结果返回。
-// 见 refreshCredentialsWithForce: 里"绝不把已有刷新当作失败"的说明。
-static const NSTimeInterval LCProxyKingRefreshCoalesceTimeout = 20.0;
 
 - (NSString *)credentialLogPath {
     // 路径只取决于数据目录，解析一次即可缓存，避免每次都做目录创建 IO。
@@ -1147,31 +1188,25 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
     // stays offline forever.
     if (self.refreshing) {
         [self.lock unlock];
-        // 合并并发刷新：**绝不把"已有刷新在飞"当作刷新失败**。
+        // 合并并发刷新 —— **绝不阻塞调用方**。
         //
-        // 为什么这是致命的：C 层对每个失败的请求都会调用 refresh hook 并重试
-        // （KPKIngCore.c: kp_forwarder_refresh_retry(fw, 3, 500)，以及 CONNECT 隧道
-        // 无上游数据时的 kp_forwarder_refresh_retry(fw, 2, 300)）。若这里直接
-        // return NO，重试的每一次都得到"失败"，于是**每个失败请求都放大成 3 次强制
-        // 取号**。共享 App 并发连接远多于私有 App（实测 activeForwarderClients=37），
-        // 几十秒内即可打出上千次取号：statRefreshCalls=1341、45 秒内 30 次完整取号
-        // 成功 —— 每次取号要 1.1~2.1s 网络往返，客户端线程全被占满，而每个取号又
-        // 清空一次凭证（见下），于是形成自我维持的雪崩。
+        // 本方法会被 C 层 client 线程经 refresh hook 调用
+        // （KPKIngCore.c: kp_forwarder_refresh → fw->refresh_fn），而
+        // kp_forwarder_refresh_retry 对每个失败请求最多重试 3 次，client 线程上限
+        // KP_FORWARDER_MAX_CLIENTS=64。因此**任何阻塞式等待都会被急剧放大**：
+        // 一次 20s 的等待 × 最多 64 个线程 × 每线程 3 次重试 = 大量线程长时间被占住，
+        // 共享 App 高并发下足以让进程被系统直接杀掉（表现为一打开就闪退）。
+        // v0.5.60 曾在此处实现 20s 阻塞等待，即为闪退来源，已彻底移除。
         //
-        // 正确语义：等待在飞的那次刷新结束（有界），把它的**真实结果**返回给所有
-        // 调用方 —— 一次取号服务所有等待者。
-        NSTimeInterval deadline = [[NSDate date] timeIntervalSince1970] + LCProxyKingRefreshCoalesceTimeout;
-        while (YES) {
-            [self.lock lock];
-            BOOL busy = self.refreshing;
-            BOOL ok = self.lastRefreshSuccess;
-            [self.lock unlock];
-            if (!busy) return ok;
-            if ([[NSDate date] timeIntervalSince1970] >= deadline) return ok;
-            [NSThread sleepForTimeInterval:0.05];
-        }
+        // 现在立即返回 YES（语义：已有刷新在飞，无需再试）：
+        //   · hook 返回 0 → C 层不再重试该请求 → 取号风暴被掐断；
+        //   · 零阻塞 → 不再有任何线程被占住；
+        //   · 等待者不会拿到"失败"，因此不会各自放大成新的强制取号。
+        // 在飞的刷新完成后会把新凭证装进转发器，后续连接自然恢复。
+        return YES;
     }
     self.refreshing = YES;
+    self.lastRefreshStartedAt = [[NSDate date] timeIntervalSince1970];
     [self.lock unlock];
     // ★ 强制刷新**不得**先清空正在服务的凭证。原实现在此处调用
     // clearForwarderKingState（已移除，勿再加回）：它会在取号所需的网络往返

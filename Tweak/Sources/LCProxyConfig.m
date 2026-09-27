@@ -571,7 +571,22 @@ static nw_path_monitor_t g_networkMonitor;
             }
         });
         if (shouldRetry) {
-            [self enqueueRuntimeApplyForceRecovery:YES reason:@"health check failed"];
+            // 补救方式是**刷新凭证**，而不是强恢复。
+            //
+            // 理由：本方法只在 lastAppliedForwarderPort > 0（转发器在监听）时才被安排，
+            // 而 performHealthCheck 的前置检查是 running && port > 0 && listen_fd_valid；
+            // 因此探测失败时转发器**对象是健康的**，失败的是经它发往上游的 CONNECT 探测
+            // （kp_probe_generate204 经本地转发器向 www.gstatic.com:80 发 CONNECT 再取
+            // /generate_204），即上游/凭证问题。
+            //
+            // 而强恢复会执行 lcproxy_async_close_all() + shutdownActiveClients，把
+            // **所有在飞连接**一起杀掉。于是一次（可能是偶发的）探测失败就变成一批用户
+            // 可见的断连，这些失败又各自触发 C 层的取号重试 —— 与"强制刷新清空凭证"
+            // 构成同一类正反馈雪崩。共享 App 并发高（实测 37 个并发客户端），最先踩中。
+            //
+            // 刷新凭证既针对真正的病因，又完全不打断正在服务的连接。
+            // 走限频异步入口：健康检查可能因上游抖动被反复触发，绝不能让它变成风暴。
+            [[LCProxyKing shared] requestBackgroundRefresh];
         }
     });
 }

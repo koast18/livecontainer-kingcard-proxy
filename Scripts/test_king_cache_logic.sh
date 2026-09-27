@@ -174,12 +174,34 @@ assert 'kp_forwarder_clear_king_state' in king, 'stale forwarder state is not cl
 # 共享 App 并发高，最先且最重地踩中；私有 App 并发低，通常波及不到。
 assert 'if (force) [self clearForwarderKingState];' not in king, \
     'a forced refresh still clears live credentials before fetching replacements (avalanche)'
-assert 'LCProxyKingRefreshCoalesceTimeout' in king, \
-    'concurrent refresh requests are not coalesced'
-assert re.search(r'if \(self\.refreshing\) \{\s*\[self\.lock unlock\];\s*// 合并并发刷新', king), \
-    'an in-flight refresh is still reported as a refresh failure (drives the retry storm)'
-assert re.search(r'BOOL busy = self\.refreshing;\s*BOOL ok = self\.lastRefreshSuccess;', king), \
-    'the coalescing wait does not return the in-flight refresh result'
+
+# 被动刷新（C 层转发失败回调）必须 **零阻塞 + 限频 + 异步**。
+# 回调跑在 C 层 client 线程上（kp_forwarder_refresh），而 kp_forwarder_refresh_retry
+# 对每个失败请求最多重试 3 次、client 线程上限 64 —— 任何阻塞式等待都会被放大成
+# "20s × 3 × 64 线程"，足以让进程被系统杀掉（实测：打开共享 App 即闪退）。
+# 同时 C 层把"连接失败"一律当成"凭证问题"，共享 App 高并发下失败成批出现，
+# 不加限频就会打出取号风暴（实测 1341 次取号 / 45 秒内 30 次完整取号）。
+assert 'LCProxyKingMinRefreshInterval' in king, 'passive refresh is not rate limited'
+_hook = king[king.index('static int LCProxyKingRefreshHook'):king.index('static void LCProxyKingLog')]
+assert 'requestBackgroundRefresh' in _hook and 'return 0;' in _hook, \
+    'the C refresh hook does not delegate to the non-blocking async path'
+assert 'refreshCredentials' not in _hook, \
+    'the C refresh hook performs the refresh inline (blocks a client thread)'
+_rbr = king[king.index('- (void)requestBackgroundRefresh {'):]
+_rbr = _rbr[:_rbr.index('\n}\n') + 3]
+assert 'NSThread sleepForTimeInterval' not in _rbr, \
+    'requestBackgroundRefresh blocks the calling thread'
+assert 'dispatch_async' in _rbr, 'requestBackgroundRefresh does not run the fetch off-thread'
+assert 'self.lastRefreshStartedAt' in _rbr and 'tooSoon' in _rbr, \
+    'requestBackgroundRefresh is not rate limited'
+assert 'self.lastRefreshStartedAt = [[NSDate date] timeIntervalSince1970];' in king, \
+    'the refresh start timestamp is never recorded (rate limit would never trigger)'
+# 任何地方都不得再出现阻塞式等待取号结果的循环（0.5.60 的闪退来源）。
+assert 'LCProxyKingRefreshCoalesceTimeout' not in king, \
+    'the blocking coalesce wait is back (crashes the app under load)'
+assert re.search(r'if \(self\.refreshing\) \{\s*\[self\.lock unlock\];', king), \
+    'an in-flight refresh no longer short-circuits cheaply'
+
 # 清空仍然必须存在（无凭证时 fail-closed），只是不再发生在强制刷新的开头。
 assert king.count('[self clearForwarderKingState]') >= 2, \
     'clearForwarderKingState was removed entirely (no fail-closed path left)'
@@ -276,9 +298,16 @@ assert 'lifecycleLock' not in _hb, \
     'heartbeat takes lifecycleLock, so a wedged apply would block the safety net too'
 assert 'runtimeQueue' not in _hb, \
     'heartbeat depends on the serial runtimeQueue it is meant to bypass'
-# 凭证陈旧也会造成"转发器在跑但全部失败"，心跳必须一并催促刷新。
-assert 'hasFreshCachedState' in _hb and 'refreshCredentialsAsync' in _hb, \
-    'heartbeat does not prod a credential refresh when the cache is stale'
+# 心跳每 5s 跑一次，必须足够省：只读内存状态，不做磁盘/配置读取；
+# 催促刷新也走同一个限频异步入口，避免变成每 5s 一次的风暴。
+assert 'hasFreshCachedState' not in _hb, \
+    'heartbeat reads settings/credential state from disk every 5 seconds'
+assert 'settingsSnapshot' not in _hb, \
+    'heartbeat re-parses settings on every tick'
+assert 'desiredForwarderRunning' in _hb, \
+    'heartbeat does not use the in-memory kingcard-enabled flag'
+assert 'requestBackgroundRefresh' in _hb, \
+    'heartbeat does not prod a (rate-limited) credential refresh'
 
 # Explicit credentials always override remote refreshes, including forced ones.
 assert '!guidOverride && (force || !guid)' in king, \
@@ -383,6 +412,20 @@ assert 'lastWebkitAppliedPort' in config, \
 assert re.search(r'if \(self\.lastWebkitAppliedPort != desiredForwarderPort\)[\s\S]{0,400}?'
                  r'livecontainer_reload_webkit_proxy\(\)', config), \
     'WebKit proxy is not reloaded unconditionally when the forwarder port changes'
+
+# 健康检查失败时**不得**做强制恢复（它会 lcproxy_async_close_all +
+# shutdownActiveClients，把所有在飞连接一起杀掉），而应走限频异步的凭证刷新。
+# 该路径只在转发器于监听（port>0）时被安排，探测失败必然是上游/凭证问题，与转发器
+# 对象无关；杀掉全部连接会把一次偶发探测失败放大成成批断连，而这些断连又各自触发
+# C 层取号重试 —— 与"强制刷新清空凭证"同类的正反馈雪崩。
+_hc = config[config.index('- (void)schedulePostRecoveryHealthCheck {'):]
+_hc = _hc[:_hc.index('\n}\n') + 3]
+assert 'enqueueRuntimeApplyForceRecovery' not in _hc, \
+    'health-check failure still triggers a force recovery that kills all live connections'
+assert 'requestBackgroundRefresh' in _hc, \
+    'health-check failure does not request a (rate-limited) credential refresh'
+assert '[LCProxyKing shared] refreshCredentialsForce]' not in _hc, \
+    'health-check failure bypasses the rate limit'
 
 # Foreground activation should not force a synchronous refresh on the main thread.
 assert 'refreshCredentials' not in control, 'foreground notification still forces refresh'
