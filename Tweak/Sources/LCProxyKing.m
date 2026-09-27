@@ -54,6 +54,12 @@ NSString *const LCProxyForwarderLifecycleChangedNotification = @"LCProxyForwarde
 // 退役转发器的异步回收队列（串行）。kp_forwarder_stop 可能等待最长 10s、
 // kp_forwarder_free 内部还会再等一轮，绝不能阻塞 runtime apply 路径。
 @property (nonatomic, strong) dispatch_queue_t forwarderReaperQueue;
+// 独立存活心跳：见 startLivenessHeartbeat / heartbeatTick。
+@property (nonatomic, strong) dispatch_source_t livenessTimer;
+@property (nonatomic, strong) dispatch_queue_t heartbeatQueue;
+@property (nonatomic, assign) NSUInteger heartbeatHealCount;
+@property (nonatomic, assign) NSUInteger heartbeatRepinCount;
+@property (nonatomic, assign) NSTimeInterval lastHeartbeatAt;
 @property (nonatomic, assign) void *forwarderPtr;
 @property (nonatomic, strong) NSMutableDictionary *cachedCredentialState;
 @property (nonatomic, strong) NSLock *cacheLock;
@@ -89,6 +95,8 @@ NSString *const LCProxyForwarderLifecycleChangedNotification = @"LCProxyForwarde
 - (void)clearForwarderKingState;
 - (void)retireForwarder:(kp_forwarder *)fw;
 - (void)healMissingForwarderDirectly;
+- (void)startLivenessHeartbeat;
+- (void)heartbeatTick;
 - (NSString *)credentialLogPath;
 - (void)appendCredentialRecord:(NSDictionary *)record;
 - (NSMutableDictionary *)newestValidRecordFromLog;
@@ -115,6 +123,7 @@ NSString *const LCProxyForwarderLifecycleChangedNotification = @"LCProxyForwarde
         _lock = [[NSLock alloc] init];
         _lifecycleLock = [[NSLock alloc] init];
         _forwarderReaperQueue = dispatch_queue_create("com.liveproxy.king.forwarder-reaper", DISPATCH_QUEUE_SERIAL);
+        _heartbeatQueue = dispatch_queue_create("com.liveproxy.king.heartbeat", DISPATCH_QUEUE_SERIAL);
         _cacheLock = [[NSLock alloc] init];
         _refreshLog = [[NSMutableArray alloc] init];
         _lastHealthCheckOk = NO;
@@ -127,6 +136,7 @@ NSString *const LCProxyForwarderLifecycleChangedNotification = @"LCProxyForwarde
         _refreshOwnerID = [NSUUID UUID].UUIDString;
         _cachedCredentialState = [[NSMutableDictionary alloc] init];
         kp_set_debug_logger(LCProxyKingLog);
+        [self startLivenessHeartbeat];
     }
     return self;
 }
@@ -187,11 +197,38 @@ static const NSTimeInterval LCProxyKingLifecycleNotifyMinInterval = 5.0;
     kp_forwarder *newForwarder = NULL;
 
     [self.lock lock];
-    BOOL alreadyRunning = !forceRestart && shouldRun && self.forwarder != NULL && kp_forwarder_is_running(self.forwarder) == 1;
+    // 复用健康转发器：**即便 forceRestart 为真**，只要现有转发器仍在运行且监听 fd
+    // 有效，就没有必要 teardown。
+    //
+    // forceRestart 的原始用途是清掉挂起/切网后残留的陈旧半开连接，而这一点已由
+    // applyRuntimeSnapshot 在调用本方法**之前**完成的 lcproxy_async_close_all() +
+    // shutdownActiveClients() 实现，与转发器对象本身无关。
+    //
+    // 而每次不必要的 teardown 都要走 kp_forwarder_stop → pthread_join（等 client
+    // 线程退出，它们可能正卡在同步取号的网络等待里）。这条路径一旦不能及时返回，
+    // 持有 lifecycleLock 的 runtime apply 就会被堵住，进而把整个串行 runtimeQueue
+    // 连同 override 更新一起永久卡死——实测形态即 forwarderPort=0 而
+    // proxyOverridePort 恒等于旧值、desiredForwarderRunning=true、
+    // forwarderDiscardCount=0、lastForwarderLifecycle=""。
+    //
+    // 因此把"是否复用"的判据从"是否要求重启"改成"现役转发器是否真的健康"：
+    // 健康就复用（并就地重装凭证），不健康才重建。这既消除了绝大部分 teardown
+    // 窗口，也让每次切前后台/切网都不再中断转发。
+    BOOL healthyRunning = shouldRun && self.forwarder != NULL &&
+                          kp_forwarder_is_running(self.forwarder) == 1 &&
+                          kp_forwarder_listen_fd_valid(self.forwarder) == 1;
+    BOOL alreadyRunning = healthyRunning;
     if (alreadyRunning) {
+        kp_forwarder *fw = self.forwarder;
         [self.lock unlock];
         BOOL settingsChanged = ![signature isEqualToString:self.lastSettingsSignature];
         if (settingsChanged) self.lastSettingsSignature = signature;
+        // forceRestart 想清掉"挂起/切网后残留的陈旧半开连接"这一意图，在复用路径上
+        // 通过 shutdown 现存 client/上游 fd 实现即可（只取 client_lock，与
+        // lifecycleLock 的加锁顺序一致）；重建转发器对象并不是达成该意图的必要条件。
+        if (forceRestart && fw) {
+            kp_forwarder_shutdown_clients(fw);
+        }
         // 不要无条件重启定时器：applyToRuntime 会因前后台切换/网络变化被频繁调用，
         // 每次都 stop+新建 会把 5 分钟→2 分钟的刷新节奏不断清零，永远凑不满一个周期。
         [self loadCachedStateIntoForwarder];
@@ -299,6 +336,82 @@ static const NSTimeInterval LCProxyKingLifecycleNotifyMinInterval = 5.0;
     });
 }
 
+// 独立存活心跳。这是整套自愈机制里**唯一不依赖任何可能被堵住的队列/锁**的一环：
+//   · 不经过 LCProxyConfig 的串行 runtimeQueue（它可能被卡住的 applyRuntimeSnapshot
+//     永久占住）；
+//   · 不取 lifecycleLock（同上）；
+//   · 不依赖刷新定时器（applyConfig 一开头就会 stopRefreshTimer，卡死时它不会复活）。
+//
+// 每 LCProxyKingLivenessInterval 秒检查一次"王卡已启用时，已发布的 per-process
+// proxy override 是否真的指向一个在监听的本地转发器"，不一致就**就地**修复：
+//   · 转发器缺失/未监听  → 重建转发器并钉住新端口
+//   · 转发器在跑但 override 指向别处 → 重新钉住 override 并让 C 层重解析配置
+//
+// 后者正是实测故障的核心形态：override 恒等于旧端口 53464，而该端口上已无监听者，
+// 于是所有连接被拒 → "彻底无法联网"。
+- (void)startLivenessHeartbeat {
+    if (self.livenessTimer) return;
+    dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, self.heartbeatQueue);
+    if (!timer) return;
+    uint64_t interval = (uint64_t)(LCProxyKingLivenessInterval * NSEC_PER_SEC);
+    // 首次延迟一个周期，避免与构造期的 applyToRuntime 抢跑。
+    dispatch_source_set_timer(timer,
+                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)interval),
+                              interval,
+                              (uint64_t)(1 * NSEC_PER_SEC));
+    __weak LCProxyKing *weakSelf = self;
+    dispatch_source_set_event_handler(timer, ^{
+        [weakSelf heartbeatTick];
+    });
+    dispatch_resume(timer);
+    self.livenessTimer = timer;
+}
+
+- (void)heartbeatTick {
+    self.lastHeartbeatAt = [[NSDate date] timeIntervalSince1970];
+
+    NSDictionary *settings = [self settingsSnapshot];
+    if (![settings[@"proxyEnabled"] boolValue]) return;
+    if (![[[LCProxyConfig shared] effectiveProxyModeForSettings:settings] isEqualToString:@"kingcard"]) return;
+
+    int port = [self localForwarderPort];
+    if (port <= 0 || ![self isRunning]) {
+        self.heartbeatHealCount++;
+        [self appendSharedRefreshLogEntry:@{
+            @"ok": @NO,
+            @"src": @"heartbeat-heal",
+            @"ms": @0,
+            @"msg": [NSString stringWithFormat:@"转发器缺失，心跳触发直接自愈 (port=%d)", port],
+        }];
+        [self healMissingForwarderDirectly];
+        return;
+    }
+
+    // 转发器在跑：确认 override 真的指向它。
+    char host[256];
+    int overridePort = 0;
+    int hasOverride = lcproxy_control_get_proxy_override(host, sizeof(host), &overridePort);
+    if (!hasOverride || overridePort != port) {
+        self.heartbeatRepinCount++;
+        lcproxy_control_set_proxy_override("127.0.0.1", port);
+        lcproxy_control_reload_config();
+        [self appendSharedRefreshLogEntry:@{
+            @"ok": @YES,
+            @"src": @"heartbeat-repin",
+            @"ms": @0,
+            @"msg": [NSString stringWithFormat:@"override %d -> %d（转发器实际端口）", overridePort, port],
+        }];
+        NSLog(@"[LCProxyKing] heartbeat repinned override %d -> %d", overridePort, port);
+    }
+
+    // 凭证陈旧同样会造成"转发器在跑、但所有请求都失败"（上游 407/403 → 转发器回 502），
+    // 症状与端口不一致一样是"无法联网"。这里顺带催促一次刷新：refreshCredentials
+    // 内部有 refreshing 去重，重复调用不会堆积，也不会阻塞心跳线程。
+    if (![self hasFreshCachedState]) {
+        [self refreshCredentialsAsync];
+    }
+}
+
 // 紧急自愈：绕过 LCProxyConfig 的串行 runtimeQueue，直接重建转发器并就地钉住
 // proxychains 的 per-process override。
 //
@@ -355,6 +468,12 @@ static const NSTimeInterval LCProxyKingLifecycleNotifyMinInterval = 5.0;
     self.lastRefresh = LCProxyKingNow();
     [self.lock unlock];
     NSLog(@"[LCProxyKing] emergency heal: forwarder rebuilt on port %d", port);
+    [self appendSharedRefreshLogEntry:@{
+        @"ok": @YES,
+        @"src": @"emergency-heal",
+        @"ms": @0,
+        @"msg": [NSString stringWithFormat:@"绕过 runtimeQueue 直接重建转发器 port=%d", port],
+    }];
 }
 
 - (void)beginRoutePublication {
@@ -664,6 +783,8 @@ static const NSTimeInterval LCProxyKingLifecycleNotifyMinInterval = 5.0;
 
 static const NSUInteger LCProxyKingCredentialLogMaxLines = 64;
 static const NSUInteger LCProxyKingSharedRefreshLogMaxLines = 200;
+// 存活心跳周期：见 startLivenessHeartbeat。
+static const NSTimeInterval LCProxyKingLivenessInterval = 5.0;
 
 - (NSString *)credentialLogPath {
     // 路径只取决于数据目录，解析一次即可缓存，避免每次都做目录创建 IO。
@@ -1399,6 +1520,9 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
     d[@"forwarderDiscardCount"] = @(self.forwarderDiscardCount);
     d[@"refreshArbitrationLossStreak"] = @(self.refreshArbitrationLossStreak);
     d[@"lastForwarderLifecycle"] = self.lastForwarderLifecycle ?: @"";
+    d[@"heartbeatHealCount"] = @(self.heartbeatHealCount);
+    d[@"heartbeatRepinCount"] = @(self.heartbeatRepinCount);
+    d[@"lastHeartbeatAt"] = @(self.lastHeartbeatAt);
     d[@"credentialLogPath"] = logPath;
     d[@"credentialCacheCount"] = @(self.cachedCredentialState.count);
     d[@"refreshLog"] = [self.refreshLog copy];

@@ -225,6 +225,44 @@ assert 'kp_forwarder_stop(oldForwarder)' in apply_cfg, \
 assert apply_cfg.index('self.forwarder = NULL') < apply_cfg.index('kp_forwarder_start(newForwarder)'), \
     'applyConfig no longer detaches the old forwarder before starting the new one (0.5.53 ordering)'
 
+# 健康转发器必须在强刷路径上被复用，而不是每次都 teardown。
+# 每次不必要的 teardown 都要走 kp_forwarder_stop → pthread_join（等 client 线程，
+# 它们可能卡在同步取号的网络等待里），一旦不能及时返回就会堵住持有 lifecycleLock
+# 的 runtime apply，进而永久卡死整个串行 runtimeQueue 与 override 更新 —— 实测形态
+# 即 forwarderPort=0 / proxyOverridePort 恒等于旧值 / desiredForwarderRunning=true /
+# forwarderDiscardCount=0 / lastForwarderLifecycle=""。
+assert 'BOOL healthyRunning = shouldRun && self.forwarder != NULL' in apply_cfg, \
+    'applyConfig does not gate reuse on the forwarder actually being healthy'
+assert 'kp_forwarder_listen_fd_valid(self.forwarder) == 1' in apply_cfg, \
+    'reuse does not verify the listen fd is still valid'
+assert '!forceRestart' not in apply_cfg, \
+    'a forced restart still tears down a healthy forwarder (unneeded teardown window)'
+assert 'kp_forwarder_shutdown_clients(fw);' in apply_cfg, \
+    'forced restart no longer clears stale client sockets on the reuse path'
+
+# 独立存活心跳：唯一不依赖 runtimeQueue / lifecycleLock / 刷新定时器的自愈环节。
+# 它直接修"王卡已启用但 override 指向一个已无监听的端口"这一实测形态。
+assert 'LCProxyKingLivenessInterval' in king, 'missing forwarder liveness heartbeat interval'
+assert 'startLivenessHeartbeat' in king, 'liveness heartbeat is never started'
+assert '[self startLivenessHeartbeat];' in king[king.index('- (instancetype)init {'):], \
+    'liveness heartbeat is not started from init'
+_hb = king[king.index('- (void)heartbeatTick {'):king.index('// 紧急自愈：绕过', king.index('- (void)heartbeatTick {'))]
+assert 'lcproxy_control_get_proxy_override' in _hb, \
+    'heartbeat does not verify the published override port'
+assert 'lcproxy_control_set_proxy_override("127.0.0.1", port)' in _hb, \
+    'heartbeat does not repin the override to the live forwarder port'
+assert 'healMissingForwarderDirectly' in _hb, \
+    'heartbeat does not heal a missing forwarder'
+# 心跳不得取 lifecycleLock、也不得依赖 runtimeQueue（否则它自己就会被卡住的 apply
+# 堵死，失去兜底意义）。
+assert 'lifecycleLock' not in _hb, \
+    'heartbeat takes lifecycleLock, so a wedged apply would block the safety net too'
+assert 'runtimeQueue' not in _hb, \
+    'heartbeat depends on the serial runtimeQueue it is meant to bypass'
+# 凭证陈旧也会造成"转发器在跑但全部失败"，心跳必须一并催促刷新。
+assert 'hasFreshCachedState' in _hb and 'refreshCredentialsAsync' in _hb, \
+    'heartbeat does not prod a credential refresh when the cache is stale'
+
 # Explicit credentials always override remote refreshes, including forced ones.
 assert '!guidOverride && (force || !guid)' in king, \
     'forced refresh can overwrite kingGuidOverride'

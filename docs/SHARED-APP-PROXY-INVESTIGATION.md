@@ -44,6 +44,69 @@
 | 0.5.55 | 生命周期通知未限频：转发器持续启动失败时 `notify → apply → notify` 紧循环烧 CPU | `LCProxyKing.m notifyForwarderLifecycle:` | 加 5s 限频（保留）|
 | 0.5.56 | 撤回 0.5.54 的重建顺序改动（见 §2.1）| `LCProxyKing.m applyConfig` | 修复"签名 dylib 后控制台一打开就黑屏" |
 | 0.5.57 | **accept 循环无界阻塞 → `pthread_join` 永久挂起 → 整个 runtime apply 永久卡死**（永久断网的根因）| `KPKIngCore.c kp_forwarder_run` / `kp_forwarder_stop` | 见 §2.2 |
+| 0.5.58 | 紧急自愈：绕过被堵死的 runtimeQueue 直接重建转发器并钉住 override | `LCProxyKing.m healMissingForwarderDirectly` | 无论 applyConfig 因何卡住都能恢复 |
+| 0.5.59 | **健康转发器在强刷路径上被无谓 teardown**（每次都制造一次 `pthread_join` 阻塞窗口）；新增**独立存活心跳** | `LCProxyKing.m applyConfig` / `startLivenessHeartbeat` | 见 §2.3 |
+
+### 2.3 v0.5.59：消除无谓 teardown + 独立存活心跳
+
+**(a) 复用健康转发器。** 原 `alreadyRunning` 判据含 `!forceRestart`，而强刷路径
+（`forceRestartForwarderWithSettings:`）覆盖了回前台、`didBecomeActive`、NWPath 变化、
+健康检查失败等**所有**恢复入口。也就是说每次切前后台/切网都会 teardown 一次转发器，
+每次 teardown 都要走 `kp_forwarder_stop → pthread_join`（等 client 线程退出，它们可能
+正卡在同步取号的网络等待里）。这条路径一旦不能及时返回，就会堵住持有 `lifecycleLock`
+的 runtime apply。
+
+`forceRestart` 的原始意图是清掉挂起/切网后残留的陈旧半开连接 —— 这一点已由
+`applyRuntimeSnapshot` 在调用前的 `lcproxy_async_close_all()` + `shutdownActiveClients()`
+完成，**与转发器对象本身无关**。因此把判据从"是否要求重启"改为"现役转发器是否真的
+健康"（`running == 1 && listen_fd_valid == 1`）：健康就复用并就地重装凭证、顺手
+`kp_forwarder_shutdown_clients` 清掉旧连接；不健康才重建。这样每次切前后台/切网都不再
+中断转发，也消除了绝大部分 teardown 窗口。
+
+**(b) 独立存活心跳（`startLivenessHeartbeat`）。** 这是整套自愈里**唯一不依赖任何可能
+被堵住的队列/锁**的一环：不经过 `LCProxyConfig` 的串行 `runtimeQueue`、不取
+`lifecycleLock`、也不依赖刷新定时器（`applyConfig` 一开头就 `stopRefreshTimer`，卡死时
+它不会复活）。每 5s 检查一次"王卡已启用时，已发布的 per-process override 是否真的指向
+一个在监听的本地转发器"，不一致就**就地**修复：
+
+| 心跳发现 | 动作 |
+|---|---|
+| 转发器缺失/未监听（`localForwarderPort <= 0`）| `healMissingForwarderDirectly`：绕过 runtimeQueue 重建并钉住新端口 |
+| 转发器在跑但 `overridePort != forwarderPort` | 重新 `set_proxy_override` + `reload_config` |
+| 转发器健康但凭证陈旧（`!hasFreshCachedState`）| 催促一次 `refreshCredentialsAsync`（内部有去重）|
+
+第二种正是实测故障的核心形态：`proxyOverridePort` 恒等于旧端口 53464 而该端口已无监听，
+所有连接被拒 → "彻底无法联网"。心跳的价值在于**它的正确性不依赖对"卡在哪里"的推断**。
+
+心跳事件会写入 App Group 的 `kingcard-refresh.log`（`src=heartbeat-heal` /
+`heartbeat-repin` / `emergency-heal`），因此一次复现即可从任意控制台看到自愈全过程。
+
+### 2.4 私有 App 正常、转共享后失效 —— 结构性差异排查结论
+
+对照上游 `LiveContainer/LiveContainer@4dbe0f9` 逐处核对了 `isSharedBundle` 影响的
+**全部**分支：
+
+| 位置 | 私有 | 共享 |
+|---|---|---|
+| `LCBootstrap.m:347` tweak 目录 | `<LC_HOME>/Documents/Tweaks` | `<AppGroup>/LiveContainer/Tweaks` |
+| `LCBootstrap.m:429-433` guest HOME | `<LC_HOME>/Documents/Data/Application/<uuid>` | `<AppGroup>/LiveContainer/Data/Application/<uuid>` |
+| `LCBootstrap.m:525` `hookDlopen` | 可启用 | **强制关闭** |
+| `LCBootstrap.m:859` `LCLoadTweaksToSelf` | 私有 Tweaks | App Group Tweaks |
+
+实测数据证明这些差异**都不是**本次故障的原因：
+- `dylibLoadsTail` 显示共享 App 进程确实从 App Group Tweaks 加载了当前版本 dylib；
+- `settingsExists` / `proxychainsConfExists` 均为 true、`proxyCount == 1`，说明配置层
+  在共享 App 里完全正常（canonical 目录与 console 完全一致）。
+
+因此**共享 App 与私有 App 在本项目的数据目录解析上是一致的**（已由代码逐行核对 +
+实测双重确认）。真正的差别是**进程生命周期**：共享 App 由 LiveContainer 经
+`openApplication` 重新拉起宿主进程来启动，切换/恢复事件更频繁，因而更容易走进
+"teardown 阻塞 → runtimeQueue 永久卡死"这条路径。§2.2/§2.3 的修复针对的正是这条路径，
+与 App 是私有还是共享无关。
+
+> 仍未排除的一个外部变量：实测快照中 `"cellular": 0`（当时在 Wi-Fi）。王卡免流本身是
+> 蜂窝侧能力，`kingAutoDirectOnNonCellular: false` 时仍会走王卡转发器。若"私有正常"
+> 与"共享失效"当初是在**不同网络**下观察的，请在同一网络下复测以排除该变量。
 
 ### 2.2 v0.5.57：accept 无界阻塞导致永久断网（真正的根因）
 
