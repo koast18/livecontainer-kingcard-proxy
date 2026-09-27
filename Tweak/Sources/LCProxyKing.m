@@ -1714,6 +1714,26 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
         d[@"liveHttpsPool"] = @(stats.live_https_pool);
         // 并发槽位耗尽被拒的次数：转发器"一慢就全拒"的直接证据。
         d[@"statClientRejections"] = @(stats.client_rejections);
+        // 上游失败**分步**诊断：把"连接失败"拆成 5 条出口 + 最后一次失败的现场。
+        // 没有它就只能盲猜"为什么连不上"（转发器这边既无 errno、也无非 2xx）。
+        d[@"upstreamDiag"] = @{
+            @"connectFail": @(stats.up_connect_fail),
+            @"sendFail": @(stats.up_send_fail),
+            @"recvFail": @(stats.up_recv_fail),
+            @"credCode": @(stats.up_cred_code),
+            @"otherCode": @(stats.up_other_code),
+            @"tunnelNoData": @(stats.up_tunnel_no_data),
+            @"fakeOk": @(stats.up_fake_ok),
+            @"pickFail": @(stats.up_pick_fail),
+            @"lastStage": [NSString stringWithUTF8String:stats.last_up_stage] ?: @"",
+            @"lastProxy": [NSString stringWithUTF8String:stats.last_up_proxy] ?: @"",
+            @"lastCode": @(stats.last_up_code),
+            @"lastErrno": @(stats.last_up_errno),
+            @"lastResp": [NSString stringWithUTF8String:stats.last_up_resp] ?: @"",
+            @"lastTunnelClientToUp": @(stats.last_tunnel_client_to_up),
+            @"lastTunnelUpToClient": @(stats.last_tunnel_up_to_client),
+            @"lastTunnelMs": @(stats.last_tunnel_ms),
+        };
 
         NSMutableArray *directHosts = [NSMutableArray array];
         int hostCount = kp_forwarder_direct_host_count(self.forwarder);

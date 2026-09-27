@@ -263,6 +263,26 @@ typedef struct {
     /// 因并发槽位耗尽被回 503 的次数（上限 KP_FORWARDER_MAX_CLIENTS=64）。
     /// 高 = 转发器饱和：上游慢导致槽位被长期占住，转发器从"慢"退化为"全拒"。
     uint64_t client_rejections;
+    /// ---- 上游失败**分步**诊断（见 KPKIngCore.c 同名注释）----
+    /// 五条失败出口各自计数；修法完全不同，因此必须分开看。
+    uint64_t up_pick_fail;      ///< 池内取节点失败
+    uint64_t up_connect_fail;   ///< TCP 连接上游节点失败
+    uint64_t up_send_fail;      ///< 构造/发送王卡 CONNECT 请求失败
+    uint64_t up_recv_fail;      ///< 上游无响应 / 读取失败
+    uint64_t up_cred_code;      ///< 上游回 820/821/823（凭证失效）
+    uint64_t up_other_code;     ///< 上游回其它非 2xx 状态码
+    uint64_t up_tunnel_no_data; ///< **隧道已建立(200) 但上游一个字节都没回** —— 最隐蔽的一种
+    uint64_t up_fake_ok;        ///< 上游回 200 但随后是 HTTP 错误文本（伪成功）
+    /// 最后一条已完成隧道的现场：字节数与存活时长（0 字节很能说明问题）。
+    uint64_t last_tunnel_client_to_up;
+    uint64_t last_tunnel_up_to_client;
+    uint64_t last_tunnel_ms;
+    /// 最后一次失败的现场，便于一次复现即定性。
+    int last_up_code;           ///< 解析到的状态码（0 = 未解析到）
+    int last_up_errno;          ///< 当时的 errno
+    char last_up_stage[16];     ///< connect / send / recv / cred / code / tunnel-nodata / fakeok / pick
+    char last_up_proxy[64];     ///< 目标节点 host:port
+    char last_up_resp[160];     ///< 上游响应前若干字节（不可打印字符已替换为 .）
     /// **此刻**转发器内实际持有的代理节点数（与上面的累计计数器互补）。
     /// 直接回答"现在池子是不是空的"，是判定"清空型"故障最直观的证据。
     int live_http_pool;

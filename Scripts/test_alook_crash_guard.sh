@@ -125,4 +125,26 @@ grep -q "stat_client_rejections" "$CORE" \
 grep -q "statClientRejections" "Tweak/Sources/LCProxyKing.m" \
     || fail "/api/status no longer exposes statClientRejections"
 
+# --- 上游失败必须分步可诊断（否则只能盲猜"为什么连不上"）---
+#
+# 实测 statHttpsConnects(270) ≈ statRefreshCalls(267)：每个连接都走完"池内全部节点失败"
+# 这条路，且 10 秒内失败 270 次说明失败很快。但"失败"有 5 个修法完全不同的出口
+# （连接/发送/无响应/820-823/其它状态码），外加最隐蔽的一种 —— **隧道已建立(200)却
+# 上游一个字节都不回**（客户端拿到 200、浏览器认为可用，TLS 握手永远完不成，而转发器
+# 这边既无 errno 也无非 2xx）。必须各自计数并保留现场。
+for marker in stat_up_pick_fail stat_up_connect_fail stat_up_send_fail stat_up_recv_fail \
+              stat_up_cred_code stat_up_other_code stat_up_tunnel_no_data stat_up_fake_ok; do
+    grep -q "$marker" "$CORE" || fail "KPKIngCore.c lost upstream diagnostic counter: $marker"
+done
+grep -q "kp_record_upstream_failure" "$CORE" \
+    || fail "KPKIngCore.c no longer records the last upstream failure context"
+grep -q "stat_up_tunnel_no_data" "Tweak/Sources/KPKIngCore.h" \
+    || fail "kp_forwarder_stats no longer exposes the tunnel-no-data counter"
+grep -q "last_tunnel_client_to_up" "$CORE" \
+    || fail "KPKIngCore.c no longer records last-tunnel byte counts"
+grep -q "upstreamDiag" "Tweak/Sources/LCProxyKing.m" \
+    || fail "/api/status no longer exposes upstreamDiag (back to guessing)"
+grep -q "tunnelNoData" "Tweak/Sources/LCProxyKing.m" \
+    || fail "upstreamDiag no longer reports tunnelNoData"
+
 echo "Alook crash guard static checks OK"

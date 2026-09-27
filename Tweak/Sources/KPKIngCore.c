@@ -1272,6 +1272,41 @@ struct kp_forwarder {
     // 停在 64 这一条线索），加上计数器后可一眼确认。
     uint64_t stat_client_rejections;
 
+    // ---- 上游失败**分步**诊断 ----
+    //
+    // 为什么必须分步：实测 statHttpsConnects(270) ≈ statRefreshCalls(267)，即每个连接都
+    // 走完了"池内全部节点失败"这条路，且 10 秒内失败 270 次说明**失败很快**（不是超时挂住）。
+    // 但"失败"有 5 个完全不同的出口（连接失败 / 发送失败 / 无响应 / 820-823 / 其它状态码），
+    // 修法完全不同。没有分步计数就只能盲猜 —— 这里把它们各自计数，并保留**最后一次失败的
+    // 现场**（阶段、目标节点、状态码、errno、上游响应前若干字节），一次复现即可定性。
+    uint64_t stat_up_pick_fail;      // 池内取节点失败
+    uint64_t stat_up_connect_fail;   // TCP 连接上游节点失败
+    uint64_t stat_up_send_fail;      // 构造/发送王卡 CONNECT 请求失败
+    uint64_t stat_up_recv_fail;      // 上游无响应 / 响应读取失败
+    uint64_t stat_up_cred_code;      // 上游回 820/821/823（凭证失效）
+    uint64_t stat_up_other_code;     // 上游回其它非 2xx 状态码
+    // **隧道已建立（200）但上游一个字节都没回**的次数。
+    //
+    // 这是最隐蔽的一种失败：客户端收到 "200 Connection Established"，浏览器认为隧道
+    // 可用，随后 TLS 握手数据发出去却拿不到任何响应 → 网页打不开；而转发器这边
+    // 既没有非 2xx、也没有 errno、statHttpRequests 恒为 0，看上去"什么都没发生"。
+    // 它的唯一线索是 statRefreshCalls ≈ statHttpsConnects（此处会触发一次刷新回调）。
+    uint64_t stat_up_tunnel_no_data;
+    // 上游对 CONNECT 回了 200，但紧随其后的是 HTTP 错误文本（伪成功，通常是 token 失效）。
+    uint64_t stat_up_fake_ok;
+    // 最后一条已完成隧道的现场：客户端→上游、上游→客户端 的字节数与存活时长。
+    // 用于区分两种修法毫无共同点的情况：
+    //   · 客户端发了 ClientHello（数百字节）而上游回 0 字节 → 上游接受 CONNECT 后黑洞；
+    //   · 客户端根本没发出数据 → 问题在客户端侧，与上游无关。
+    uint64_t last_tunnel_client_to_up;
+    uint64_t last_tunnel_up_to_client;
+    uint64_t last_tunnel_ms;
+    int last_up_code;                // 最后一次失败时解析到的状态码（0 = 未解析）
+    int last_up_errno;               // 最后一次失败时的 errno
+    char last_up_stage[16];          // connect / send / recv / cred / code / pick
+    char last_up_proxy[64];          // 最后一次失败的目标节点 host:port
+    char last_up_resp[160];          // 上游响应前若干字节（不可打印字符替换为 .）
+
     char direct_host_log[KP_DIRECT_HOST_LOG_MAX][128];
     int direct_host_log_count;
     int direct_host_log_rr;
@@ -1376,6 +1411,34 @@ static int kp_up_open(kp_forwarder *fw, const char *host, int port, int timeout_
         fd = -1;
     }
     return fd;
+}
+
+// 记录一次"上游节点失败"的现场。纯诊断，绝不改变控制流。
+//
+// 必须在 cred_mutex 下写：多个 client 线程会并发失败。锁序与既有代码一致
+// （池选择 kp_proxy_pool_pick_index 也在 cred_mutex 下，二者不嵌套）。
+static void kp_record_upstream_failure(kp_forwarder *fw, const char *stage,
+                                       const char *proxy, int port,
+                                       int code, const char *resp, size_t resplen) {
+    if (!fw) return;
+    pthread_mutex_lock(&fw->cred_mutex);
+    fw->last_up_code = code;
+    fw->last_up_errno = errno;
+    snprintf(fw->last_up_stage, sizeof(fw->last_up_stage), "%s", stage ? stage : "");
+    snprintf(fw->last_up_proxy, sizeof(fw->last_up_proxy), "%s:%d",
+             proxy ? proxy : "-", port);
+    if (resp && resplen) {
+        size_t n = resplen < sizeof(fw->last_up_resp) - 1
+                 ? resplen : sizeof(fw->last_up_resp) - 1;
+        for (size_t i = 0; i < n; i++) {
+            unsigned char ch = (unsigned char)resp[i];
+            fw->last_up_resp[i] = (ch >= 32 && ch < 127) ? (char)ch : '.';
+        }
+        fw->last_up_resp[n] = '\0';
+    } else {
+        fw->last_up_resp[0] = '\0';
+    }
+    pthread_mutex_unlock(&fw->cred_mutex);
 }
 
 // 已持有 client_lock 的调用方使用的内部变体（kp_forwarder_stop 在同一个临界区
@@ -2230,11 +2293,15 @@ https_retry:
                                                proxy_host, sizeof(proxy_host), &proxy_port);
         pthread_mutex_unlock(&fw->cred_mutex);
         if (pick_rc != 0) {
+            kp_stat_increment(&fw->stat_up_pick_fail);
+            kp_record_upstream_failure(fw, "pick", "-", 0, 0, NULL, 0);
             continue;
         }
 
         int up = kp_up_open(fw, proxy_host, proxy_port, 10000);
         if (up < 0) {
+            kp_stat_increment(&fw->stat_up_connect_fail);
+            kp_record_upstream_failure(fw, "connect", proxy_host, proxy_port, 0, NULL, 0);
             continue;
         }
 
@@ -2243,6 +2310,8 @@ https_retry:
         int cn = kp_build_queen_connect_request(fw, host, port, creq, sizeof(creq),
                                                 qkey_val, sizeof(qkey_val));
         if (cn <= 0 || kp_send_all(up, creq, (size_t)cn) != 0) {
+            kp_stat_increment(&fw->stat_up_send_fail);
+            kp_record_upstream_failure(fw, "send", proxy_host, proxy_port, 0, NULL, 0);
             kp_upstream_close(fw, &up);
             continue;
         }
@@ -2250,6 +2319,9 @@ https_retry:
         char resp[2048];
         size_t rgot = 0;
         if (kp_recv_until(up, resp, sizeof(resp), &rgot, 10000) != 0) {
+            kp_stat_increment(&fw->stat_up_recv_fail);
+            kp_record_upstream_failure(fw, "recv", proxy_host, proxy_port, 0,
+                                       resp, rgot);
             kp_upstream_close(fw, &up);
             continue;
         }
@@ -2257,6 +2329,9 @@ https_retry:
         kp_dbg("[fw] queen_https %s:%d CONNECT -> code=%d", proxy_host, proxy_port, code);
 
         if (kp_code_needs_credential_refresh(code)) {
+            kp_stat_increment(&fw->stat_up_cred_code);
+            kp_record_upstream_failure(fw, "cred", proxy_host, proxy_port, code,
+                                       resp, rgot);
             kp_upstream_close(fw, &up);
             continue;
         }
@@ -2294,6 +2369,9 @@ https_retry:
             // 部分 HTTPS 代理在 token 失效时仍会回 200，但后面跟的是 HTTP 错误文本
             // 而不是 TLS 数据。这里在把 200 转发给客户端之前先识别这种伪成功。
             if (extra_len > 0 && kp_extra_is_http_error(resp + consumed, extra_len)) {
+                kp_stat_increment(&fw->stat_up_fake_ok);
+                kp_record_upstream_failure(fw, "fakeok", proxy_host, proxy_port, code,
+                                           resp + consumed, extra_len);
                 kp_dbg("[fw] queen_https CONNECT 200 but extra data is HTTP error (likely token invalid)");
                 kp_upstream_close(fw, &up);
                 continue;
@@ -2335,13 +2413,24 @@ https_retry:
             // 同样只尝试一次：hook 是异步的，重试永远失败，只会白占 client 线程
             // （原为 2 次 + 300ms 退避）。
             if (up_to_client == 0 && client_to_up > 0) {
+                kp_stat_increment(&fw->stat_up_tunnel_no_data);
+                kp_record_upstream_failure(fw, "tunnel-nodata", proxy_host, proxy_port,
+                                           code, resp, rgot);
                 kp_dbg("[fw] CONNECT closed before upstream data (likely handshake failure), refreshing credentials");
                 kp_forwarder_refresh_retry(fw, 1, 0);
             }
+            // 记录这条隧道的现场（无论死活），供分步诊断判定方向。
+            pthread_mutex_lock(&fw->cred_mutex);
+            fw->last_tunnel_client_to_up = client_to_up;
+            fw->last_tunnel_up_to_client = up_to_client;
+            fw->last_tunnel_ms = (uint64_t)(kp_now_ms() - t0);
+            pthread_mutex_unlock(&fw->cred_mutex);
             kp_upstream_close(fw, &up);
             KP_CLOSESOCK(client);
             return;
         }
+        kp_stat_increment(&fw->stat_up_other_code);
+        kp_record_upstream_failure(fw, "code", proxy_host, proxy_port, code, resp, rgot);
         kp_upstream_close(fw, &up);
         continue;
     }
@@ -2765,6 +2854,24 @@ void kp_forwarder_get_stats(kp_forwarder *fw, kp_forwarder_stats *stats) {
     stats->proxy_errors = __atomic_load_n(&fw->stat_proxy_errors, __ATOMIC_RELAXED);
     stats->pool_empty = __atomic_load_n(&fw->stat_pool_empty, __ATOMIC_RELAXED);
     stats->client_rejections = __atomic_load_n(&fw->stat_client_rejections, __ATOMIC_RELAXED);
+    stats->up_pick_fail = __atomic_load_n(&fw->stat_up_pick_fail, __ATOMIC_RELAXED);
+    stats->up_connect_fail = __atomic_load_n(&fw->stat_up_connect_fail, __ATOMIC_RELAXED);
+    stats->up_send_fail = __atomic_load_n(&fw->stat_up_send_fail, __ATOMIC_RELAXED);
+    stats->up_recv_fail = __atomic_load_n(&fw->stat_up_recv_fail, __ATOMIC_RELAXED);
+    stats->up_cred_code = __atomic_load_n(&fw->stat_up_cred_code, __ATOMIC_RELAXED);
+    stats->up_other_code = __atomic_load_n(&fw->stat_up_other_code, __ATOMIC_RELAXED);
+    stats->up_tunnel_no_data = __atomic_load_n(&fw->stat_up_tunnel_no_data, __ATOMIC_RELAXED);
+    stats->up_fake_ok = __atomic_load_n(&fw->stat_up_fake_ok, __ATOMIC_RELAXED);
+    pthread_mutex_lock(&fw->cred_mutex);
+    stats->last_up_code = fw->last_up_code;
+    stats->last_up_errno = fw->last_up_errno;
+    memcpy(stats->last_up_stage, fw->last_up_stage, sizeof(stats->last_up_stage));
+    memcpy(stats->last_up_proxy, fw->last_up_proxy, sizeof(stats->last_up_proxy));
+    memcpy(stats->last_up_resp, fw->last_up_resp, sizeof(stats->last_up_resp));
+    stats->last_tunnel_client_to_up = fw->last_tunnel_client_to_up;
+    stats->last_tunnel_up_to_client = fw->last_tunnel_up_to_client;
+    stats->last_tunnel_ms = fw->last_tunnel_ms;
+    pthread_mutex_unlock(&fw->cred_mutex);
     // 实时池大小必须在 cred_mutex 下读取。锁序与既有代码一致：
     // loadCachedStateIntoForwarder 就是"持有 self.lock 时调用 kp_forwarder_set_king_state
     // （其内部取 cred_mutex）"，即 self.lock → cred_mutex；本函数同样在 self.lock 下被调用。
