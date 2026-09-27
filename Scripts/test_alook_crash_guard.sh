@@ -141,8 +141,14 @@ grep -q "stat_up_other_code" "$CORE" || fail "KPKIngCore.c lost counter: stat_up
 grep -q "stat_up_tunnel_no_data" "$CORE" || fail "KPKIngCore.c lost counter: stat_up_tunnel_no_data"
 grep -q "stat_up_fake_ok" "$CORE" || fail "KPKIngCore.c lost counter: stat_up_fake_ok"grep -q "kp_record_upstream_failure" "$CORE" \
     || fail "KPKIngCore.c no longer records the last upstream failure context"
-grep -q "stat_up_tunnel_no_data" "Tweak/Sources/KPKIngCore.h" \
+# 注意字段名：kp_forwarder_stats 里的字段**没有** stat_ 前缀（stat_ 前缀只用在
+# struct kp_forwarder 的内部字段上）。这里曾写错名字导致 CI 红、而本地 runner 没抓到。
+grep -q "up_tunnel_no_data" "Tweak/Sources/KPKIngCore.h" \
     || fail "kp_forwarder_stats no longer exposes the tunnel-no-data counter"
+grep -q "up_connect_fail" "Tweak/Sources/KPKIngCore.h" \
+    || fail "kp_forwarder_stats no longer exposes the upstream connect-failure counter"
+grep -q "last_up_stage" "Tweak/Sources/KPKIngCore.h" \
+    || fail "kp_forwarder_stats no longer exposes the last upstream failure stage"
 grep -q "last_tunnel_client_to_up" "$CORE" \
     || fail "KPKIngCore.c no longer records last-tunnel byte counts"
 grep -q "upstreamDiag" "Tweak/Sources/LCProxyKing.m" \
