@@ -785,6 +785,9 @@ static const NSUInteger LCProxyKingCredentialLogMaxLines = 64;
 static const NSUInteger LCProxyKingSharedRefreshLogMaxLines = 200;
 // 存活心跳周期：见 startLivenessHeartbeat。
 static const NSTimeInterval LCProxyKingLivenessInterval = 5.0;
+// 并发刷新合并的等待上限：在飞的刷新结束前，其他调用方最多等这么久再按当前结果返回。
+// 见 refreshCredentialsWithForce: 里"绝不把已有刷新当作失败"的说明。
+static const NSTimeInterval LCProxyKingRefreshCoalesceTimeout = 20.0;
 
 - (NSString *)credentialLogPath {
     // 路径只取决于数据目录，解析一次即可缓存，避免每次都做目录创建 IO。
@@ -1144,11 +1147,47 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
     // stays offline forever.
     if (self.refreshing) {
         [self.lock unlock];
-        return NO;
+        // 合并并发刷新：**绝不把"已有刷新在飞"当作刷新失败**。
+        //
+        // 为什么这是致命的：C 层对每个失败的请求都会调用 refresh hook 并重试
+        // （KPKIngCore.c: kp_forwarder_refresh_retry(fw, 3, 500)，以及 CONNECT 隧道
+        // 无上游数据时的 kp_forwarder_refresh_retry(fw, 2, 300)）。若这里直接
+        // return NO，重试的每一次都得到"失败"，于是**每个失败请求都放大成 3 次强制
+        // 取号**。共享 App 并发连接远多于私有 App（实测 activeForwarderClients=37），
+        // 几十秒内即可打出上千次取号：statRefreshCalls=1341、45 秒内 30 次完整取号
+        // 成功 —— 每次取号要 1.1~2.1s 网络往返，客户端线程全被占满，而每个取号又
+        // 清空一次凭证（见下），于是形成自我维持的雪崩。
+        //
+        // 正确语义：等待在飞的那次刷新结束（有界），把它的**真实结果**返回给所有
+        // 调用方 —— 一次取号服务所有等待者。
+        NSTimeInterval deadline = [[NSDate date] timeIntervalSince1970] + LCProxyKingRefreshCoalesceTimeout;
+        while (YES) {
+            [self.lock lock];
+            BOOL busy = self.refreshing;
+            BOOL ok = self.lastRefreshSuccess;
+            [self.lock unlock];
+            if (!busy) return ok;
+            if ([[NSDate date] timeIntervalSince1970] >= deadline) return ok;
+            [NSThread sleepForTimeInterval:0.05];
+        }
     }
     self.refreshing = YES;
     [self.lock unlock];
-    if (force) [self clearForwarderKingState];
+    // ★ 强制刷新**不得**先清空正在服务的凭证。原实现在此处调用
+    // clearForwarderKingState（已移除，勿再加回）：它会在取号所需的网络往返
+    // （实测 1.1~2.1s）期间让转发器**没有任何凭证**，于是一批本来能成功的连接也一起
+    // 失败，而每个失败又触发新的强制刷新（再次清空）→ 正反馈雪崩。
+    // 实测形态完全吻合：转发器对象健康（running=true / listenFdValid=1 /
+    // forwarderPort 与 proxyOverridePort 一致）、取号次次成功（refreshLog 全为
+    // ok:true）、却什么都转发不出去，且 lastRefreshSuccess 因清空而恒为 false。
+    // 共享 App 并发高，因此最先、最重地踩中它；私有 App 并发低，通常波及不到。
+    //
+    // 现在改为"先用旧凭证继续服务，取到新凭证后覆盖"。只有当旧凭证确实不可用时
+    // （finishRefreshWithState 里的 freshness 检查）才清空，且那是最后手段。
+    //
+    // 注意：三个上游获取点都用 force 作为强制条件
+    // （!guidOverride && (force || !guid)、token 缓存分支的 !force、代理池的
+    // force || 过期），因此去掉清空**不影响**强制重新取号的语义。
 
     NSDictionary *settings = [self settingsSnapshot];
     // 看门狗：王卡模式已启用但转发器缺失/监听失效时，就地请求一次重建。

@@ -164,8 +164,25 @@ assert 'refreshInvalidatingGeneration' not in freshness, \
 
 # Fail-closed routing is unchanged: no credentials means drop, never direct.
 assert 'kp_forwarder_clear_king_state' in king, 'stale forwarder state is not cleared'
-assert 'if (force) [self clearForwarderKingState];' in king, \
-    'a forced refresh leaves stale credentials in its forwarder'
+
+# ⚠️ 强制刷新**不得**先清空正在服务的凭证。
+# 原先断言的是 "if (force) [self clearForwarderKingState];" —— 那条断言把**错误行为**
+# 固化了。清空会让取号所需的网络往返（实测 1.1~2.1s）期间转发器没有任何凭证，一批本
+# 可成功的连接随之失败，而每个失败又触发新的强制刷新（再次清空）→ 自我维持的雪崩：
+# 转发器健康、取号次次成功，却什么都转发不出去（实测 forwarderPort/listenFdValid
+# 正常、refreshLog 全为 ok:true、lastRefreshSuccess 却恒为 false、refreshCalls=1341）。
+# 共享 App 并发高，最先且最重地踩中；私有 App 并发低，通常波及不到。
+assert 'if (force) [self clearForwarderKingState];' not in king, \
+    'a forced refresh still clears live credentials before fetching replacements (avalanche)'
+assert 'LCProxyKingRefreshCoalesceTimeout' in king, \
+    'concurrent refresh requests are not coalesced'
+assert re.search(r'if \(self\.refreshing\) \{\s*\[self\.lock unlock\];\s*// 合并并发刷新', king), \
+    'an in-flight refresh is still reported as a refresh failure (drives the retry storm)'
+assert re.search(r'BOOL busy = self\.refreshing;\s*BOOL ok = self\.lastRefreshSuccess;', king), \
+    'the coalescing wait does not return the in-flight refresh result'
+# 清空仍然必须存在（无凭证时 fail-closed），只是不再发生在强制刷新的开头。
+assert king.count('[self clearForwarderKingState]') >= 2, \
+    'clearForwarderKingState was removed entirely (no fail-closed path left)'
 
 # Latency probing must stay capped so a refresh cannot stall for tens of seconds.
 assert 'KP_LATENCY_PROBE_MAX' in king, 'sequential latency probing is not capped'

@@ -81,6 +81,59 @@
 心跳事件会写入 App Group 的 `kingcard-refresh.log`（`src=heartbeat-heal` /
 `heartbeat-repin` / `emergency-heal`），因此一次复现即可从任意控制台看到自愈全过程。
 
+### 2.5 v0.5.60：强制刷新清空凭证引发的正反馈雪崩（真正的"转发不出去"根因）
+
+**这是最终定位到的根因。**
+
+`applyConfig` 的存活心跳把转发器修健康之后（实测 `forwarderPort=58603`、
+`running=true`、`listenFdValid=1`、`proxyOverridePort` 与之一致、
+`heartbeatHealCount=0`），**故障依然存在**，只是形态变了 —— 数据给出了决定性线索：
+
+| 观测 | 值 |
+|---|---|
+| 取号次数 | `statRefreshCalls=1341`；45 秒内 **30 次完整取号成功** |
+| 取号结果 | refreshLog 全部 `ok:true`（GUID/Token/代理池都拿到了）|
+| 却 | `lastRefreshSuccess=false`、`lastHealthCheckOk=false`、`statHttpRequests=0` |
+| 并发 | `activeForwarderClients=37` |
+
+**"取号次次成功却什么都转发不出去"** 指向一个自我维持的正反馈，而不是单点故障：
+
+```
+某个请求失败
+  → C 层触发强制刷新（kp_forwarder_refresh_retry，每请求最多 3 次）
+  → refreshCredentialsWithForce 开头执行 clearForwarderKingState
+  → 取号需要 1.1~2.1s 网络往返，这期间转发器**没有任何凭证**
+  → 其它 36 个并发请求因此也失败，每个又触发自己的强制刷新（再次清空）
+  → 回到第一步，永不收敛
+```
+
+三个放大因子：
+
+1. **`if (force) [self clearForwarderKingState];`** —— 强制刷新在拿到替代品**之前**就
+   销毁了正在服务的凭证，把一次瞬时失败变成 1~2 秒的全量失败。
+2. **C 层按请求重试** —— `kp_forwarder_refresh_retry(fw, 3, 500)`（每个失败请求 3 次）
+   和 CONNECT 隧道无上游数据时的 `kp_forwarder_refresh_retry(fw, 2, 300)`。
+3. **`if (self.refreshing) return NO;`** —— 并发刷新被当作"刷新失败"上报给 C 层，
+   于是重试的每一次都放大成一次新的强制取号。
+
+**为什么私有 App 正常、共享 App 失效**：这是**并发度**问题。共享 App 常被用于高并发
+场景（实测 37 个并发客户端），雪崩阈值被跨过；私有 App 并发低，单次清空造成的附带
+失败很少，形不成闭环。同一份代码、同一套路径解析，差别只在负载。
+
+**修复**：
+
+- **不再在强制刷新开始时清空凭证** —— 先用旧凭证继续服务，取到新凭证后覆盖。
+  三个上游获取点都以 `force` 为强制条件，因此强制重新取号的语义不受影响。
+  仅在旧凭证确实不可用时（`finishRefreshWithState` 的 freshness 检查）才清空，
+  且那是最后手段。
+- **合并并发刷新** —— `if (self.refreshing)` 不再 `return NO`，而是等待在飞的刷新结束
+  （有界，`LCProxyKingRefreshCoalesceTimeout=20s`）并返回其**真实结果**。一次取号服务
+  所有等待者，重试不再放大成风暴。等待只按 50ms 轮询 `self.lock`，不嵌套任何其他锁。
+
+> 说明：v0.5.57/0.5.58/0.5.59 修的是"转发器对象消失/override 悬空/被无谓 teardown"，
+> 都是真实缺陷且必须保留；但它们只是让转发器**对象**恢复健康，并未触及本条"凭证在
+> 刷新期间被清空"的逻辑，因此单独修它们不足以恢复转发。本版本与它们叠加后才完整。
+
 ### 2.4 私有 App 正常、转共享后失效 —— 结构性差异排查结论
 
 对照上游 `LiveContainer/LiveContainer@4dbe0f9` 逐处核对了 `isSharedBundle` 影响的
