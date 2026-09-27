@@ -83,6 +83,10 @@
 
 ### 2.10 v0.5.67：代理链端口陈旧导致「status 全绿却完全连不上」+ 心跳自愈
 
+> **真机验证请直接照做 [`docs/REAL-DEVICE-VERIFICATION.md`](./REAL-DEVICE-VERIFICATION.md)**
+> —— 那里有精确到 JSON 层级的字段路径、逐步升级流程与"一次定位方向"的判读表。
+> 该清单里的字段名与层级已由 `Scripts/test_king_cache_logic.sh` 的守卫断言与源码保持同步。
+
 **这是本轮定位到的、能解释"私有正常 / 共享失效"这一类症状的结构性缺陷。**
 
 **机制。** `lcproxy_control_apply_proxy_override()`（把 per-process override 真正**覆盖到

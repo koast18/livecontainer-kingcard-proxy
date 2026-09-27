@@ -532,5 +532,43 @@ assert '[LCProxyKing shared] refreshCredentialsForce]' not in _hc, \
 # Foreground activation should not force a synchronous refresh on the main thread.
 assert 'refreshCredentials' not in control, 'foreground notification still forces refresh'
 
+# 文档与代码同步：真机验证清单里提到的每个 status 字段都必须真实存在于源码中，
+# 且层级（顶层 vs king 内）必须与文档标注一致。
+#
+# 为什么需要这条守卫：验证清单是用户唯一要照做的东西，一旦字段名或层级写错，
+# 用户会白找一遍甚至报回错数据 —— 而"减少反复验证的工作量"正是本次交付的目标。
+# 之前就写错过一次（把顶层字段写成 king 内），因此固化为断言。
+_verify = Path('docs/REAL-DEVICE-VERIFICATION.md')
+if _verify.exists():
+    _doc = _verify.read_text(encoding='utf-8')
+    # (字段, 是否在 king 内)
+    _documented = [
+        ('chainPortMatches', False),
+        ('chainProxyPort', False),
+        ('forwarderPort', False),
+        ('swallowedExceptions', False),
+        ('kingRefreshLogShared', False),
+        ('statRefreshCalls', True),
+        ('statPoolEmpty', True),
+        ('liveHttpPool', True),
+        ('liveHttpsPool', True),
+        ('heartbeatChainRepairCount', True),
+        ('lastError', True),
+    ]
+    for _field, _in_king in _documented:
+        assert _field in _doc, f'verification doc no longer documents {_field}'
+        assert f'd[@"{_field}"]' in server or f'd[@"{_field}"]' in king, \
+            f'verification doc documents a status field that no longer exists: {_field}'
+        # 层级必须与文档一致：顶层字段在 server 的 configPayload，king 内字段在 LCProxyKing.status
+        _owner_src = server if not _in_king else king
+        assert f'd[@"{_field}"]' in _owner_src, \
+            f'{_field} is documented at the wrong nesting level'
+    # 顶层与 king 内必须分别有文档小节，避免再次混淆层级。
+    # 用容错正则：文档里可能带 Markdown 加粗（**顶层**）。
+    assert re.search(r'顶层[^\n]{0,8}`chainPortMatches`', _doc), \
+        'verification doc lost the explicit top-level path'
+    assert re.search(r'`king` 内', _doc), \
+        'verification doc lost the explicit king-nested path'
+
 print('king cache/refresh logic static checks OK')
 PY
