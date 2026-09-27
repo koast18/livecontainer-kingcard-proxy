@@ -616,5 +616,22 @@ for _src in sorted(Path('Tweak/Sources').glob('*.m')) + sorted(Path('Tweak/Sourc
         assert '#import "Version.h"' in _t or '#include "Version.h"' in _t, \
             f'{_src} uses KPTWEAK_* but does not include Version.h (compile error on CI)'
 
+# ★ 一键重置凭证：可主动丢弃共享凭证库的缓存，重新领一整套身份。
+# 凭证库在 App Group 被所有进程共享；若最新那条对运营商已失效（或被写坏），每个读它的
+# 进程都会拿坏凭证去连而被零字节关闭，而自己重新领一套的进程却正常 —— 这正好能造成
+# "私有正常、共享不正常"。因此需要一个用户可触发的一键动作来验证/修复。
+assert 'resetSharedCredentialsAndRefresh' in king, \
+    'the manual credential-reset entry point is missing'
+assert 'newIdentityRequested' in king, \
+    'the reset flag is missing (reset would silently reuse the cached credentials)'
+assert re.search(r'if \(wantNew\) \{\s*state = \[NSMutableDictionary dictionary\];', king), \
+    'the reset no longer discards the cached credential state'
+assert 'if (wantNew) self.newIdentityRequested = NO;' in king, \
+    'the reset flag is not one-shot (every later refresh would mint a new identity)'
+assert '/api/king/reset-credentials' in server, \
+    'the console no longer exposes the reset-credentials endpoint'
+assert 'resetSharedCredentialsAndRefresh' in Path('Tweak/Sources/LCProxyKing.h').read_text(encoding='utf-8'), \
+    'the reset entry point is not declared in the public header'
+
 print('king cache/refresh logic static checks OK')
 PY

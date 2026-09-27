@@ -366,14 +366,24 @@ static const NSUInteger LCProxyDefaultPort = 19092;
         return [GCDWebServerDataResponse responseWithHTML:[NSString stringWithUTF8String:kLCProxyConsoleHTML]];
     }];
 
-    [server addHandlerForMethod:@"GET" path:@"/api/status" requestClass:[GCDWebServerRequest class]
-                   processBlock:^GCDWebServerResponse *(GCDWebServerRequest *request) {
+    [server addHandlerForMethod:@"GET" path:@"/api/status" requestClass:[GCDWebServerRequest class]                   processBlock:^GCDWebServerResponse *(GCDWebServerRequest *request) {
         return [self json:[self configPayload]];
     }];
 
     [server addHandlerForMethod:@"GET" path:@"/api/stats" requestClass:[GCDWebServerRequest class]
                    processBlock:^GCDWebServerResponse *(GCDWebServerRequest *request) {
         return [self json:[[LCProxyStats shared] aggregate]];
+    }];
+
+    // 一键重置凭证：丢弃共享凭证库里的缓存状态，重新领一整套全新 GUID + Q-Token + 代理池。
+    //
+    // 用途：凭证库在 App Group，被所有进程共享。若最新那条记录对运营商已失效（或被某个
+    // 进程写坏），则每个读它的进程都会拿坏凭证去连、被运营商零字节关闭 —— 而自己重新领
+    // 一套的进程却正常。这正好能造成"私有正常、共享不正常"。
+    [server addHandlerForMethod:@"GET" path:@"/api/king/reset-credentials" requestClass:[GCDWebServerRequest class]
+                   processBlock:^GCDWebServerResponse *(GCDWebServerRequest *request) {
+        [[LCProxyKing shared] resetSharedCredentialsAndRefresh];
+        return [self json:@{ @"ok": @YES, @"msg": @"已丢弃缓存凭证并开始重新领取；约 2~3 秒后再看 king.upstreamDiag 与 liveHttpsPool。" }];
     }];
 
     [server addHandlerForMethod:@"POST" path:@"/api/config" requestClass:[GCDWebServerDataRequest class]

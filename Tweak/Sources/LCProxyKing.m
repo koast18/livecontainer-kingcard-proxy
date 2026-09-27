@@ -108,6 +108,9 @@ NSString *const LCProxyForwarderLifecycleChangedNotification = @"LCProxyForwarde
 @property (nonatomic, assign) BOOL lastRefreshSuccess;
 @property (nonatomic, strong) dispatch_source_t refreshTimer;
 @property (nonatomic, assign) BOOL refreshing;
+// 用户通过控制台触发"重置凭证"时置位：本次刷新必须领全新身份，并忽略缓存状态。
+// 见 resetSharedCredentialsAndRefresh。
+@property (nonatomic, assign) BOOL newIdentityRequested;
 // 上一次真正开始取号的时间戳。用于给被动刷新限频（见 requestBackgroundRefresh）。
 @property (nonatomic, assign) NSTimeInterval lastRefreshStartedAt;
 @property (nonatomic, assign) BOOL lockRetryScheduled;
@@ -619,8 +622,22 @@ static const NSTimeInterval LCProxyKingLifecycleNotifyMinInterval = 5.0;
     return signature;
 }
 
-- (void)refreshCredentialsAsync {
+// 用户可触发：丢弃共享凭证库里的缓存状态，重新领一整套全新凭证。
+//
+// 动机：凭证库位于 App Group，被所有进程共享。若最新那条记录对运营商已失效（或被某个
+// 进程写坏），则每个读它的进程都会拿坏凭证去连、被运营商零字节关闭 —— 而自己重新领一套
+// 的进程却正常。这正好能造成"私有正常、共享不正常"。该动作把 newIdentityRequested 置位
+// 并立即强制刷新，刷新完成后新记录成为日志里最新的一条，其他进程也会随之用上。
+- (void)resetSharedCredentialsAndRefresh {
+    [self.lock lock];
+    self.newIdentityRequested = YES;
+    [self.lock unlock];
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        [self refreshCredentialsForce];
+    });
+}
+
+- (void)refreshCredentialsAsync {    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         [self refreshCredentials];
     });
 }
@@ -1451,6 +1468,19 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
     }
 
     NSMutableDictionary *state = [self loadState];
+    // 用户触发的"重置凭证"：丢弃一切缓存状态，本次必须重新领 GUID + Q-Token + 代理池。
+    {
+        [self.lock lock];
+        BOOL wantNew = self.newIdentityRequested;
+        if (wantNew) self.newIdentityRequested = NO;   // 一次性
+        [self.lock unlock];
+        if (wantNew) {
+            state = [NSMutableDictionary dictionary];
+            force = YES;
+            if (!settings) settings = [self settingsSnapshot];
+            [steps appendString:@"重置: 用户触发，丢弃缓存凭证并重新领取\n"];
+        }
+    }
     if (!force && state.count && [self stateHasFreshCredentials:state matchingSettings:settings]) {
         // 缓存命中：无需取号。凭证有效期长达 2 小时，普通刷新只是确认仍然新鲜。
         [self loadCachedStateIntoForwarder];
