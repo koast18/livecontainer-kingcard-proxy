@@ -7,20 +7,20 @@
       "name": "LiveProxy 控制台",
       "bundleIdentifier": "com.liveproxy.console",
       "developerName": "koast18",
-      "version": "0.5.62",
-      "versionDate": "2026-09-27T10:50:49Z",
+      "version": "0.5.63",
+      "versionDate": "2026-09-27T11:01:49Z",
       "versionDescription": "LiveProxy 控制台：LiveContainer 任意 App HTTP 代理开关、非 TCP 丢弃、10 分钟粒度蜂窝流量统计。首次打开自动下载 dylib。",
-      "downloadURL": "https://gh-proxy.com/https://github.com/koast18/livecontainer-kingcard-proxy/releases/download/v0.5.62/LiveProxyConsole-0.5.62.ipa",
+      "downloadURL": "https://gh-proxy.com/https://github.com/koast18/livecontainer-kingcard-proxy/releases/download/v0.5.63/LiveProxyConsole-0.5.63.ipa",
       "localizedDescription": "LiveContainer 内任意 App 走 HTTP 代理的控制台 IPA。依赖 LCProxyControl dylib（自动下载到 LiveContainer Tweaks 目录），支持代理开关、丢弃非 TCP、蜂窝网络上传/下载流量统计（10 分钟时段）。",
       "iconURL": "https://raw.githubusercontent.com/koast18/livecontainer-kingcard-proxy/master/AltStore/icon.png",
       "tintColor": "2E7D32",
       "size": 19475,
       "versions": [
         {
-          "version": "0.5.62",
-          "date": "2026-09-27T10:50:49Z",
-          "downloadURL": "https://gh-proxy.com/https://github.com/koast18/livecontainer-kingcard-proxy/releases/download/v0.5.62/LiveProxyConsole-0.5.62.ipa",
-          "localizedDescription": "修复闪退与取号风暴（回调零阻塞+限频20s+异步、返回-1避免整轮代理空跑）；健康检查失败不再杀掉在飞连接；稳态零被动取号。"
+          "version": "0.5.63",
+          "date": "2026-09-27T11:01:49Z",
+          "downloadURL": "https://gh-proxy.com/https://github.com/koast18/livecontainer-kingcard-proxy/releases/download/v0.5.63/LiveProxyConsole-0.5.63.ipa",
+          "localizedDescription": "修复闪退与取号风暴；删除恒失败的重试循环（失败立即回502，不再白占client线程）；新增防重复加载守卫，避免新旧两份dylib同时进内存导致的崩溃。"
         }
       ]
     }
