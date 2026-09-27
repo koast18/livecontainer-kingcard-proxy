@@ -240,6 +240,14 @@ int kp_forwarder_active_clients(kp_forwarder *fw);
 /// forwarder is running and its listen fd is still open.
 int kp_forwarder_listen_fd_valid(kp_forwarder *fw);
 
+/// 真正的"还在监听"检查：**真去 connect 一次** listen_port，而不是只看 fd 号。
+///
+/// 二者必须区分：进入后台/熄屏会让监听 socket 失效，但 fd 号仍 >= 0、running 标志仍为真，
+/// 于是仅看 fd 号的判据永远为"健康"，转发器**永远不会被重建** —— 表现为切后台/熄屏后
+/// 彻底断网且不再恢复（实测回归）。
+/// 所有"是否复用现役转发器 / 是否发布路由"的决策都必须用它。
+int kp_forwarder_is_listening(kp_forwarder *fw);
+
 /// Connect once to 127.0.0.1:listen_port using a bypass socket. Returns 1 when
 /// the local forwarder accepts a new connection (proves accept thread + listen
 /// fd are still alive).

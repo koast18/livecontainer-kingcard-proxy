@@ -347,8 +347,14 @@ assert apply_cfg.index('self.forwarder = NULL') < apply_cfg.index('kp_forwarder_
 # forwarderDiscardCount=0 / lastForwarderLifecycle=""。
 assert 'BOOL healthyRunning = shouldRun && self.forwarder != NULL' in apply_cfg, \
     'applyConfig does not gate reuse on the forwarder actually being healthy'
-assert 'kp_forwarder_listen_fd_valid(self.forwarder) == 1' in apply_cfg, \
-    'reuse does not verify the listen fd is still valid'
+# ⚠️ 这里曾断言用 kp_forwarder_listen_fd_valid（只看 fd 号）。那是**错的**：
+# 进入后台/熄屏会让监听 socket 失效，而 fd 号依旧 >= 0、running 标志仍为真，于是"健康"
+# 判断永远成立、转发器永远不重建 → 切后台后彻底断网且不再恢复（实测回归）。
+# 必须用真去 connect 一次的 kp_forwarder_is_listening()。
+assert 'kp_forwarder_is_listening(self.forwarder) == 1' in apply_cfg, \
+    'reuse does not really probe the listen socket (fd-number check only => background regression)'
+assert 'kp_forwarder_listen_fd_valid(self.forwarder) == 1' not in apply_cfg, \
+    'the reuse gate went back to the fd-number check (background/screen-off regression)'
 assert '!forceRestart' not in apply_cfg, \
     'a forced restart still tears down a healthy forwarder (unneeded teardown window)'
 assert 'kp_forwarder_shutdown_clients(fw);' in apply_cfg, \
@@ -633,24 +639,41 @@ assert '/api/king/reset-credentials' in server, \
 assert 'resetSharedCredentialsAndRefresh' in Path('Tweak/Sources/LCProxyKing.h').read_text(encoding='utf-8'), \
     'the reset entry point is not declared in the public header'
 
-# ★ 永不回退到本地随机 GUID —— 这是"后台/熄屏后整体断网"的根因。
+# ★ 本地 GUID 必须**保留**为启动引导回退，且必须被标记来源。
 #
-# 旧实现在 PBProxy 取 GUID 失败时 `guid = [self localRandomGuid]`，并把它当成一次**成功**
-# 的取号写进共享凭证库（日志可见 "GUID: 本地生成…" 且 ok:true）。运营商不认识这个身份，
-# 于是之后每次 CONNECT 都被对端零字节关闭（实测：connectFail=0、sendFail=0、recvFail 上千、
-# lastResp 为空）。因为凭证库在 App Group 被所有进程共享，这条"有毒"记录一旦成为最新一条，
-# 每个读它的进程都会拿假身份去连 —— 一次失败污染全体。
-assert 'guid = [self localRandomGuid];' not in king, \
-    'the local random-GUID fallback is back (poisons the shared credential store)'
-assert 'guidSource' in king and '@"local"' in king, \
-    'poisoned guidSource=local records are no longer rejected'
-assert re.search(r'if \(\[guidSource isEqualToString:@"local"\]\) return NO;', king), \
-    'stateHasFreshCredentials no longer rejects locally-generated identities'
+# 历史：commit ec37444 明确"restore GUID fallback" —— 取号可能发生在路由发布之前，而
+# PBProxy GetGuid 本身要走转发器的引导隧道，在那个窗口里必然失败；若直接判失败就会
+# "一个凭证都拿不到"。我曾在 v0.5.74 把它删掉并拒绝 guidSource=local 的记录，那是错误的
+# 过度修正（会让冷启动彻底取不到凭证），现已撤回。下面两条守卫防止再次误删。
+assert 'guid = [self localRandomGuid];' in king, \
+    'the bootstrap local-GUID fallback was removed again (cold start cannot acquire credentials)'
+assert re.search(r'if \(!state\[@"guidSource"\]\) state\[@"guidSource"\] = @"local";', king), \
+    'the local bootstrap GUID is not tagged with guidSource=local'
+assert 'if ([guidSource isEqualToString:@"local"]) return NO;' not in king, \
+    'guidSource=local records are rejected again (breaks bootstrap credential acquisition)'
+assert 'd[@"guidSource"]' in king, 'guidSource is not exposed for diagnosis'
 # 路由"未发布"必须可自愈，否则一次后台切换就把进程锁死（syncFetchGuid 会直接失败）。
 assert re.search(r'int chainPort = lcproxy_control_get_applied_override_port\(\);\s*\[self\.lock lock\];\s*BOOL routeOk = self\.routePublished;', king), \
     'the heartbeat no longer checks routePublished'
 assert re.search(r'if \(!routeOk \|\| chainPort != port\)', king), \
     'a stale/never-published route no longer triggers a repair'
+
+# ★★ 后台/熄屏断网的回归守卫：判"转发器是否健康"必须用**真监听探测**，不能只看 fd 号。
+#
+# iOS 进入后台/熄屏会让监听 socket 失效，但 fd 号依旧 >= 0、running 标志仍为真 ——
+# kp_forwarder_listen_fd_valid() 于是恒为 1，"复用健康转发器"永远成立、转发器永远不重建
+# => 切后台后彻底断网且不再恢复。这个真检查最早由 bd075c8 引入并被后续弱化。
+assert 'kp_forwarder_is_listening' in core, \
+    'KPKIngCore.c lost the real listen probe (only the fd-number check remains)'
+_hb3 = king
+assert 'kp_forwarder_listen_fd_valid(self.forwarder) == 1;' not in _hb3, \
+    'the forwarder-reuse gate is back to the fd-number check (background/screen-off regression)'
+assert re.search(r'kp_forwarder_is_listening\(self\.forwarder\) == 1;', king), \
+    'the forwarder-reuse gate does not use the real listen probe'
+assert 'kp_forwarder_is_listening(fw) == 1;' in king, \
+    'route publication does not require a real listen probe'
+assert 'd[@"listenProbeOk"]' in king, \
+    'the real listen-probe result is not exposed in status'
 
 print('king cache/refresh logic static checks OK')
 PY

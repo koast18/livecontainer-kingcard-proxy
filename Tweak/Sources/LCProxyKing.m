@@ -266,7 +266,7 @@ static const NSTimeInterval LCProxyKingLifecycleNotifyMinInterval = 5.0;
     // 窗口，也让每次切前后台/切网都不再中断转发。
     BOOL healthyRunning = shouldRun && self.forwarder != NULL &&
                           kp_forwarder_is_running(self.forwarder) == 1 &&
-                          kp_forwarder_listen_fd_valid(self.forwarder) == 1;
+                          kp_forwarder_is_listening(self.forwarder) == 1;
     BOOL alreadyRunning = healthyRunning;
     if (alreadyRunning) {
         kp_forwarder *fw = self.forwarder;
@@ -599,7 +599,7 @@ static const NSTimeInterval LCProxyKingLifecycleNotifyMinInterval = 5.0;
     [self.lock lock];
     kp_forwarder *fw = self.forwarder;
     port = fw ? kp_forwarder_port(fw) : 0;
-    published = isKingRoute && port > 0 && kp_forwarder_listen_fd_valid(fw) == 1;
+    published = isKingRoute && port > 0 && kp_forwarder_is_listening(fw) == 1;
     self.routePublished = published;
     self.publishedForwarderPort = published ? port : 0;
     [self.lock unlock];
@@ -872,14 +872,10 @@ static const NSTimeInterval LCProxyKingLifecycleNotifyMinInterval = 5.0;
     NSArray *queenHttps = [state[@"queen_https"] isKindOfClass:[NSArray class]] ? state[@"queen_https"] : nil;
     NSString *inputSignature = [state[@"credentialInputSignature"] isKindOfClass:[NSString class]] ? state[@"credentialInputSignature"] : nil;
     if (!LCProxyKingHexStringValid(guid) || !token.length || !qkey.length || !qua2.length) return NO;
-    // ★ 拒绝"本地生成的假身份"记录。
-    //
-    // 旧实现会在 PBProxy 取 GUID 失败时回退到本地随机 GUID，并把它当成一次**成功**的取号
-    // 写进共享凭证库（日志："GUID: 本地生成…" 且 ok:true）。运营商不认识这个身份，于是
-    // 每一次 CONNECT 都被零字节关闭。因为凭证库是共享的，这条记录还会污染其他所有进程。
-    // 这里把带 guidSource=local 标记的记录一律视为不可用 —— 它会自然被下一次成功取号取代。
-    NSString *guidSource = [state[@"guidSource"] isKindOfClass:[NSString class]] ? state[@"guidSource"] : nil;
-    if ([guidSource isEqualToString:@"local"]) return NO;
+    // 注意：**不要**因为 guidSource=local 就拒绝这条记录。
+    // 本地 GUID 是启动引导阶段（路由尚未发布、PBProxy 必然失败）的既定回退，删掉它会让
+    // 冷启动彻底取不到凭证 —— 那是 commit ec37444 明确修复过的问题。我曾在 v0.5.74 误加
+    // 这条拒绝，已撤回。它只作为诊断字段暴露（见 status 的 guidSource）。
     if (![inputSignature isEqualToString:[self credentialInputSignatureForSettings:settings]]) return NO;
     NSArray *validHttp = [self validatedProxyPool:queenHttp];
     NSArray *validHttps = [self validatedProxyPool:queenHttps];
@@ -1222,7 +1218,7 @@ static const NSTimeInterval LCProxyKingChainRepairMinInterval = 20.0;
     kp_forwarder *forwarder = self.forwarder;
     int port = self.publishedForwarderPort;
     BOOL routePublished = self.routePublished && forwarder != NULL &&
-                          kp_forwarder_listen_fd_valid(forwarder) == 1;
+                          kp_forwarder_is_listening(forwarder) == 1;
     if (routePublished) {
         routePublished = kp_forwarder_retain(forwarder) == 0;
     }
@@ -1594,31 +1590,31 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
         NSError *guidErr = nil;
         guid = [self syncFetchGuid:qua2 timeout:timeout error:&guidErr];
         if (!guid) {
-            // ★ 绝不回退到本地随机 GUID。
+            // ★ 保留本地 GUID 作为**启动引导回退** —— 这是刻意的，不要删除。
             //
-            // 曾经这里会 `guid = [self localRandomGuid]` 并把结果当成**成功**写进凭证库
-            // （日志里能看到 "GUID: 本地生成（服务器失败 王卡本地路由尚未发布）" 且 ok:true）。
-            // 后果是灾难性的两级放大：
-            //   1) 本地随机 GUID 是运营商**根本不认识**的身份 —— 于是之后每一次 CONNECT
-            //      都被对端零字节关闭（实测形态：connectFail=0、sendFail=0、recvFail 上千、
-            //      lastResp 为空、连状态码都拿不到）；
-            //   2) 凭证库在 App Group 里被**所有进程共享**，这条"有毒"记录成为日志里最新的
-            //      一条后，**每个**读它的进程都会拿假身份去连 —— 于是一个进程的一次失败会
-            //      污染全体，表现为"换个 App 就不行"。
-            // 正确做法是 fail-closed：拿不到真身份就让本次取号失败（不写记录、保留旧凭证），
-            // 由重试与自愈路径去修复"路由未发布"这个**真正的原因**。
+            // 历史依据（commit ec37444 "…restore GUID fallback"）：取号可能发生在
+            // **路由发布之前**，而 PBProxy GetGuid 本身要走转发器的引导隧道，因此在那个
+            // 窗口里它必然失败。若此时直接判失败，就会"一个凭证都拿不到"（当年实测的
+            // 症状）。所以这里生成一个本地 GUID 先走通 token/代理池的获取流程。
+            //
+            // ⚠️ 我曾在 v0.5.74 把这段回退删掉、并拒绝 guidSource=local 的记录，那是**错误的
+            // 过度修正**，已撤回：它会让启动阶段彻底取不到凭证。
+            //
+            // 但仍然要把它**标记**出来（guidSource=local），并且把"路由未发布"这个真正的原因
+            // 修掉（心跳自愈）。因为本地 GUID 运营商并不认识：带着它去转发时对端会直接关闭
+            // 连接；而凭证库是跨进程共享的，所以它只应作为短暂引导，不应成为长期身份。
             [steps appendFormat:@"GUID: PBProxy 失败 %@\n", guidErr.localizedDescription ?: @""];
-            return [self finishRefreshWithState:state success:NO src:source
-                                             ms:-[t0 timeIntervalSinceNow] * 1000.0
-                                          steps:steps
-                                          error:[NSString stringWithFormat:@"GUID 获取失败（不写本地假身份）: %@",
-                                                 guidErr.localizedDescription ?: @"unknown"]];
+            guid = [self localRandomGuid];
+            source = @"guid-local";
+            [steps appendFormat:@"GUID: 本地生成（服务器失败 %@）\n", guidErr.localizedDescription ?: @""];
+        } else {
+            source = @"guid-pbprx";
+            actuallyFetchedUpstream = YES;
+            [steps appendString:@"GUID: PBProxy 获取\n"];
+            state[@"guidSource"] = @"pbproxy";
         }
-        source = @"guid-pbprx";
-        actuallyFetchedUpstream = YES;
-        [steps appendString:@"GUID: PBProxy 获取\n"];
         state[@"guid"] = guid;
-        state[@"guidSource"] = @"pbproxy";
+        if (!state[@"guidSource"]) state[@"guidSource"] = @"local";
     } else {
         [steps appendString:guidOverride ? @"GUID: 使用配置覆盖\n" : @"GUID: 复用缓存\n"];
     }
@@ -1873,18 +1869,32 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
     // v0.5.47 首版导致控制台保存挂死的原因）。
     NSMutableDictionary *state = [self loadState];
     NSString *logPath = [self credentialLogPath] ?: @"";
+    // 当前生效凭证的 GUID 来源：pbproxy（运营商下发，可用）/ local（启动引导回退，
+    // 运营商不认，仅应短暂存在）/ 空（旧记录）。它能一眼区分"身份是假的"这类故障。
+    // 必须在取 self.lock **之前**读（loadState 用 cacheLock，锁序不允许嵌套）。
+    NSString *guidSourceText = [state[@"guidSource"] isKindOfClass:[NSString class]] ? state[@"guidSource"] : @"";
     [self.lock lock];
     NSMutableDictionary *d = [NSMutableDictionary dictionary];
     d[@"running"] = @([self isRunning]);
     d[@"forwarderPort"] = @(self.forwarder ? kp_forwarder_port(self.forwarder) : 0);
     d[@"activeForwarderClients"] = @(self.forwarder ? kp_forwarder_active_clients(self.forwarder) : 0);
     d[@"listenFdValid"] = @(self.forwarder ? kp_forwarder_listen_fd_valid(self.forwarder) : 0);
+    // ★ 真·监听检查：实际 connect 一次 listen_port。
+    // listenFdValid 只看 fd 号 —— 后台/熄屏会让 socket 失效而 fd 依旧 >= 0，于是它恒为 1，
+    // 这正是"切后台后永久断网"此前无法从 status 看出的原因。本字段才是真相。
+    {
+        [self.lock lock];
+        kp_forwarder *fwForProbe = self.forwarder;
+        [self.lock unlock];
+        d[@"listenProbeOk"] = @(fwForProbe ? kp_forwarder_is_listening(fwForProbe) : 0);
+    }
     d[@"lastHealthCheckOk"] = @(self.lastHealthCheckOk);
     d[@"lastHealthCheckAt"] = @(self.lastHealthCheckAt);
     d[@"lastRefreshSuccess"] = @(self.lastRefreshSuccess);
     d[@"lastRefresh"] = self.lastRefresh ?: @"";
     d[@"lastSource"] = self.lastSource ?: @"";
     d[@"lastError"] = self.lastError ?: @"";
+    d[@"guidSource"] = guidSourceText;
     d[@"lastDiagnostics"] = self.lastDiagnostics ?: @"";
     d[@"desiredForwarderRunning"] = @(self.desiredForwarderRunning);
     d[@"forwarderDiscardCount"] = @(self.forwarderDiscardCount);

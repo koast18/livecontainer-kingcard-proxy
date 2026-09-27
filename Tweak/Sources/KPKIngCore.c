@@ -2851,6 +2851,23 @@ int kp_forwarder_listen_fd_valid(kp_forwarder *fw) {
     return kp_forwarder_running(fw) && kp_forwarder_listen_fd(fw) >= 0;
 }
 
+// ★ 真正的"还在监听"检查：真去连一次 listen_port，而不是只看 fd 号。
+//
+// 为什么二者必须区分：iOS 在**进入后台/熄屏**时会让 socket 失效，但 fd 号依旧 >= 0，
+// 内存里的 running 标志也仍为真。此时 kp_forwarder_listen_fd_valid() 依然返回 1 ——
+// 于是"转发器是否健康"的判断永远成立、**转发器永远不会被重建**，表现为
+// "切后台或熄屏后彻底断网，且再也回不来"。
+//
+// 历史：这个真检查最早由 bd075c8（fix: recover kingcard proxy after
+// background/foreground）引入，正是为了处理"后台期间失效的监听 socket 要在前台重建"。
+// 后来判据被弱化成 kp_forwarder_listen_fd_valid()，而 0.5.59 的"复用健康转发器"
+// 又恰好用了那个弱判据，于是后台失效的转发器被无限复用 —— 该回归由此产生。
+// 现在恢复真检查，并统一用于所有"是否复用/是否发布路由"的决策点。
+int kp_forwarder_is_listening(kp_forwarder *fw) {
+    // 500ms 足够：loopback connect 是微秒级；失败即认为监听已失效。
+    return kp_forwarder_probe_local(fw, 500);
+}
+
 int kp_forwarder_probe_local(kp_forwarder *fw, int timeout_ms) {
     if (!kp_forwarder_running(fw) || fw->listen_port <= 0) return 0;
     int fd = kp_connect_host("127.0.0.1", fw->listen_port, timeout_ms);
