@@ -175,16 +175,25 @@ assert 'kp_forwarder_clear_king_state' in king, 'stale forwarder state is not cl
 assert 'if (force) [self clearForwarderKingState];' not in king, \
     'a forced refresh still clears live credentials before fetching replacements (avalanche)'
 
-# 被动刷新（C 层转发失败回调）必须 **零阻塞 + 限频 + 异步**。
+# 被动刷新（C 层转发失败回调）必须 **零阻塞 + 限频 + 异步**，且**返回 -1**。
 # 回调跑在 C 层 client 线程上（kp_forwarder_refresh），而 kp_forwarder_refresh_retry
 # 对每个失败请求最多重试 3 次、client 线程上限 64 —— 任何阻塞式等待都会被放大成
 # "20s × 3 × 64 线程"，足以让进程被系统杀掉（实测：打开共享 App 即闪退）。
 # 同时 C 层把"连接失败"一律当成"凭证问题"，共享 App 高并发下失败成批出现，
 # 不加限频就会打出取号风暴（实测 1341 次取号 / 45 秒内 30 次完整取号）。
+#
+# 返回值必须是 -1（不是 0）：C 层把 0 解释为"刷新成功，立刻用新凭证重试"，
+# kp_forwarder_refresh_retry 返回 0 后 kp_handle_client 会 goto https_retry 再跑
+# **整整一轮**池内代理尝试（最多 4 节点 × (10s 连接 + 10s 接收)）。我们的取号是异步的，
+# 那一轮时凭证池并未变化，纯属浪费，最坏占住 client 线程数十秒。
 assert 'LCProxyKingMinRefreshInterval' in king, 'passive refresh is not rate limited'
 _hook = king[king.index('static int LCProxyKingRefreshHook'):king.index('static void LCProxyKingLog')]
-assert 'requestBackgroundRefresh' in _hook and 'return 0;' in _hook, \
+assert 'requestBackgroundRefresh' in _hook, \
     'the C refresh hook does not delegate to the non-blocking async path'
+assert 'return -1;' in _hook, \
+    'the C refresh hook returns 0, which makes the C layer re-run a whole extra proxy round'
+assert 'return 0;' not in _hook, \
+    'the C refresh hook must not claim success (that triggers a guaranteed-wasted retry round)'
 assert 'refreshCredentials' not in _hook, \
     'the C refresh hook performs the refresh inline (blocks a client thread)'
 _rbr = king[king.index('- (void)requestBackgroundRefresh {'):]
@@ -298,16 +307,18 @@ assert 'lifecycleLock' not in _hb, \
     'heartbeat takes lifecycleLock, so a wedged apply would block the safety net too'
 assert 'runtimeQueue' not in _hb, \
     'heartbeat depends on the serial runtimeQueue it is meant to bypass'
-# 心跳每 5s 跑一次，必须足够省：只读内存状态，不做磁盘/配置读取；
-# 催促刷新也走同一个限频异步入口，避免变成每 5s 一次的风暴。
+# 心跳每 5s 跑一次，必须足够省：只读内存状态，不做磁盘/配置读取，且**不催取号**。
+# 心跳只负责它独有的价值（发现转发器缺失/override 失配并就地修复）。凭证续期已由
+# 2 分钟主动定时器与"连接失败回调（限频 20s）"覆盖；而 requestBackgroundRefresh 走
+# force 分支会绕过缓存命中判断，若心跳调用它，稳态下就变成每 20s 一次完整网络取号。
 assert 'hasFreshCachedState' not in _hb, \
     'heartbeat reads settings/credential state from disk every 5 seconds'
 assert 'settingsSnapshot' not in _hb, \
     'heartbeat re-parses settings on every tick'
 assert 'desiredForwarderRunning' in _hb, \
     'heartbeat does not use the in-memory kingcard-enabled flag'
-assert 'requestBackgroundRefresh' in _hb, \
-    'heartbeat does not prod a (rate-limited) credential refresh'
+assert '[self requestBackgroundRefresh]' not in _hb, \
+    'heartbeat prods a forced (cache-bypassing) network refresh every tick'
 
 # Explicit credentials always override remote refreshes, including forced ones.
 assert '!guidOverride && (force || !guid)' in king, \

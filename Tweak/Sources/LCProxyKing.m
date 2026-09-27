@@ -18,26 +18,37 @@ static const NSTimeInterval LCProxyKingRefreshLeeway = 30;
 static const NSTimeInterval LCProxyKingRefreshLeadTime = 2 * 60;
 static const NSTimeInterval LCProxyKingPBProxyBootstrapSetupAllowance = 2;
 // 被动刷新（转发失败触发）的最小间隔。见 requestBackgroundRefresh。
-static const NSTimeInterval LCProxyKingMinRefreshInterval = 60.0;
+// 正常续期由 2 分钟主动定时器负责（提前 LCProxyKingRefreshLeadTime 续期），本路径只在
+// "凭证提前失效 / 池内节点全挂"时兜底，因此 20s 足够及时，且把上游压力限制在 ≤3 次/分。
+static const NSTimeInterval LCProxyKingMinRefreshInterval = 20.0;
 
-// C 层回调：在**转发失败**时被调用（它已先试完所有代理节点）。
+// C 层回调：在**转发失败**时被调用（此前它已试完池内所有代理节点）。
 //
-// 必须满足两条硬约束，否则会变成灾难：
-//   ① **零阻塞** —— 它跑在 C 层 client 线程上（KPKIngCore.c: kp_forwarder_refresh），
-//      而 kp_forwarder_refresh_retry 对每个失败请求最多重试 3 次、client 线程上限 64。
-//      任何阻塞式等待都会被放大：20s/次 × 3 次 × 64 线程足以让进程被系统杀掉（闪退）。
-//   ② **强限频** —— C 层把"连接失败"一律当成"凭证问题"，而失败在共享 App 的高并发下
-//      是成批出现的。不加限制时每个失败连接都要一次取号，实测打出 1341 次取号、
-//      45 秒内 30 次完整取号，把 client 线程全占满。
+// 必须同时满足三条硬约束，否则会变成灾难：
 //
-// 因此这里只做一件事：投递一个限频的异步刷新信号，并**立即返回 0**。
-// 返回 0 的含义是"本轮重试到此为止" —— 让 C 层停止重试，避免风暴；
-// 真正的取号在后台队列完成，完成后新凭证会装进转发器，后续连接自然恢复。
-// 当前这次连接会失败（客户端拿到 502），但这是可接受的：它换来的是不雪崩、不闪退。
+// ① **零阻塞** —— 本回调跑在 C 层 client 线程上（kp_forwarder_refresh →
+//    fw->refresh_fn），而 kp_forwarder_refresh_retry 对每个失败请求最多重试 3 次、
+//    client 线程上限 KP_FORWARDER_MAX_CLIENTS=64。任何阻塞式等待都会被放大：
+//    20s × 3 次 × 最多 64 线程足以让进程被系统直接杀掉（实测：打开共享 App 即闪退）。
+//
+// ② **必须返回 -1，不能返回 0** —— C 层把 0 解释为"刷新成功，立刻用新凭证重试"：
+//    kp_forwarder_refresh_retry 返回 0 后 kp_handle_client 会 `goto https_retry`
+//    再跑**整整一轮**池内代理尝试（最多 4 个节点 × 每次 10s 连接 + 10s 接收）。
+//    而我们的取号是**异步**的，那一轮时凭证池根本没变化，纯属浪费，最坏能占住
+//    client 线程数十秒。返回 -1 表示"本次重试到此为止"：C 层最多做一次 500ms 退避
+//    就回 502，代价可控且可预期。
+//
+// ③ **强限频** —— C 层把"连接失败"一律当成"凭证问题"，而共享 App 高并发下失败是
+//    成批出现的；不加限制时每个失败连接都要一次取号（实测 1341 次、45 秒内 30 次
+//    完整取号），把 client 线程全占满。限频统一在 requestBackgroundRefresh 内完成。
+//
+// 因此这里只做一件事：投递一个限频的异步刷新信号，然后立刻返回 -1。
+// 当前这次连接会拿到 502，换来的是不雪崩、不闪退、也不浪费一整轮代理尝试；
+// 真正的取号在后台队列完成，新凭证装入转发器后，后续连接自然恢复。
 static int LCProxyKingRefreshHook(void *ctx) {
     LCProxyKing *king = (__bridge LCProxyKing *)ctx;
     [king requestBackgroundRefresh];
-    return 0;
+    return -1;
 }
 
 static void LCProxyKingLog(const char *line) {
@@ -425,10 +436,16 @@ static const NSTimeInterval LCProxyKingLifecycleNotifyMinInterval = 5.0;
         NSLog(@"[LCProxyKing] heartbeat repinned override %d -> %d", overridePort, port);
     }
 
-    // 凭证陈旧同样会造成"转发器在跑、但所有请求都失败"（上游 407/403 → 转发器回 502），
-    // 症状与端口不一致一样是"无法联网"。这里走与被动刷新同一个**限频异步**入口，
-    // 因此即使凭证持续拿不到，也绝不会变成每 5 秒一次的风暴。
-    [self requestBackgroundRefresh];
+    // 心跳**不催取号**。它只负责自己做得到、别人做不到的那件事：在没有任何外部事件
+    // （前台/切网/定时器/流量）时发现"转发器缺失"或"override 指向别处"并就地修好。
+    //
+    // 凭证续期已由两条路径覆盖，心跳再插一手只会造成稳态浪费：
+    //   · 正常续期：2 分钟主动定时器（提前 LCProxyKingRefreshLeadTime 续期）；
+    //   · 提前失效 / 池内节点全挂：连接失败会触发 C 层回调 → requestBackgroundRefresh
+    //     （限频 20s，且走 force 分支强制重取）。
+    // 而 requestBackgroundRefresh 用的是 force 路径，会**绕过缓存命中判断**，
+    // 因此若在这里调用，稳态下就会变成每 20 秒一次完整网络取号（实测即 3 次/分、
+    // 180 次/小时），纯属无谓。
 }
 
 // 紧急自愈：绕过 LCProxyConfig 的串行 runtimeQueue，直接重建转发器并就地钉住
