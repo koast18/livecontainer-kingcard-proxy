@@ -489,7 +489,19 @@ static const NSTimeInterval LCProxyKingLifecycleNotifyMinInterval = 5.0;
     //
     // 限频：requestRuntimeApplyAsync 会重写多份配置文件，绝不能每 5 秒来一次。
     int chainPort = lcproxy_control_get_applied_override_port();
-    if (chainPort != port) {
+    [self.lock lock];
+    BOOL routeOk = self.routePublished;
+    [self.lock unlock];
+    // ★ 路由"未发布"同样必须自愈 —— 这是后台/熄屏后整体断网的成因。
+    //
+    // applyRuntimeSnapshot 开头会 beginRoutePublication（routePublished=NO），结尾只在
+    // `configReady && (!proxyActive || config_valid)` 成立时才 publishRouteForSettings 把它
+    // 置回 YES。若这个条件不成立，routePublished 就**停在 NO 且没有任何自愈路径**：
+    //   · syncFetchGuid 直接失败（错误串就是实测日志里的"王卡本地路由尚未发布"）；
+    //   · 而 publishRouteForSettings 的失败分支还会 stopRefreshTimer，主动续期也停了；
+    //   · 0.5.62 起心跳又不再催促取号 —— 于是一次后台切换就能把进程锁死在断网状态。
+    // 这里补上兜底：转发器健康却没发布路由 → 请求一次 apply（限频），把它救回来。
+    if (!routeOk || chainPort != port) {
         NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
         if (now - self.lastChainRepairRequestAt >= LCProxyKingChainRepairMinInterval) {
             self.lastChainRepairRequestAt = now;
@@ -498,11 +510,11 @@ static const NSTimeInterval LCProxyKingLifecycleNotifyMinInterval = 5.0;
                 @"ok": @NO,
                 @"src": @"heartbeat-chain-repair",
                 @"ms": @0,
-                @"msg": [NSString stringWithFormat:@"代理链端口 %d != 转发器 %d，请求重载配置",
-                         chainPort, port],
+                @"msg": [NSString stringWithFormat:@"路由自检失败（routePublished=%d，链端口 %d，转发器 %d），请求重载配置",
+                         routeOk ? 1 : 0, chainPort, port],
             }];
-            NSLog(@"[LCProxyKing] heartbeat: chain port %d != forwarder %d, requesting runtime apply",
-                  chainPort, port);
+            NSLog(@"[LCProxyKing] heartbeat: routePublished=%d chainPort=%d forwarder=%d, requesting runtime apply",
+                  routeOk ? 1 : 0, chainPort, port);
             [[LCProxyConfig shared] requestRuntimeApplyAsync];
         }
     }
@@ -860,6 +872,14 @@ static const NSTimeInterval LCProxyKingLifecycleNotifyMinInterval = 5.0;
     NSArray *queenHttps = [state[@"queen_https"] isKindOfClass:[NSArray class]] ? state[@"queen_https"] : nil;
     NSString *inputSignature = [state[@"credentialInputSignature"] isKindOfClass:[NSString class]] ? state[@"credentialInputSignature"] : nil;
     if (!LCProxyKingHexStringValid(guid) || !token.length || !qkey.length || !qua2.length) return NO;
+    // ★ 拒绝"本地生成的假身份"记录。
+    //
+    // 旧实现会在 PBProxy 取 GUID 失败时回退到本地随机 GUID，并把它当成一次**成功**的取号
+    // 写进共享凭证库（日志："GUID: 本地生成…" 且 ok:true）。运营商不认识这个身份，于是
+    // 每一次 CONNECT 都被零字节关闭。因为凭证库是共享的，这条记录还会污染其他所有进程。
+    // 这里把带 guidSource=local 标记的记录一律视为不可用 —— 它会自然被下一次成功取号取代。
+    NSString *guidSource = [state[@"guidSource"] isKindOfClass:[NSString class]] ? state[@"guidSource"] : nil;
+    if ([guidSource isEqualToString:@"local"]) return NO;
     if (![inputSignature isEqualToString:[self credentialInputSignatureForSettings:settings]]) return NO;
     NSArray *validHttp = [self validatedProxyPool:queenHttp];
     NSArray *validHttps = [self validatedProxyPool:queenHttps];
@@ -1574,16 +1594,31 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
         NSError *guidErr = nil;
         guid = [self syncFetchGuid:qua2 timeout:timeout error:&guidErr];
         if (!guid) {
+            // ★ 绝不回退到本地随机 GUID。
+            //
+            // 曾经这里会 `guid = [self localRandomGuid]` 并把结果当成**成功**写进凭证库
+            // （日志里能看到 "GUID: 本地生成（服务器失败 王卡本地路由尚未发布）" 且 ok:true）。
+            // 后果是灾难性的两级放大：
+            //   1) 本地随机 GUID 是运营商**根本不认识**的身份 —— 于是之后每一次 CONNECT
+            //      都被对端零字节关闭（实测形态：connectFail=0、sendFail=0、recvFail 上千、
+            //      lastResp 为空、连状态码都拿不到）；
+            //   2) 凭证库在 App Group 里被**所有进程共享**，这条"有毒"记录成为日志里最新的
+            //      一条后，**每个**读它的进程都会拿假身份去连 —— 于是一个进程的一次失败会
+            //      污染全体，表现为"换个 App 就不行"。
+            // 正确做法是 fail-closed：拿不到真身份就让本次取号失败（不写记录、保留旧凭证），
+            // 由重试与自愈路径去修复"路由未发布"这个**真正的原因**。
             [steps appendFormat:@"GUID: PBProxy 失败 %@\n", guidErr.localizedDescription ?: @""];
-            guid = [self localRandomGuid];
-            source = @"guid-local";
-            [steps appendFormat:@"GUID: 本地生成（服务器失败 %@）\n", guidErr.localizedDescription ?: @""];
-        } else {
-            source = @"guid-pbprx";
-            actuallyFetchedUpstream = YES;
-            [steps appendString:@"GUID: PBProxy 获取\n"];
+            return [self finishRefreshWithState:state success:NO src:source
+                                             ms:-[t0 timeIntervalSinceNow] * 1000.0
+                                          steps:steps
+                                          error:[NSString stringWithFormat:@"GUID 获取失败（不写本地假身份）: %@",
+                                                 guidErr.localizedDescription ?: @"unknown"]];
         }
+        source = @"guid-pbprx";
+        actuallyFetchedUpstream = YES;
+        [steps appendString:@"GUID: PBProxy 获取\n"];
         state[@"guid"] = guid;
+        state[@"guidSource"] = @"pbproxy";
     } else {
         [steps appendString:guidOverride ? @"GUID: 使用配置覆盖\n" : @"GUID: 复用缓存\n"];
     }

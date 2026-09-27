@@ -633,5 +633,24 @@ assert '/api/king/reset-credentials' in server, \
 assert 'resetSharedCredentialsAndRefresh' in Path('Tweak/Sources/LCProxyKing.h').read_text(encoding='utf-8'), \
     'the reset entry point is not declared in the public header'
 
+# ★ 永不回退到本地随机 GUID —— 这是"后台/熄屏后整体断网"的根因。
+#
+# 旧实现在 PBProxy 取 GUID 失败时 `guid = [self localRandomGuid]`，并把它当成一次**成功**
+# 的取号写进共享凭证库（日志可见 "GUID: 本地生成…" 且 ok:true）。运营商不认识这个身份，
+# 于是之后每次 CONNECT 都被对端零字节关闭（实测：connectFail=0、sendFail=0、recvFail 上千、
+# lastResp 为空）。因为凭证库在 App Group 被所有进程共享，这条"有毒"记录一旦成为最新一条，
+# 每个读它的进程都会拿假身份去连 —— 一次失败污染全体。
+assert 'guid = [self localRandomGuid];' not in king, \
+    'the local random-GUID fallback is back (poisons the shared credential store)'
+assert 'guidSource' in king and '@"local"' in king, \
+    'poisoned guidSource=local records are no longer rejected'
+assert re.search(r'if \(\[guidSource isEqualToString:@"local"\]\) return NO;', king), \
+    'stateHasFreshCredentials no longer rejects locally-generated identities'
+# 路由"未发布"必须可自愈，否则一次后台切换就把进程锁死（syncFetchGuid 会直接失败）。
+assert re.search(r'int chainPort = lcproxy_control_get_applied_override_port\(\);\s*\[self\.lock lock\];\s*BOOL routeOk = self\.routePublished;', king), \
+    'the heartbeat no longer checks routePublished'
+assert re.search(r'if \(!routeOk \|\| chainPort != port\)', king), \
+    'a stale/never-published route no longer triggers a repair'
+
 print('king cache/refresh logic static checks OK')
 PY
