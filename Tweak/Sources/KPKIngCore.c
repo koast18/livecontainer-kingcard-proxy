@@ -2087,7 +2087,10 @@ static void kp_handle_client(kp_forwarder *fw, int client) {
             kp_upstream_close(fw, &up);
             continue;
         }
-        if (!http_refreshed && kp_forwarder_refresh_retry(fw, 3, 500) == 0) {
+        // 只尝试一次：被动刷新 hook 现在是**异步**的（只投递信号并恒返回 -1），
+        // 因此重试永远不可能成功，多试只是白占 client 线程（原为 3 次 + 1000ms 退避）。
+        // 失败即立刻回 502，让 client 线程尽快释放；后台取号完成后，后续连接自然用上新凭证。
+        if (!http_refreshed && kp_forwarder_refresh_retry(fw, 1, 0) == 0) {
             http_refreshed = 1;
             pthread_mutex_lock(&fw->cred_mutex);
             http_pool_count = fw->http_pool.count;
@@ -2255,10 +2258,12 @@ https_retry:
             }
             // 隧道已建立但客户端发了数据后上游一个字节都没回就关闭，常见于：
             // Q-Token 已失效/代理节点异常导致 TLS handshake 被对端直接终止。
-            // 这里主动触发一次强制刷新，让后续连接有机会用新凭证恢复。
+            // 这里主动触发一次刷新，让后续连接有机会用新凭证恢复。
+            // 同样只尝试一次：hook 是异步的，重试永远失败，只会白占 client 线程
+            // （原为 2 次 + 300ms 退避）。
             if (up_to_client == 0 && client_to_up > 0) {
                 kp_dbg("[fw] CONNECT closed before upstream data (likely handshake failure), refreshing credentials");
-                kp_forwarder_refresh_retry(fw, 2, 300);
+                kp_forwarder_refresh_retry(fw, 1, 0);
             }
             kp_upstream_close(fw, &up);
             KP_CLOSESOCK(client);
@@ -2267,7 +2272,8 @@ https_retry:
         kp_upstream_close(fw, &up);
         continue;
     }
-    if (!https_refreshed && kp_forwarder_refresh_retry(fw, 3, 500) == 0) {
+    // 只尝试一次：见上（hook 异步、恒返回 -1，重试是纯浪费）。
+    if (!https_refreshed && kp_forwarder_refresh_retry(fw, 1, 0) == 0) {
         https_refreshed = 1;
         pthread_mutex_lock(&fw->cred_mutex);
         https_pool_count = fw->https_pool.count;
@@ -2285,8 +2291,15 @@ static int kp_forwarder_refresh(kp_forwarder *fw) {
     return fw->refresh_fn(fw->refresh_ctx);
 }
 
-// 带有限重试的被动刷新：瞬时失败（取号接口抖动等）不应直接判死回 502。
-// 共尝试 attempts 次，间隔 backoff_ms。任一次成功立即返回 0。
+// 被动刷新（可选重试）。**所有调用点都必须传 attempts=1、backoff_ms=0。**
+//
+// 历史：这里原本用 3 次 / 500ms 重试，因为刷新曾经是同步的、可能瞬时失败后重试成功。
+// 现在 ObjC 侧的刷新 hook 已改为**异步投递信号并恒返回 -1**（见 LCProxyKingRefreshHook：
+// 它跑在 client 线程上，绝不能阻塞或耗时），因此重试**永远不可能成功** —— 多试一次就
+// 只是让 client 线程多占 one backoff 周期（原为 1000ms），在高并发下直接加剧线程占用。
+// 失败应尽快回 502 释放 client 线程；后台取号完成后，后续连接自然用上新凭证。
+//
+// 保留 attempts/backoff 参数是为了在将来若重新引入同步刷新时无需改动调用点。
 static int kp_forwarder_refresh_retry(kp_forwarder *fw, int attempts, int backoff_ms) {
     if (!fw) return -1;
     for (int i = 0; i < attempts; i++) {

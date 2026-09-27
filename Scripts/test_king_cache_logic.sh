@@ -98,6 +98,18 @@ assert 'LCProxyRecordDylibLoad' in control and 'dylib-loads.log' in control, \
     'dylib load is not recorded to the shared App Group log'
 assert 'dylibLoadsTail' in server, '/api/status does not expose dylib load records'
 
+# 防重复加载：LiveContainer 的 TweakLoader 会加载 Tweaks 目录里的每一个 dylib，升级
+# 期间新旧两份很容易共存（实测同一 pid 先后加载了 0.5.57 与 0.5.56）。两个映像的同类名
+# 会让 runtime 二选一、另一份的 ivar/实现被交叉使用 → 未定义行为/崩溃；还会产生两个
+# 单例、两个转发器、两个心跳。构造器必须先在运行期确认"本映像才是生效的那份"。
+assert re.search(r'NSClassFromString\(@"LCProxyConfig"\)', control), \
+    'duplicate-image guard is missing from LCProxyControl constructor'
+assert re.search(r'if \(registeredConfig && registeredConfig != \[LCProxyConfig class\]\)', control), \
+    'duplicate-image guard does not compare against this image\'s own class'
+_ctor = control[control.index('static void LCProxyControlConstructor(void) {'):]
+assert _ctor.index('registeredConfig') < _ctor.index('LCProxyRecordDylibLoad();'), \
+    'duplicate-image guard runs after side effects (must be the very first check)'
+
 # Persistence is best-effort: if the log is unwritable the process must keep
 # working purely in memory rather than failing closed for a write problem.
 store_start = king.index('- (NSString *)credentialLogPath {')
@@ -196,6 +208,14 @@ assert 'return 0;' not in _hook, \
     'the C refresh hook must not claim success (that triggers a guaranteed-wasted retry round)'
 assert 'refreshCredentials' not in _hook, \
     'the C refresh hook performs the refresh inline (blocks a client thread)'
+
+# 回调恒返回 -1 之后，C 层的重试循环永远不可能成功，必须只尝试一次。
+# 原为 (3,500)/(2,300)：多试一次就让 client 线程多占一个退避周期（最多 1000ms），
+# 高并发下直接加剧线程占用（这正是闪退的资源来源）。
+assert re.findall(r'kp_forwarder_refresh_retry\(fw, (\d+), (\d+)\)', core) == [('1', '0')] * 3, \
+    'a kp_forwarder_refresh_retry call site still retries an always-failing async hook'
+for _old in ('kp_forwarder_refresh_retry(fw, 3, 500)', 'kp_forwarder_refresh_retry(fw, 2, 300)'):
+    assert _old not in core, f'wasted synchronous retry loop still present: {_old}'
 _rbr = king[king.index('- (void)requestBackgroundRefresh {'):]
 _rbr = _rbr[:_rbr.index('\n}\n') + 3]
 assert 'NSThread sleepForTimeInterval' not in _rbr, \
