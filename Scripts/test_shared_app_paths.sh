@@ -112,15 +112,32 @@ assert '[cls respondsToSelector:selector]' in paths, \
 assert '[lcSharedUtils respondsToSelector:sel]' in updater, \
     'console updater can call an unavailable LCSharedUtils selector'
 
-# 未签名的新版绝不能清空私有/共享 tweak 目录里已签名的旧版：以前 keep:nil 会在新版
-# 未签名时把共享目录删空，导致共享 App 在"下载→签名→重开控制台"完成之前完全没有
-# dylib 可加载。清理必须只在当前版本已就位且已签名时进行。
-assert '[self cleanOldDylibsIn:sharedTweaks keep:sharedSigned ? asset : nil];' not in updater, \
-    'console updater still wipes the shared tweak folder when the new dylib is unsigned'
-assert 'if (sharedSigned) {\n            [self cleanOldDylibsIn:sharedTweaks keep:asset];' in updater, \
-    'shared tweak cleanup is not gated on the new dylib being signed and in place'
-assert 'if (normalSigned) {\n        [self cleanOldDylibsIn:normalTweaks keep:asset];' in updater, \
-    'private tweak cleanup is not gated on the new dylib being signed'
+# ⚠️ 这里曾经断言的是**错误行为**，必须说明清楚以免再被改回去。
+#
+# 旧实现：只要新版还没签名就"什么都不删"，理由是"未签名的新版绝不能清空已签名的旧版"。
+# 这个理由本身没错，但结论是错的 —— 它让**新旧两份同时在目录里**。而 LiveContainer 的
+# TweakLoader 会加载 Tweaks 目录里的每一个 dylib，于是同一个进程进入两个 LCProxyControl
+# 映像（同名 ObjC 类注册两次、实现与实例变量交叉使用），表现为
+# **用户签名之后打开任何 App 都闪退**。
+#
+# 正确的不变量：**每个 Tweaks 目录最多只能有一个已启用（非 .disabled）的 dylib**。
+# 同时满足"旧版继续可用"与"新版可被签名"的手段是 .disabled 暂存：
+#   · TweakLoader 跳过 .disabled → 不会被加载，不会冲突；
+#   · LiveContainer 的签名页仍会给 .disabled 文件签名（先剥 .disabled 再判 .dylib）。
+assert 'cleanOldDylibsIn' not in updater, \
+    'the conditional cleanOldDylibsIn is back (old+new dylibs coexist while the new one is unsigned)'
+assert 'enforceSingleActiveDylibIn' in updater, \
+    'console updater no longer enforces "at most one active dylib per Tweaks folder"'
+assert 'desiredAsset:asset' in updater, \
+    'the single-active-dylib enforcer is not applied to the private tweak folder'
+assert '[self enforceSingleActiveDylibIn:sharedTweaks' in updater, \
+    'the single-active-dylib enforcer is not applied to the shared tweak folder'
+# 新版必须下载/暂存为 .disabled，否则下载完就与旧版共存。
+assert 'stringByAppendingString:@".disabled"' in updater and 'dylib.disabled' in updater, \
+    'the new dylib is no longer staged as .disabled (downloading it would break the invariant)'
+# 枚举必须同时覆盖 .dylib 与 .dylib.disabled，否则 .disabled 文件会被永久泄漏。
+assert 'hasSuffix:@".dylib.disabled"' in updater, \
+    'the enumerator ignores .dylib.disabled files (they would never be reclaimed)'
 
 # 王卡状态仍以 canonical 为权威，但同时写入/锁定所有可访问数据目录，
 # 避免共享 App 因 AppGroup 目录不可见/不可写而完全丢失状态。

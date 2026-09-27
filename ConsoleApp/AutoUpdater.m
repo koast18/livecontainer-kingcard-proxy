@@ -180,14 +180,125 @@ static NSMutableString *gDiag = nil;
     return NO;
 }
 
-+ (void)cleanOldDylibsIn:(NSString *)dir keep:(NSString *)keep {
+// 列出目录里所有 LCProxyControl 相关文件（**含** .dylib 与 .dylib.disabled）。
+//
+// 旧的清理函数只匹配 ".dylib" 后缀，因此 .dylib.disabled 永远不会被回收 —— 而新版
+// 恰恰要以 .disabled 形式暂存，所以必须同时覆盖两种后缀。
++ (NSArray<NSString *> *)lcProxyControlFilesIn:(NSString *)dir {
+    NSMutableArray<NSString *> *out = [NSMutableArray array];
     NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil];
     for (NSString *f in files) {
-        if ([f hasPrefix:@"LCProxyControl-"] && [f hasSuffix:@".dylib"] && ![f isEqualToString:keep]) {
-            [[NSFileManager defaultManager] removeItemAtPath:[dir stringByAppendingPathComponent:f] error:nil];
+        if ([f hasPrefix:@"LCProxyControl-"] &&
+            ([f hasSuffix:@".dylib"] || [f hasSuffix:@".dylib.disabled"])) {
+            [out addObject:f];
+        }
+    }
+    return out;
+}
+
+static BOOL LCProxyIsDisabledName(NSString *name) {
+    return [name hasSuffix:@".disabled"];
+}
+
+// 从 "LCProxyControl-0.5.72.dylib[.disabled]" 取出 "0.5.72"，用于挑最新版本。
+static NSString *LCProxyVersionFromName(NSString *name) {
+    NSString *s = name;
+    if ([s hasSuffix:@".disabled"]) s = [s substringToIndex:s.length - @".disabled".length];
+    if (![s hasSuffix:@".dylib"]) return @"";
+    s = [s substringToIndex:s.length - @".dylib".length];
+    NSRange dash = [s rangeOfString:@"-" options:NSBackwardsSearch];
+    return dash.location == NSNotFound ? @"" : [s substringFromIndex:dash.location + 1];
+}
+
+// ★ 核心不变量：目录里**最多只能有一个已启用（非 .disabled）的 LCProxyControl-*.dylib**。
+//
+// 为什么这是硬要求：LiveContainer 的 TweakLoader 会加载 Tweaks 目录里的**每一个** dylib
+// 文件。若新旧两份同时存在（升级过程中极易发生），同一个进程里会进入两个 LCProxyControl
+// 映像 —— 同名 ObjC 类被注册两次、另一份的实现与实例变量被交叉使用，表现为
+// **打开任何 App 都闪退**。实测出现过（dylib-loads.log 里同一个 pid 先后加载了 0.5.57
+// 与 0.5.56）。
+//
+// 同时必须避免另一个极端：如果为了"只留一个"就把旧版删掉、而新版还没签名，用户就会
+// 在签名之前彻底失去可用 dylib。两个目标靠 **.disabled 暂存** 同时满足：
+//   · TweakLoader 跳过以 .disabled 结尾的文件（不会被加载 → 不会冲突）；
+//   · LiveContainer 的签名页仍然会给 .disabled 文件签名（它先剥掉 .disabled 再判 .dylib）。
+// 因此把新版下载成 "<资产名>.disabled"，用户签名它、旧版继续生效，两边都不受损；
+// 下次打开控制台时本方法把它改名为正式名并删掉旧版，完成切换。
+//
+// 返回目录中"当前启用"的 dylib 文件名（可能为 nil）。
++ (NSString *)enforceSingleActiveDylibIn:(NSString *)dir desiredAsset:(NSString *)asset {
+    if (!dir.length || !asset.length) return nil;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *desiredActive = asset;
+    NSString *desiredStaged = [asset stringByAppendingString:@".disabled"];
+
+    // 0) 兼容旧版控制台留下的"未签名新版"：把它转为 .disabled 暂存。
+    //    旧逻辑会把它当作正常文件留在目录里 —— 它既不能加载（未签名），又和旧版共存，
+    //    用户一签名就变成"两份都已签名"从而闪退。这里就地纠正。
+    {
+        NSString *p = [dir stringByAppendingPathComponent:desiredActive];
+        if ([fm fileExistsAtPath:p] && !LCProxyCodeSignatureValid(p)) {
+            NSString *sp = [dir stringByAppendingPathComponent:desiredStaged];
+            [fm removeItemAtPath:sp error:nil];
+            if ([fm moveItemAtPath:p toPath:sp error:nil]) {
+                [self diag:@"[暂存] 未签名的新版已转为 %@（不会被加载，等待签名）", desiredStaged];
+            }
+        }
+    }
+
+    NSArray<NSString *> *files = [self lcProxyControlFilesIn:dir];
+
+    // 1) 暂存的新版若已被签名 → 激活它（改名去掉 .disabled）。
+    {
+        BOOL stagedExists = [files containsObject:desiredStaged];
+        if (stagedExists &&
+            LCProxyCodeSignatureValid([dir stringByAppendingPathComponent:desiredStaged])) {
+            [fm removeItemAtPath:[dir stringByAppendingPathComponent:desiredActive] error:nil];
+            if ([fm moveItemAtPath:[dir stringByAppendingPathComponent:desiredStaged]
+                            toPath:[dir stringByAppendingPathComponent:desiredActive] error:nil]) {
+                [self diag:@"[启用] 已签名的新版生效：%@", desiredActive];
+            }
+            files = [self lcProxyControlFilesIn:dir];
+        }
+    }
+
+    // 2) 选出唯一保留的"已启用"文件：优先目标版本，否则取最新的**已签名**版本。
+    NSString *keepActive = nil;
+    {
+        NSString *p = [dir stringByAppendingPathComponent:desiredActive];
+        if ([fm fileExistsAtPath:p] && LCProxyCodeSignatureValid(p)) {
+            keepActive = desiredActive;
+        } else {
+            NSString *bestVer = nil;
+            for (NSString *f in files) {
+                if (LCProxyIsDisabledName(f)) continue;
+                NSString *full = [dir stringByAppendingPathComponent:f];
+                if (!LCProxyCodeSignatureValid(full)) continue;
+                NSString *v = LCProxyVersionFromName(f);
+                if (!bestVer || [v compare:bestVer options:NSNumericSearch] == NSOrderedDescending) {
+                    bestVer = v;
+                    keepActive = f;
+                }
+            }
+        }
+    }
+
+    // 3) 删除其余一切：其它已启用文件、以及除"待签名暂存"之外的所有暂存文件。
+    //    这一步同时修掉历史遗留（目录里已经躺着多份已签名 dylib 的情况）。
+    for (NSString *f in files) {
+        if ([f isEqualToString:keepActive]) continue;
+        if ([f isEqualToString:desiredStaged]) continue;   // 等用户签名
+        if (!keepActive && LCProxyIsDisabledName(f)) continue; // 没有任何可用版本时保留暂存
+        NSString *full = [dir stringByAppendingPathComponent:f];
+        if ([fm removeItemAtPath:full error:nil]) {
             [self diag:@"[清理] %@", f];
         }
     }
+
+    if (!keepActive) {
+        [self diag:@"[警告] 目录中暂无已启用的 dylib；请签名 %@ 后重开本控制台。", desiredStaged];
+    }
+    return keepActive;
 }
 
 struct lc_code_signature_command {
@@ -295,66 +406,74 @@ static BOOL LCProxyCodeSignatureValid(NSString *path) {
         return [self diagnostics];
     }
 
+    // ★ 新版必须下载为 "<资产名>.disabled"，而不是直接落到正式名。
+    //
+    // 直接落正式名会让"新版"与"旧版"在 Tweaks 目录里共存 —— TweakLoader 会加载每一个
+    // dylib，于是同名 ObjC 类被注册两次 → 打开任何 App 都闪退。而 .disabled 结尾会被
+    // TweakLoader 跳过，同时 LiveContainer 的签名页仍会给它签名（先剥 .disabled 再判
+    // .dylib），所以用户照常签名即可，旧版在此期间继续可用。
     NSString *normalDst = [normalTweaks stringByAppendingPathComponent:asset];
-    if (![[NSFileManager defaultManager] fileExistsAtPath:normalDst]) {
+    NSString *normalStaged = [normalDst stringByAppendingString:@".disabled"];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:normalDst] &&
+        ![[NSFileManager defaultManager] fileExistsAtPath:normalStaged]) {
         stage([NSString stringWithFormat:@"下载 %@…", asset], -1);
         if (![self downloadAsset:asset toDirectory:normalTweaks]) {
             [self diag:@"下载失败。"];
             return [self diagnostics];
+        }
+        // 下载器落的是正式名；立刻转为 .disabled 暂存，避免与旧版共存。
+        if ([[NSFileManager defaultManager] fileExistsAtPath:normalDst]) {
+            [[NSFileManager defaultManager] removeItemAtPath:normalStaged error:nil];
+            if ([[NSFileManager defaultManager] moveItemAtPath:normalDst toPath:normalStaged error:nil]) {
+                [self diag:@"[暂存] 新版已下载为 %@（不会被加载，等待签名）", normalStaged.lastPathComponent];
+            }
         }
         gDownloadedNew = YES;
     } else {
         [self diag:@"普通 Tweaks 已存在：%@", asset];
     }
 
-    // 只复制用户已签名的 dylib 到共享 App 目录。
-    BOOL normalSigned = LCProxyCodeSignatureValid(normalDst);
+    // ★ 先让私有目录满足"最多一个已启用 dylib"的不变量，并以它的结果为准决定共享目录。
+    // 历史遗留：目录里可能已经躺着多份已签名 dylib —— 那正是"签名后打开任何 App 都闪退"
+    // 的原因。这一步就地修掉它，用户不需要手动删除任何文件。
+    NSString *normalActive = [self enforceSingleActiveDylibIn:normalTweaks desiredAsset:asset];
+    BOOL normalSigned = normalActive.length > 0 &&
+        LCProxyCodeSignatureValid([normalTweaks stringByAppendingPathComponent:normalActive]);
+
     if (normalSigned) {
-        [self diag:@"[签名] %@ 已签名", asset];
-        if (sharedTweaks) {
-            NSString *sharedDst = [sharedTweaks stringByAppendingPathComponent:asset];
-            BOOL sharedExists = [[NSFileManager defaultManager] fileExistsAtPath:sharedDst];
-            BOOL sharedSigned = sharedExists && LCProxyCodeSignatureValid(sharedDst);
+        [self diag:@"[签名] 当前启用：%@", normalActive];
+        if (![normalActive isEqualToString:asset]) {
+            [self diag:@"[提示] 新版 %@ 尚未签名，当前仍在使用 %@。请在 LiveContainer 的 Tweaks 页签名后重开本控制台。", asset, normalActive];
+        }
+    } else {
+        [self diag:@"[签名] %@ 尚未签名（已暂存为 .disabled，不会被加载）。请在 LiveContainer 的 Tweaks 页签名后重新打开本控制台。", asset];
+    }
+
+    // 共享目录：只复制**已签名的当前启用版本**，并同样收敛到"最多一个已启用"。
+    if (sharedTweaks) {
+        if (normalSigned) {
+            NSString *sharedDst = [sharedTweaks stringByAppendingPathComponent:normalActive];
+            BOOL sharedSigned = [[NSFileManager defaultManager] fileExistsAtPath:sharedDst] &&
+                LCProxyCodeSignatureValid(sharedDst);
             if (!sharedSigned) {
                 NSError *err = nil;
-                if (sharedExists) [[NSFileManager defaultManager] removeItemAtPath:sharedDst error:&err];
-                if ([[NSFileManager defaultManager] copyItemAtPath:normalDst toPath:sharedDst error:&err]) {
+                [[NSFileManager defaultManager] removeItemAtPath:sharedDst error:nil];
+                if ([[NSFileManager defaultManager] copyItemAtPath:[normalTweaks stringByAppendingPathComponent:normalActive]
+                                                            toPath:sharedDst error:&err]) {
                     [self diag:@"[复制] 已签名 dylib -> 共享 App: %@", sharedDst];
-                    // 复制到共享目录是给其它 guest App 用的，不影响控制台进程自身
-                    // 的 dylib 注入；不要置 gDownloadedNew，否则用户签名后还要
-                    // 重复打开两次才能进入控制台。
+                    // 复制到共享目录是给其它 guest App 用的，不影响控制台进程自身的 dylib
+                    // 注入；不要置 gDownloadedNew，否则用户签名后还要重复打开两次。
                 } else {
                     [self diag:@"[复制] 到共享 App 失败: %@", err.localizedDescription ?: @"?"];
                 }
             } else {
-                [self diag:@"共享 App 已有已签名 dylib：%@", asset];
+                [self diag:@"共享 App 已有已签名 dylib：%@", normalActive];
             }
         }
-    } else {
-        [self diag:@"[签名] %@ 尚未签名。请在 LiveContainer 的 Tweaks 页签名后重新打开本控制台。", asset];
-    }
-
-    // 清理策略：只清理"已被更新的已签名版本取代"的旧文件。
-    // 关键：新下载的版本在用户签名之前绝不能被当作可用的替代品——以前的写法是
-    // [self cleanOldDylibsIn:sharedTweaks keep:(sharedSigned ? asset : nil)]，当新版
-    // 尚未签名时 keep=nil 会把共享目录里**所有** LCProxyControl-*.dylib 删光；
-    // 私有目录同样会因为 keep:asset（未签名新版）而删掉旧的已签名版本。结果是
-    // 用户每次打开控制台下载新版后，共享 App 与私有 App 同时失去可用 dylib，
-    // 必须完成"签名 + 重开控制台"才恢复。现在未签名时什么都不删。
-    if (normalSigned) {
-        [self cleanOldDylibsIn:normalTweaks keep:asset];
-    } else {
-        [self diag:@"[清理] 新版尚未签名，保留私有目录中已有的已签名 dylib"];
-    }
-    if (sharedTweaks) {
-        // 共享目录只保留已签名的当前版本；当前版本未就位或未签名时保持原样。
-        NSString *sharedDst = [sharedTweaks stringByAppendingPathComponent:asset];
-        BOOL sharedSigned = [[NSFileManager defaultManager] fileExistsAtPath:sharedDst] && LCProxyCodeSignatureValid(sharedDst);
-        if (sharedSigned) {
-            [self cleanOldDylibsIn:sharedTweaks keep:asset];
-        } else {
-            [self diag:@"[清理] 共享目录未就位/未签名，保留其中已有的已签名 dylib（共享 App 仍可加载）"];
-        }
+        // 无论私有侧是否已签名，共享目录都必须收敛到"最多一个已启用"，
+        // 否则共享 App 同样会因为两份同名映像而闪退。
+        [self enforceSingleActiveDylibIn:sharedTweaks
+                             desiredAsset:(normalSigned ? normalActive : asset)];
     }
 
     if (!normalSigned) {

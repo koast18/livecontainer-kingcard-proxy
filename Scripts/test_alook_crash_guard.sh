@@ -156,4 +156,27 @@ grep -q "upstreamDiag" "Tweak/Sources/LCProxyKing.m" \
 grep -q "tunnelNoData" "Tweak/Sources/LCProxyKing.m" \
     || fail "upstreamDiag no longer reports tunnelNoData"
 
+# --- 升级期"两份 dylib 共存"必须被结构性排除 ---
+#
+# LiveContainer 的 TweakLoader 会加载 Tweaks 目录里的**每一个** dylib。新旧两份同时存在
+# 时，同一个进程会进入两个 LCProxyControl 映像 —— 同名 ObjC 类注册两次、另一份的实现与
+# 实例变量被交叉使用 → **打开任何 App 都闪退**。实测出现过（同一 pid 先后加载 0.5.57 与
+# 0.5.56）。因此不变量是：**每个 Tweaks 目录最多只能有一个已启用（非 .disabled）的
+# LCProxyControl-*.dylib**。
+AUTOUPDATER="ConsoleApp/AutoUpdater.m"
+grep -q "enforceSingleActiveDylibIn" "$AUTOUPDATER" \
+    || fail "AutoUpdater lost the single-active-dylib invariant enforcer (two copies can coexist)"
+grep -q "dylib.disabled" "$AUTOUPDATER" \
+    || fail "AutoUpdater no longer stages the new dylib as .disabled (old+new would coexist)"
+grep -q "lcProxyControlFilesIn" "$AUTOUPDATER" \
+    || fail "AutoUpdater lost the enumerator that also matches .dylib.disabled files"
+# 旧的"仅在后缀为 .dylib 时清理"的写法必须不复存在：它既漏掉 .dylib.disabled，
+# 又只在"新版已签名"时才清理，导致未签名期间新旧共存。
+if grep -q "cleanOldDylibsIn" "$AUTOUPDATER"; then
+    fail "AutoUpdater reintroduced the conditional cleanOldDylibsIn (old+new coexist while unsigned)"
+fi
+if grep -q 'hasSuffix:@".dylib"\] && !\[f isEqualToString:keep\]' "$AUTOUPDATER"; then
+    fail "AutoUpdater cleanup again ignores .dylib.disabled files"
+fi
+
 echo "Alook crash guard static checks OK"
