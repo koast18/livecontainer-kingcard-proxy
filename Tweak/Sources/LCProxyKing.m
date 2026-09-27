@@ -1646,6 +1646,7 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
         // 此刻转发器内实际的代理节点数：池为 0 就是"清空型"故障的直接证据。
         d[@"liveHttpPool"] = @(stats.live_http_pool);
         d[@"liveHttpsPool"] = @(stats.live_https_pool);
+        d[@"clientRejections"] = @(stats.client_rejections);
         NSMutableArray *hosts = [NSMutableArray array];
         int hostCount = kp_forwarder_direct_host_count(self.forwarder);
         for (int i = 0; i < hostCount && i < 16; i++) {
@@ -1711,6 +1712,8 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
         // 此刻池内实际节点数（0 = 清空型故障正在发生）。
         d[@"liveHttpPool"] = @(stats.live_http_pool);
         d[@"liveHttpsPool"] = @(stats.live_https_pool);
+        // 并发槽位耗尽被拒的次数：转发器"一慢就全拒"的直接证据。
+        d[@"statClientRejections"] = @(stats.client_rejections);
 
         NSMutableArray *directHosts = [NSMutableArray array];
         int hostCount = kp_forwarder_direct_host_count(self.forwarder);

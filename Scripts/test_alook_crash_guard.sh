@@ -100,4 +100,29 @@ grep -q "LCProxyRecordSwallowedException(@\"applyRuntimeSnapshot\"" "$CONFIG" \
 grep -q "swallowedExceptions" "$SERVER" \
     || fail "/api/status no longer exposes swallowedExceptions"
 
+# --- 上游 connect 必须真超时（否则"一慢就全拒"）---
+#
+# SO_SNDTIMEO / SO_RCVTIMEO 只约束 send/recv，**不约束 connect()**：阻塞 socket 上的
+# connect 会等到内核 TCP 握手超时（可达 ~75s）。于是"10 秒超时"名不副实 —— 单节点最坏
+# 占住 client 线程 ~75s，一次转发试 4 个节点最坏 ~300s，而 client 槽位上限只有 64。
+# 上游一慢，槽位立刻被等待 connect 的线程占满，转发器从"慢"退化为"对一切新连接回 503"，
+# 而 running / listenFdValid / 凭证池 / 链端口在 status 里全部正常 —— 实测形态就是
+# activeForwarderClients 停在 64、statHttpRequests=0、完全无法上网。
+grep -q "kp_connect_with_timeout" "$CORE" \
+    || fail "KPKIngCore.c lost the real-timeout connect helper"
+grep -q "O_NONBLOCK" "$CORE" \
+    || fail "KPKIngCore.c upstream connect is blocking again (timeout not enforced)"
+grep -q "SO_ERROR" "$CORE" \
+    || fail "KPKIngCore.c non-blocking connect does not check SO_ERROR"
+grep -q "kp_connect_with_timeout(fd, ai->ai_addr" "$CORE" \
+    || fail "kp_connect_host no longer routes through the timeout-enforcing connect"
+if grep -q "if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) break;" "$CORE"; then
+    fail "KPKIngCore.c calls blocking connect() directly again (SO_SNDTIMEO cannot bound it)"
+fi
+# 槽位耗尽必须可观测：否则"一慢就全拒"在 status 里只剩 activeForwarderClients 一条线索。
+grep -q "stat_client_rejections" "$CORE" \
+    || fail "KPKIngCore.c no longer counts client-slot rejections"
+grep -q "statClientRejections" "Tweak/Sources/LCProxyKing.m" \
+    || fail "/api/status no longer exposes statClientRejections"
+
 echo "Alook crash guard static checks OK"

@@ -81,6 +81,64 @@
 心跳事件会写入 App Group 的 `kingcard-refresh.log`（`src=heartbeat-heal` /
 `heartbeat-repin` / `emergency-heal`），因此一次复现即可从任意控制台看到自愈全过程。
 
+### 2.11 v0.5.68：上游 connect 超时名不副实 → 槽位耗尽 → "一慢就全拒"
+
+**真机数据（v0.5.67，共享 App `com.ld.TakeBrowser`，pid 96747）把所有其它可能性都排除干净了：**
+
+| 字段 | 值 | 结论 |
+|---|---|---|
+| `chainPortMatches` / `chainProxyPort` = `forwarderPort` | `1` / `64179` = `64179` | 链端口正确 → §2.10 的缺口已修复 |
+| `liveHttpPool` / `liveHttpsPool` | `4` / `4` | 池**非空** |
+| `statPoolEmpty` | `0` | 无"清空型"故障 |
+| `statRefreshCalls` | **`2`**（历史基线 1341） | 取号风暴彻底消失 |
+| `lastRefreshSuccess` / `lastError` | `true` / `""` | 无错误 |
+| `swallowedExceptions` | `[]` | 本 tweak 未出错 |
+| `heartbeatChainRepairCount` | `0` | 自愈未被触发 |
+| **`activeForwarderClients`** | **`64`** | ← **就是这里** |
+
+`KP_FORWARDER_MAX_CLIENTS` 恰好是 **64**，而 `statHttpsConnects` 仅 **66**：
+**64 个客户端槽位被占满且不释放 → 转发器对一切新连接回 503。**
+
+**根因：`SO_SNDTIMEO` / `SO_RCVTIMEO` 不约束 `connect()`。**
+
+`kp_connect_host` 原本这样"设置超时"：
+
+```c
+setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) break;
+```
+
+但这两个选项**只约束 `send`/`recv`，不约束 `connect`**（POSIX/BSD 语义）。阻塞 socket 上的
+`connect` 会一直等到内核 TCP 握手超时（实测可达 **~75 秒**）。于是：
+
+- 单个上游节点最坏占住 client 线程 **~75s**（而非预期的 10s）；
+- 一次转发要试 4 个节点 → 最坏 **~300s**；
+- 而槽位上限只有 **64**。
+
+上游一慢，槽位立刻被"正在等待 connect"的线程占满，转发器从"慢"**退化为"对一切新连接回
+503"** —— 也就是"完全无法上网"，而 `running` / `listenFdValid` / 凭证池 / 链端口在
+`/api/status` 里**全部正常**，只有 `activeForwarderClients` 停在 64。
+
+这同时解释了 `statRefreshCalls` 只有 2 的疑点：若连接是"试完 4 个节点后失败"，每次都会触发
+刷新回调，应接近 66 次；只有 2 次说明线程**卡在池循环内部**（connect / recv 的长等待里），
+根本没走到刷新那一步。
+
+**修复。**
+
+1. **新增 `kp_connect_with_timeout()`**：非阻塞 `connect` + `poll` + `SO_ERROR` 判定，
+   完成后恢复阻塞模式（其余代码依赖阻塞 `send`/`recv` + `SO_RCVTIMEO` 的既有语义）。
+   取不到原 fd 标志或 `F_SETFL` 失败时**退回阻塞 connect**，不引入新的失败模式。
+   效果：单节点耗时上限从 ~75s 降到名义值 10s，槽位周转快约 7 倍。
+2. **新增 `stat_client_rejections`** 并暴露为 `king.statClientRejections` —— 槽位耗尽此前
+   在 status 里几乎不可见（只有 `activeForwarderClients` 停在 64 一条线索）。
+
+> 仍待真机确认：本修复解决"一慢就全拒"的退化，但 `lastHealthCheckOk: false` 说明
+> **单次探测也无法通过转发器** → 上游数据面（`116.130.x.x:8091` 集群）本身是否可用仍需
+> 验证。注意最新一次取号返回 `bProxy=0`（此前多为 `1`）；该字段目前只记录、不参与决策。
+> 另：`trafficLogTail` 里最后一次成功转发是约 27 小时前，且 `trafficLogging: false`，
+> 因此**目前没有任何"私有 App 此刻正常"的直接证据**，同网 A/B 对照仍需补做。
+
 ### 2.10 v0.5.67：代理链端口陈旧导致「status 全绿却完全连不上」+ 心跳自愈
 
 > **真机验证请直接照做 [`docs/REAL-DEVICE-VERIFICATION.md`](./REAL-DEVICE-VERIFICATION.md)**

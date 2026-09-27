@@ -11,6 +11,7 @@ extern void proxychains_write_log(char *str, ...);
 
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -538,6 +539,62 @@ int kp_parse_http_response(const char *buf, size_t len,
 
 // ---------- POSIX socket 工具 ----------
 
+// 带**真实超时**的 connect。
+//
+// 为什么不能只靠 SO_SNDTIMEO：POSIX/BSD 里 SO_SNDTIMEO / SO_RCVTIMEO 只约束
+// send/recv，**不约束 connect()**。阻塞 socket 上的 connect 会一直等到内核的 TCP
+// 握手超时（实测可达 ~75 秒）。于是上层传进来的 "10 秒超时" 名不副实：
+//   · 单个上游节点最坏占住 client 线程 ~75s；
+//   · 一次转发要试 4 个节点 → 最坏 ~300s；
+//   · 而转发器的 client 槽位上限只有 64（KP_FORWARDER_MAX_CLIENTS）。
+// 结果：上游一慢，64 个槽位立刻被"正在等待 connect"的线程占满，转发器从"慢"直接
+// 退化为"对一切新连接回 503"—— 也就是"完全无法上网"，而 /api/status 里
+// running / listenFdValid / 凭证池 / 链端口全部正常，只有 activeForwarderClients
+// 停在 64。这正是实测到的形态。
+//
+// 改为非阻塞 connect + poll，让超时真正生效；完成后恢复阻塞模式，因为其余代码
+// 依赖阻塞 send/recv + SO_RCVTIMEO 的既有语义。
+static int kp_connect_with_timeout(int fd, const struct sockaddr *addr,
+                                   socklen_t addrlen, int timeout_ms) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) {
+        // 拿不到原标志就退回阻塞 connect（保持旧行为，不引入新失败模式）。
+        return connect(fd, addr, addrlen);
+    }
+    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+        return connect(fd, addr, addrlen);
+    }
+    int rc = connect(fd, addr, addrlen);
+    if (rc != 0 && (errno == EINPROGRESS || errno == EINTR)) {
+        struct pollfd pfd;
+        pfd.fd = fd;
+        pfd.events = POLLOUT;
+        pfd.revents = 0;
+        int wait_ms = timeout_ms > 0 ? timeout_ms : 10000;
+        int pr;
+        do {
+            pr = poll(&pfd, 1, wait_ms);
+        } while (pr < 0 && errno == EINTR);
+        if (pr > 0) {
+            int soerr = 0;
+            socklen_t slen = sizeof(soerr);
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &slen) == 0 && soerr == 0) {
+                rc = 0;
+            } else {
+                errno = soerr ? soerr : ECONNREFUSED;
+                rc = -1;
+            }
+        } else {
+            // 超时：poll 返回 0，或出错。必须显式失败，否则会拿着未连上的 fd 继续用。
+            if (pr == 0) errno = ETIMEDOUT;
+            rc = -1;
+        }
+    }
+    // 恢复阻塞模式：后续 send/recv 依赖阻塞语义 + SO_RCVTIMEO。
+    (void)fcntl(fd, F_SETFL, flags);
+    return rc;
+}
+
 static int kp_connect_host(const char *host, int port, int timeout_ms) {
     kp_dbg("[conn] 开始连接 %s:%d timeout=%dms", host, port, timeout_ms);
     struct addrinfo hints, *res = NULL;
@@ -563,7 +620,7 @@ static int kp_connect_host(const char *host, int port, int timeout_ms) {
             setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
             setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
         }
-        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) break;
+        if (kp_connect_with_timeout(fd, ai->ai_addr, (socklen_t)ai->ai_addrlen, timeout_ms) == 0) break;
         KP_CLOSESOCK(fd);
         fd = -1;
     }
@@ -1210,6 +1267,10 @@ struct kp_forwarder {
     //     （v0.5.60 已移除）。
     //   · pool_empty_count 为 0 而连接仍失败 → 池内有节点但都被拒（上游/凭证失效）。
     uint64_t stat_pool_empty;
+    // 因并发槽位耗尽而被回 503 的次数（见 KP_FORWARDER_MAX_CLIENTS）。
+    // "一慢就全拒"这种退化此前在 status 里几乎不可见（只有 activeForwarderClients
+    // 停在 64 这一条线索），加上计数器后可一眼确认。
+    uint64_t stat_client_rejections;
 
     char direct_host_log[KP_DIRECT_HOST_LOG_MAX][128];
     int direct_host_log_count;
@@ -2380,6 +2441,7 @@ static void *kp_forwarder_run(void *arg) {
         }
         pthread_mutex_unlock(&fw->client_lock);
         if (over) {
+            kp_stat_increment(&fw->stat_client_rejections);
             char *msg = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
             (void)send(client, msg, (int)strlen(msg), 0);
             KP_CLOSESOCK(client);
@@ -2702,6 +2764,7 @@ void kp_forwarder_get_stats(kp_forwarder *fw, kp_forwarder_stats *stats) {
     stats->refresh_calls = __atomic_load_n(&fw->stat_refresh_calls, __ATOMIC_RELAXED);
     stats->proxy_errors = __atomic_load_n(&fw->stat_proxy_errors, __ATOMIC_RELAXED);
     stats->pool_empty = __atomic_load_n(&fw->stat_pool_empty, __ATOMIC_RELAXED);
+    stats->client_rejections = __atomic_load_n(&fw->stat_client_rejections, __ATOMIC_RELAXED);
     // 实时池大小必须在 cred_mutex 下读取。锁序与既有代码一致：
     // loadCachedStateIntoForwarder 就是"持有 self.lock 时调用 kp_forwarder_set_king_state
     // （其内部取 cred_mutex）"，即 self.lock → cred_mutex；本函数同样在 self.lock 下被调用。
