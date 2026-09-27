@@ -20,7 +20,7 @@
           "version": "0.5.64",
           "date": "2026-09-27T11:14:37Z",
           "downloadURL": "https://gh-proxy.com/https://github.com/koast18/livecontainer-kingcard-proxy/releases/download/v0.5.64/LiveProxyConsole-0.5.64.ipa",
-          "localizedDescription": "修复无法联网的根因（强制刷新清空代理池）+闪退（阻塞回调、重复加载dylib）；新增 statPoolEmpty 诊断，可一眼区分"没有凭证"与"上游拒绝"。"
+          "localizedDescription": "修复无法联网的根因（强制刷新清空代理池）+闪退（阻塞回调、重复加载dylib）；新增 statPoolEmpty 诊断，可一眼区分「没有凭证」与「上游拒绝」。"
         }
       ]
     }
