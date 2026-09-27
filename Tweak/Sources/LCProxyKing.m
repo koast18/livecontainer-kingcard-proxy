@@ -117,6 +117,11 @@ NSString *const LCProxyForwarderLifecycleChangedNotification = @"LCProxyForwarde
 - (void)scheduleRefreshRetryAfter:(NSTimeInterval)delay;
 - (BOOL)stateHasFreshCredentials:(NSDictionary *)state;
 - (BOOL)stateHasFreshCredentials:(NSDictionary *)state matchingSettings:(NSDictionary *)settings;
+// leadTime = 0 表示"此刻是否仍可用"（装载缓存/判断能否继续服务时必须用这个）；
+// leadTime = LCProxyKingRefreshLeadTime 表示"是否需要现在续期"（前瞻性判断）。
+- (BOOL)stateHasFreshCredentials:(NSDictionary *)state
+                matchingSettings:(NSDictionary *)settings
+                        leadTime:(NSTimeInterval)leadTime;
 - (NSArray<NSString *> *)validatedProxyPool:(id)value;
 - (NSString *)credentialInputSignatureForSettings:(NSDictionary *)settings;
 - (void)clearForwarderKingState;
@@ -671,7 +676,10 @@ static const NSTimeInterval LCProxyKingLifecycleNotifyMinInterval = 5.0;
         [self.lock unlock];
     }
     NSDictionary *settings = [self settingsSnapshot];
-    if (![self stateHasFreshCredentials:state matchingSettings:settings]) {
+    // leadTime:0 —— 只判"此刻是否还能用"。距过期还有 1 分钟的凭证现在完全可用，若按
+    // 2 分钟余量判为不可用而清空代理池，就把"即将降级"变成"立刻全断"，且要等下一次取号
+    // 成功才恢复。转发器 fail-closed 绝不直连，所以用旧凭证最坏只是被上游拒绝。
+    if (![self stateHasFreshCredentials:state matchingSettings:settings leadTime:0]) {
         [self clearForwarderKingState];
         return;
     }
@@ -757,6 +765,24 @@ static const NSTimeInterval LCProxyKingLifecycleNotifyMinInterval = 5.0;
 }
 
 - (BOOL)stateHasFreshCredentials:(NSDictionary *)state matchingSettings:(NSDictionary *)settings {
+    return [self stateHasFreshCredentials:state
+                        matchingSettings:settings
+                                leadTime:LCProxyKingRefreshLeadTime];
+}
+
+// leadTime 的语义：要求凭证在**未来 leadTime 秒内**仍然有效。
+//
+// 两种用法必须区分开，混用会造成"提前清空"这一类自伤：
+//   · leadTime = LCProxyKingRefreshLeadTime(2 分钟)：用于判断"是否需要现在就去续期"
+//     （isReady、是否需要主动刷新），是**前瞻性**判断。
+//   · leadTime = 0：用于判断"这批凭证**此刻**还能不能用"。装载缓存到转发器时必须用
+//     这个 —— 距过期还有 1 分钟的凭证**此刻完全可用**，若按 2 分钟余量判为不可用而
+//     清空代理池，就等于把"即将降级"变成"立刻全断"（且要等到下一次取号成功才恢复）。
+//     转发器本身是 fail-closed（绝不直连），所以用旧凭证最坏只是被上游拒绝，不会
+//     绕过王卡通道、不会消耗通用流量。
+- (BOOL)stateHasFreshCredentials:(NSDictionary *)state
+                matchingSettings:(NSDictionary *)settings
+                        leadTime:(NSTimeInterval)leadTime {
     NSString *guid = [state[@"guid"] isKindOfClass:[NSString class]] ? state[@"guid"] : nil;
     NSString *token = [state[@"token"] isKindOfClass:[NSString class]] ? state[@"token"] : nil;
     NSString *qkey = [state[@"key"] isKindOfClass:[NSString class]] ? state[@"key"] : nil;
@@ -773,8 +799,8 @@ static const NSTimeInterval LCProxyKingLifecycleNotifyMinInterval = 5.0;
     double now = [[NSDate date] timeIntervalSince1970];
     NSNumber *tokenExpireEpoch = [state[@"tokenExpireEpoch"] isKindOfClass:[NSNumber class]] ? state[@"tokenExpireEpoch"] : nil;
     NSNumber *proxyExpireEpoch = [state[@"proxyExpireEpoch"] isKindOfClass:[NSNumber class]] ? state[@"proxyExpireEpoch"] : nil;
-    if (!tokenExpireEpoch || tokenExpireEpoch.doubleValue <= now + LCProxyKingRefreshLeadTime) return NO;
-    if (!proxyExpireEpoch || proxyExpireEpoch.doubleValue <= now + LCProxyKingRefreshLeadTime) return NO;
+    if (!tokenExpireEpoch || tokenExpireEpoch.doubleValue <= now + leadTime) return NO;
+    if (!proxyExpireEpoch || proxyExpireEpoch.doubleValue <= now + leadTime) return NO;
     return YES;
 }
 
@@ -969,7 +995,11 @@ static const NSTimeInterval LCProxyKingLivenessInterval = 5.0;
         if (![obj isKindOfClass:[NSDictionary class]]) continue;
         double ts = [obj[@"ts"] isKindOfClass:[NSNumber class]] ? [obj[@"ts"] doubleValue] : -1;
         if (ts <= bestTs) continue;
-        if (![self stateHasFreshCredentials:obj matchingSettings:settings]) continue;
+        // leadTime:0 —— 这里要挑的是"**此刻仍然可用**的最新一条记录"，不是"是否该续期"。
+        // 若用 2 分钟余量：凭证有效期的最后 2 分钟内，最新记录会被跳过；而更旧的记录
+        // 过期更早、同样被跳过 → loadState 返回 nil → 装载缓存时清空代理池。每个凭证
+        // 周期都会出现一次这样的"提前全断"窗口，且要等下一次取号成功才恢复。
+        if (![self stateHasFreshCredentials:obj matchingSettings:settings leadTime:0]) continue;
         best = [obj mutableCopy];
         bestTs = ts;
     }
@@ -1490,8 +1520,13 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
         [self loadCachedStateIntoForwarder];
         [self startRefreshTimer];
     } else if (![self stateHasFreshCredentials:[self loadState]
-                               matchingSettings:[self settingsSnapshot]]) {
-        // 确实没有任何可用凭证才清空转发器（fail-closed，但绝不直连）。
+                               matchingSettings:[self settingsSnapshot]
+                                       leadTime:0]) {
+        // 确实没有任何**此刻还能用**的凭证才清空转发器（fail-closed，但绝不直连）。
+        //
+        // leadTime:0 是必须的：取号失败本身不该导致断网 —— 只要手上凭证此刻仍有效，
+        // 就继续用它服务，等下一次取号成功再换。若按 2 分钟余量判为"不可用"而清空，
+        // 一次取号失败就会把可用状态打成全断（这正是 v0.5.60 那类正反馈的形态）。
         [self clearForwarderKingState];
         [self scheduleRefreshRetryAfter:15.0];
     }
@@ -1575,6 +1610,9 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
         d[@"refreshCalls"] = @(stats.refresh_calls);
         d[@"proxyErrors"] = @(stats.proxy_errors);
         d[@"poolEmpty"] = @(stats.pool_empty);
+        // 此刻转发器内实际的代理节点数：池为 0 就是"清空型"故障的直接证据。
+        d[@"liveHttpPool"] = @(stats.live_http_pool);
+        d[@"liveHttpsPool"] = @(stats.live_https_pool);
         NSMutableArray *hosts = [NSMutableArray array];
         int hostCount = kp_forwarder_direct_host_count(self.forwarder);
         for (int i = 0; i < hostCount && i < 16; i++) {
@@ -1636,6 +1674,9 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
         d[@"statProxyErrors"] = @(stats.proxy_errors);
         // 决定性判据：连接到达时代理池为空的次数。
         d[@"statPoolEmpty"] = @(stats.pool_empty);
+        // 此刻池内实际节点数（0 = 清空型故障正在发生）。
+        d[@"liveHttpPool"] = @(stats.live_http_pool);
+        d[@"liveHttpsPool"] = @(stats.live_https_pool);
 
         NSMutableArray *directHosts = [NSMutableArray array];
         int hostCount = kp_forwarder_direct_host_count(self.forwarder);

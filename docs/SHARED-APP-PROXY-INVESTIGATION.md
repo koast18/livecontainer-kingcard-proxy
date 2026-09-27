@@ -81,6 +81,54 @@
 心跳事件会写入 App Group 的 `kingcard-refresh.log`（`src=heartbeat-heal` /
 `heartbeat-repin` / `emergency-heal`），因此一次复现即可从任意控制台看到自愈全过程。
 
+### 2.8 v0.5.65：修正 leadTime 语义混用（提前清空代理池）+ 撤回重复映像守卫 + 实时池大小
+
+**(a) leadTime 语义混用 —— 与 §2.5 同族的"提前清空"。**
+
+`stateHasFreshCredentials:` 原本把两个不同的问题混成一个判断：
+
+| 问题 | 正确语义 |
+|---|---|
+| 是否需要**现在就去续期**？ | 前瞻性：要求凭证在未来 `LCProxyKingRefreshLeadTime`(2 分钟)内仍有效 |
+| 这批凭证**此刻还能不能用**？ | 时点性：只要求"现在没过期"（`leadTime = 0`） |
+
+原实现一律用 2 分钟余量，于是三个"时点性"调用点被误判：
+
+1. **`loadState`** —— 从追加日志里挑**最新的可用记录**。在凭证有效期的最后 2 分钟里，
+   最新记录被跳过；更旧的记录过期更早、同样被跳过 → 返回 `nil`。
+   **每个凭证周期都会出现这样一次** 2 分钟窗口。
+2. **`loadCachedStateIntoForwarder`** —— 拿到 `nil`/不新鲜就 `clearForwarderKingState`
+   → **代理池被清空**。
+3. **取号失败路径**（`finishRefreshWithState`）—— 一次取号失败就把"此刻仍有效"的凭证
+   判为不可用并清空，即**一次网络抖动 = 立刻全断**。
+
+三处合起来：距过期还有 1 分钟的凭证现在完全可用，却按"2 分钟内就要过期"被判为不可用而
+清空，把"即将降级"变成"立刻全断"，要等下一次取号成功才恢复。转发器本身是 fail-closed
+（绝不直连），所以继续用旧凭证最坏只是被上游拒绝，**不会**绕过王卡通道、不会消耗通用
+流量 —— 提前清空严格更差。
+
+修正：`stateHasFreshCredentials:matchingSettings:leadTime:` 显式区分两种语义；上述三个
+时点性调用点传 `leadTime:0`；前瞻性调用点（`isReady`、`hasFreshCachedState`、
+`ensureCredentialsReady`、续期快速路径）保留 2 分钟余量，因此"提前 2 分钟续期"的既有
+行为完全不变。
+
+**(b) 撤回 v0.5.63 的"重复映像守卫"（它比重复本身更危险）。**
+
+每一份 dylib 都有**自己独立的一套 C 层全局变量**（proxychains 链、per-process override
+端口、fishhook 后的 `connect`）。两份的 C 构造函数都会各自执行（不受 ObjC 层控制），且
+后加载者通常赢下 `connect` 的符号解析。若让位的那份不执行
+`lcproxy_control_set_proxy_override`，**它生效的 hook 就会回落到 conf 里的占位端口
+`127.0.0.1:18080`（无人监听）→ 全部连接被拒** —— 把"能用但浪费"变成"彻底断网"。
+
+两份都完整运行则自洽：各自的 hook 读各自的 override，指向各自重建的转发器；代价只是
+多一个转发器/心跳/Web 服务与略高的取号频率。真正消除重复靠 `AutoUpdater` 未签名时不再
+清空已签名副本（v0.5.49 起）+ 升级时手动清理旧 dylib，**不靠运行期让位**。
+
+**(c) `/api/status` 新增实时池大小。** `liveHttpPool` / `liveHttpsPool` 直接回答
+"**此刻**池子是不是空的"，比累计计数 `statPoolEmpty` 更直观 —— 池为 0 就是清空型故障
+正在发生的直接证据。读取在 `cred_mutex` 下进行，锁序与既有代码一致
+（`loadCachedStateIntoForwarder` 已是"持有 `self.lock` 时取 `cred_mutex`"）。
+
 ### 2.7 v0.5.63：删掉恒失败的重试循环 + 防重复加载
 
 **(a) 删掉恒失败的重试循环。** 回调改为恒返回 -1（异步）之后，C 层的

@@ -260,6 +260,10 @@ typedef struct {
     /// 高 → 完全没有可用凭证/代理池（凭证被清空或从未装载）；
     /// 为 0 而连接仍失败 → 池内有节点但都被拒（上游/凭证失效）。
     uint64_t pool_empty;
+    /// **此刻**转发器内实际持有的代理节点数（与上面的累计计数器互补）。
+    /// 直接回答"现在池子是不是空的"，是判定"清空型"故障最直观的证据。
+    int live_http_pool;
+    int live_https_pool;
 } kp_forwarder_stats;
 
 void kp_forwarder_get_stats(kp_forwarder *fw, kp_forwarder_stats *stats);

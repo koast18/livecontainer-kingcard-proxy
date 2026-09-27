@@ -134,28 +134,26 @@ static void LCProxyShowBanner(NSDictionary *settings) {
 __attribute__((constructor))
 static void LCProxyControlConstructor(void) {
     @autoreleasepool {
-        // ① 防重复加载（必须最先做）。
+        // ⚠️ 这里**刻意不做**"重复映像就让位"的守卫（v0.5.63 曾加过，v0.5.65 撤回）。
         //
-        // LiveContainer 的 TweakLoader 会加载 Tweaks 目录里的**每一个** dylib 文件，
-        // 而升级过程中新旧两份 LCProxyControl-*.dylib 很容易共存（新版已下载、旧版
-        // 尚未被清理）。此时两个映像会同时进入进程，后果是：
-        //   · 同一个 ObjC 类名被注册两次 —— runtime 只能选其一，另一份的方法实现与
-        //     实例变量被交叉使用 → **未定义行为 / 崩溃**；
-        //   · 两份 dispatch_once 单例 → 两个转发器、两个存活心跳、两个本地 Web 服务。
-        // 实测确实发生过：dylib-loads.log 里同一个 pid 先后加载了 0.5.57 与 0.5.56。
+        // LiveContainer 的 TweakLoader 会加载 Tweaks 目录里的每一个 dylib，升级期新旧
+        // 两份 LCProxyControl-*.dylib 可能共存（实测 dylib-loads.log 里同一个 pid 先后
+        // 加载了 0.5.57 与 0.5.56）。看起来很危险，但**让位反而更危险**：
         //
-        // 这里做一次幂等检查：若运行期已注册的 LCProxyConfig 不是本映像的类，说明另一份
-        // 已经生效，本映像整体让位 —— 不记录加载、不注册观察者、不启服务、不建转发器。
-        // 用 LCProxyConfig 作锚点是因为它在本文件已导入；NSClassFromString 返回 nil 时
-        // 保持原行为（不改变现有正常路径）。
-        Class registeredConfig = NSClassFromString(@"LCProxyConfig");
-        if (registeredConfig && registeredConfig != [LCProxyConfig class]) {
-            NSLog(@"[LCProxy] duplicate LCProxyControl image detected; skipping this copy "
-                  @"(already loaded: %@)", NSStringFromClass(registeredConfig));
-            return;
-        }
+        //   每一份 dylib 都有自己独立的一套 C 层全局变量（proxychains 链、per-process
+        //   override 端口、fishhook 后的 connect 实现）。两份的 C 构造函数都会各自执行
+        //   （那不受本文件控制），且后加载者通常赢下 connect 的符号解析。
+        //   若让位的那份不执行 lcproxy_control_set_proxy_override，它的 C 层 hook 就会
+        //   回落到 conf 里的占位端口 127.0.0.1:18080（无人监听）→ **全部连接被拒**。
+        //   即：守卫会把"能用但浪费"变成"彻底断网"。
+        //
+        // 两份都完整运行则是自洽的：各自的 hook 读各自的 override，指向各自重建的转发器。
+        // 代价只是多一个转发器/心跳/Web 服务与略高的取号频率，不影响可用性。
+        //
+        // 真正该做的消除重复：AutoUpdater 未签名时不再清空已签名副本（v0.5.49 起），
+        // 以及升级时在 Tweaks 页手动删除旧版 dylib。
 
-        // ② 最优先记录加载事实：即便后面任何一步出问题，我们也知道这个进程在什么
+        // 最优先记录加载事实：即便后面任何一步出问题，我们也知道这个进程在什么
         // 时间加载了哪个版本的 dylib。
         LCProxyRecordDylibLoad();
         // Apply persisted settings immediately. The proxychains C core is already

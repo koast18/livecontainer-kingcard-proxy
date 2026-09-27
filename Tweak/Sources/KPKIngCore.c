@@ -2702,6 +2702,13 @@ void kp_forwarder_get_stats(kp_forwarder *fw, kp_forwarder_stats *stats) {
     stats->refresh_calls = __atomic_load_n(&fw->stat_refresh_calls, __ATOMIC_RELAXED);
     stats->proxy_errors = __atomic_load_n(&fw->stat_proxy_errors, __ATOMIC_RELAXED);
     stats->pool_empty = __atomic_load_n(&fw->stat_pool_empty, __ATOMIC_RELAXED);
+    // 实时池大小必须在 cred_mutex 下读取。锁序与既有代码一致：
+    // loadCachedStateIntoForwarder 就是"持有 self.lock 时调用 kp_forwarder_set_king_state
+    // （其内部取 cred_mutex）"，即 self.lock → cred_mutex；本函数同样在 self.lock 下被调用。
+    pthread_mutex_lock(&fw->cred_mutex);
+    stats->live_http_pool = fw->http_pool.count;
+    stats->live_https_pool = fw->https_pool.count;
+    pthread_mutex_unlock(&fw->cred_mutex);
 }
 
 int kp_forwarder_direct_host_count(kp_forwarder *fw) {

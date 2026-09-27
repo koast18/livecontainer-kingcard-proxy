@@ -98,17 +98,23 @@ assert 'LCProxyRecordDylibLoad' in control and 'dylib-loads.log' in control, \
     'dylib load is not recorded to the shared App Group log'
 assert 'dylibLoadsTail' in server, '/api/status does not expose dylib load records'
 
-# 防重复加载：LiveContainer 的 TweakLoader 会加载 Tweaks 目录里的每一个 dylib，升级
-# 期间新旧两份很容易共存（实测同一 pid 先后加载了 0.5.57 与 0.5.56）。两个映像的同类名
-# 会让 runtime 二选一、另一份的 ivar/实现被交叉使用 → 未定义行为/崩溃；还会产生两个
-# 单例、两个转发器、两个心跳。构造器必须先在运行期确认"本映像才是生效的那份"。
-assert re.search(r'NSClassFromString\(@"LCProxyConfig"\)', control), \
-    'duplicate-image guard is missing from LCProxyControl constructor'
-assert re.search(r'if \(registeredConfig && registeredConfig != \[LCProxyConfig class\]\)', control), \
-    'duplicate-image guard does not compare against this image\'s own class'
+# ⚠️ 构造器**不得**加"重复映像就让位"的守卫。
+#
+# LiveContainer 的 TweakLoader 会加载 Tweaks 目录里的每一个 dylib，升级期新旧两份
+# 确实可能共存（实测同一 pid 先后加载了 0.5.57 与 0.5.56）。但**让位比重复更危险**：
+# 每一份 dylib 都有自己独立的一套 C 层全局变量（proxychains 链、per-process override
+# 端口、fishhook 后的 connect）。两份的 C 构造函数都会各自执行（不受 ObjC 层控制），
+# 后加载者通常赢下 connect 的符号解析；若让位的那份不执行
+# lcproxy_control_set_proxy_override，它生效的 hook 就会回落到 conf 里的占位端口
+# 127.0.0.1:18080（无人监听）→ **全部连接被拒**，把"能用但浪费"变成"彻底断网"。
+assert 'NSClassFromString(@"LCProxyConfig")' not in control, \
+    'a duplicate-image bail-out guard is back (risks a hard offline: override never set)'
+assert 'registeredConfig' not in control, \
+    'a duplicate-image bail-out guard is back (risks a hard offline: override never set)'
+# 移除守卫后，构造器首行副作用必须仍然是"记录加载事实"。
 _ctor = control[control.index('static void LCProxyControlConstructor(void) {'):]
-assert _ctor.index('registeredConfig') < _ctor.index('LCProxyRecordDylibLoad();'), \
-    'duplicate-image guard runs after side effects (must be the very first check)'
+assert _ctor.index('LCProxyRecordDylibLoad();') < _ctor.index('[[LCProxyConfig shared] load]'), \
+    'the constructor no longer records the dylib load before applying settings'
 
 # Persistence is best-effort: if the log is unwritable the process must keep
 # working purely in memory rather than failing closed for a write problem.
@@ -235,6 +241,24 @@ assert re.search(r'if \(self\.refreshing\) \{\s*\[self\.lock unlock\];', king), 
 assert king.count('[self clearForwarderKingState]') >= 2, \
     'clearForwarderKingState was removed entirely (no fail-closed path left)'
 
+# ⚠️ leadTime 的两种语义必须分开，混用会造成"提前清空"这一类自伤。
+#
+# LCProxyKingRefreshLeadTime(2 分钟) 是**前瞻性**判断："是否该现在续期"。
+# 而"这批凭证此刻还能不能用"必须是 leadTime:0 —— 距过期还有 1 分钟的凭证现在完全
+# 可用；若按 2 分钟余量判为不可用，就会在**每个凭证有效期的最后 2 分钟**里清空代理池
+# （loadState 挑不到记录 → 装载缓存时清空），把"即将降级"变成"立刻全断"。
+# 转发器 fail-closed 绝不直连，所以继续用旧凭证最坏只是被上游拒绝。
+assert 'leadTime:(NSTimeInterval)leadTime' in king, \
+    'stateHasFreshCredentials has no leadTime parameter (prospective vs usable conflated)'
+# 三处"此刻是否可用"的调用点必须显式传 0。
+assert king.count('matchingSettings:settings leadTime:0') >= 2, \
+    'loadState/loadCachedStateIntoForwarder do not use leadTime:0 (premature pool clearing)'
+assert 'matchingSettings:[self settingsSnapshot]\n                                       leadTime:0' in king, \
+    'the refresh-failure path does not use leadTime:0 (one failed fetch can still kill a live pool)'
+# 前瞻性调用点必须保留默认余量（不得被改成 0，否则永远不会提前续期）。
+assert re.search(r'if \(!force && state\.count && \[self stateHasFreshCredentials:state matchingSettings:settings\]\)', king), \
+    'the refresh cache-hit fast path lost its prospective (lead-time) check'
+
 # 决定性诊断计数器：连接到达时代理池为空的次数。
 # 这是区分两类"完全无法联网"的唯一可靠指标：
 #   高 → 完全没有可用凭证/池（凭证被清空或从未装载）——曾由强制刷新开头清空导致，
@@ -249,6 +273,13 @@ assert 'uint64_t pool_empty;' in Path('Tweak/Sources/KPKIngCore.h').read_text(en
 assert 'stats->pool_empty = __atomic_load_n(&fw->stat_pool_empty' in core, \
     'pool_empty is not populated by kp_forwarder_get_stats'
 assert 'd[@"statPoolEmpty"]' in king, '/api/status does not expose statPoolEmpty'
+# 实时池大小：直接回答"现在池子是不是空的"，比累计计数器更直观。
+assert 'int live_http_pool;' in Path('Tweak/Sources/KPKIngCore.h').read_text(encoding='utf-8'), \
+    'live pool size is not exposed in kp_forwarder_stats'
+assert re.search(r'pthread_mutex_lock\(&fw->cred_mutex\);\s*stats->live_http_pool = fw->http_pool\.count;', core), \
+    'live pool size is not read under cred_mutex'
+assert 'd[@"liveHttpPool"]' in king and 'd[@"liveHttpsPool"]' in king, \
+    '/api/status does not expose the live pool size'
 
 # Latency probing must stay capped so a refresh cannot stall for tens of seconds.
 assert 'KP_LATENCY_PROBE_MAX' in king, 'sequential latency probing is not capped'
