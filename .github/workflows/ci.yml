@@ -30,6 +30,9 @@ jobs:
       - name: Alook high-download crash guard static checks
         run: bash Scripts/test_alook_crash_guard.sh
 
+      - name: Diagnosis verdict unit tests
+        run: bash Scripts/test_lcproxy_diagnosis.sh
+
       - name: Async proxy relay test
         run: bash Scripts/test_async_proxy.sh
 

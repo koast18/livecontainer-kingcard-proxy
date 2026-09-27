@@ -5,6 +5,7 @@
 #import "ConsoleHTML.h"
 #import "lcproxy_bridge.h"
 #import "LCProxyKing.h"
+#import "LCProxyDiagnosis.h"
 #import "KPKIngCore.h"
 #import "Version.h"
 #include "webkit_proxy.h"
@@ -373,6 +374,39 @@ static const NSUInteger LCProxyDefaultPort = 19092;
     [server addHandlerForMethod:@"GET" path:@"/api/stats" requestClass:[GCDWebServerRequest class]
                    processBlock:^GCDWebServerResponse *(GCDWebServerRequest *request) {
         return [self json:[[LCProxyStats shared] aggregate]];
+    }];
+
+    // 统一诊断入口：把 /api/status 的原始字段**翻译成结论**，并附上跨进程现场。
+    //
+    // 存在的理由：状态字典有二十多个字段，判断"为什么连不上"需要把它们组合起来看 ——
+    // 这件事此前由我逐轮手工做，也是反复误判的直接来源。这个端点把同一套判断固化成代码：
+    // 直接给出"哪里坏了 / 下一步看什么"，并附带所有进程的状态快照以便跨进程对比。
+    [server addHandlerForMethod:@"GET" path:@"/api/diag" requestClass:[GCDWebServerRequest class]
+                   processBlock:^GCDWebServerResponse *(GCDWebServerRequest *request) {
+        NSDictionary *payload = [self configPayload];
+        NSMutableDictionary *out = [NSMutableDictionary dictionary];
+        [out addEntriesFromDictionary:LCProxyDiagnose(payload)];
+        out[@"pid"] = payload[@"pid"] ?: @0;
+        out[@"bundleId"] = payload[@"bundleId"] ?: @"";
+        out[@"version"] = payload[@"version"] ?: @"";
+        // 本进程关键现场（便于快速核对，不必再翻整个 status）。
+        NSDictionary *king = [payload[@"king"] isKindOfClass:[NSDictionary class]] ? payload[@"king"] : @{};
+        out[@"king"] = @{
+            @"forwarderPort": king[@"forwarderPort"] ?: @0,
+            @"chainProxyPort": payload[@"chainProxyPort"] ?: @0,
+            @"listenFdValid": king[@"listenFdValid"] ?: @0,
+            @"listenProbeOk": king[@"listenProbeOk"] ?: @0,
+            @"routePublished": king[@"routePublished"] ?: @0,
+            @"running": king[@"running"] ?: @0,
+            @"liveHttpPool": king[@"liveHttpPool"] ?: @0,
+            @"liveHttpsPool": king[@"liveHttpsPool"] ?: @0,
+            @"guidSource": king[@"guidSource"] ?: @"",
+            @"lastError": king[@"lastError"] ?: @"",
+            @"upstreamDiag": king[@"upstreamDiag"] ?: @{},
+        };
+        // 所有进程的现场（含私有/共享对照）——这正是"私有正常、共享不正常"的判定依据。
+        out[@"statusTail"] = [self tailOfAppGroupLog:@"kingcard-status.log" maxLines:24];
+        return [self json:out];
     }];
 
     // 一键重置凭证：丢弃共享凭证库里的缓存状态，重新领一整套全新 GUID + Q-Token + 代理池。

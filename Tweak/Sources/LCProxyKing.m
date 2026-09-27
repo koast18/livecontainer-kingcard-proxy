@@ -1895,6 +1895,10 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
     d[@"lastSource"] = self.lastSource ?: @"";
     d[@"lastError"] = self.lastError ?: @"";
     d[@"guidSource"] = guidSourceText;
+    // 路由是否已发布：为 0 时 syncFetchGuid 会直接失败、主动续期定时器被停掉。
+    // 这是"切后台/熄屏后整体断网"链路里的关键一环，此前没有暴露。
+    d[@"routePublished"] = @(self.routePublished);
+    d[@"publishedForwarderPort"] = @(self.publishedForwarderPort);
     d[@"lastDiagnostics"] = self.lastDiagnostics ?: @"";
     d[@"desiredForwarderRunning"] = @(self.desiredForwarderRunning);
     d[@"forwarderDiscardCount"] = @(self.forwarderDiscardCount);

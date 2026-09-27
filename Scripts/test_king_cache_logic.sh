@@ -675,5 +675,26 @@ assert 'kp_forwarder_is_listening(fw) == 1;' in king, \
 assert 'd[@"listenProbeOk"]' in king, \
     'the real listen-probe result is not exposed in status'
 
+# ★ 诊断必须收敛到一个"给结论"的入口，而不是让人（此前是我）逐字段手工解读。
+# 状态字段已有二十多个，把"为什么连不上"读错是本项目反复误判的直接原因。
+# /api/diag 把同一套判断固化成代码（纯函数，可在 CI 上真实运行断言）。
+assert 'routePublished' in king, 'routePublished is not exposed (core field for background breakage)'
+for _f in ('Tweak/Sources/LCProxyDiagnosis.h', 'Tweak/Sources/LCProxyDiagnosis.m',
+           'Scripts/test_lcproxy_diagnosis.m', 'Scripts/test_lcproxy_diagnosis.sh'):
+    assert Path(_f).exists(), f'diagnosis unit missing: {_f}'
+assert '/api/diag' in server, '/api/diag endpoint is missing'
+assert 'LCProxyDiagnose(payload)' in server, '/api/diag does not run the diagnosis unit'
+assert 'LCProxyDiagnosis.h' in server, '/api/diag does not import the diagnosis unit'
+_diag = Path('Tweak/Sources/LCProxyDiagnosis.m').read_text(encoding='utf-8')
+# 关键判据必须都在：真监听、链端口、路由发布、零字节上游、池为空、引导身份。
+for _needle in ('listenProbeOk', 'chainProxyPort', 'routePublished', 'recvFail',
+                'liveHttpPool', 'guidSource'):
+    assert _needle in _diag, f'diagnosis unit no longer checks {_needle}'
+assert 'LCProxyDiagLevelBad' in _diag and 'LCProxyDiagLevelWarn' in _diag, \
+    'diagnosis unit no longer distinguishes bad from warn'
+# 纯函数约束：诊断不得自己取锁/读文件/发请求（否则它就不能在 CI 上单测，也可能引入死锁）。
+for _forbidden in ('[self ', 'NSFileManager', 'dispatch_', 'pthread_'):
+    assert _forbidden not in _diag, f'diagnosis unit is no longer pure (found {_forbidden})'
+
 print('king cache/refresh logic static checks OK')
 PY
