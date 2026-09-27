@@ -7,20 +7,20 @@
       "name": "LiveProxy 控制台",
       "bundleIdentifier": "com.liveproxy.console",
       "developerName": "koast18",
-      "version": "0.5.74",
-      "versionDate": "2026-09-27T23:36:00Z",
+      "version": "0.5.75",
+      "versionDate": "2026-09-27T23:46:00Z",
       "versionDescription": "LiveProxy 控制台：LiveContainer 任意 App HTTP 代理开关、非 TCP 丢弃、10 分钟粒度蜂窝流量统计。首次打开自动下载 dylib。",
-      "downloadURL": "https://gh-proxy.com/https://github.com/koast18/livecontainer-kingcard-proxy/releases/download/v0.5.74/LiveProxyConsole-0.5.74.ipa",
+      "downloadURL": "https://gh-proxy.com/https://github.com/koast18/livecontainer-kingcard-proxy/releases/download/v0.5.75/LiveProxyConsole-0.5.75.ipa",
       "localizedDescription": "LiveContainer 内任意 App 走 HTTP 代理的控制台 IPA。依赖 LCProxyControl dylib（自动下载到 LiveContainer Tweaks 目录），支持代理开关、丢弃非 TCP、蜂窝网络上传/下载流量统计（10 分钟时段）。",
       "iconURL": "https://raw.githubusercontent.com/koast18/livecontainer-kingcard-proxy/master/AltStore/icon.png",
       "tintColor": "2E7D32",
       "size": 19474,
       "versions": [
         {
-          "version": "0.5.74",
-          "date": "2026-09-27T23:36:00Z",
-          "downloadURL": "https://gh-proxy.com/https://github.com/koast18/livecontainer-kingcard-proxy/releases/download/v0.5.74/LiveProxyConsole-0.5.74.ipa",
-          "localizedDescription": "修复后台/熄屏后整体断网：不再回退到运营商不认识的本地假GUID（会污染共享凭证库），并在路由未发布时自动自愈。含闪退修复（Tweaks目录只保留一个已启用dylib）。"
+          "version": "0.5.75",
+          "date": "2026-09-27T23:46:00Z",
+          "downloadURL": "https://gh-proxy.com/https://github.com/koast18/livecontainer-kingcard-proxy/releases/download/v0.5.75/LiveProxyConsole-0.5.75.ipa",
+          "localizedDescription": "回归审计修复：①后台/熄屏后永久断网（判转发器健康只看fd号，失效socket被无限复用）→改为真监听探测；②撤回0.5.74误删的本地GUID启动引导回退；③保留路由未发布自愈。含闪退修复。"
         }
       ]
     }
