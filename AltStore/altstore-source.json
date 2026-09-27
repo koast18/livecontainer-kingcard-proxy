@@ -7,20 +7,20 @@
       "name": "LiveProxy 控制台",
       "bundleIdentifier": "com.liveproxy.console",
       "developerName": "koast18",
-      "version": "0.5.70",
-      "versionDate": "2026-09-27T14:00:43Z",
+      "version": "0.5.71",
+      "versionDate": "2026-09-27T14:12:31Z",
       "versionDescription": "LiveProxy 控制台：LiveContainer 任意 App HTTP 代理开关、非 TCP 丢弃、10 分钟粒度蜂窝流量统计。首次打开自动下载 dylib。",
-      "downloadURL": "https://gh-proxy.com/https://github.com/koast18/livecontainer-kingcard-proxy/releases/download/v0.5.70/LiveProxyConsole-0.5.70.ipa",
+      "downloadURL": "https://gh-proxy.com/https://github.com/koast18/livecontainer-kingcard-proxy/releases/download/v0.5.71/LiveProxyConsole-0.5.71.ipa",
       "localizedDescription": "LiveContainer 内任意 App 走 HTTP 代理的控制台 IPA。依赖 LCProxyControl dylib（自动下载到 LiveContainer Tweaks 目录），支持代理开关、丢弃非 TCP、蜂窝网络上传/下载流量统计（10 分钟时段）。",
       "iconURL": "https://raw.githubusercontent.com/koast18/livecontainer-kingcard-proxy/master/AltStore/icon.png",
       "tintColor": "2E7D32",
-      "size": 19474,
+      "size": 19475,
       "versions": [
         {
-          "version": "0.5.70",
-          "date": "2026-09-27T14:00:43Z",
-          "downloadURL": "https://gh-proxy.com/https://github.com/koast18/livecontainer-kingcard-proxy/releases/download/v0.5.70/LiveProxyConsole-0.5.70.ipa",
-          "localizedDescription": "修复共享App无法联网：强制刷新不再重新申请GUID身份（多进程共享凭证时会互相作废身份，导致上游零字节关闭连接）。含上游失败分步诊断 upstreamDiag。"
+          "version": "0.5.71",
+          "date": "2026-09-27T14:12:31Z",
+          "downloadURL": "https://gh-proxy.com/https://github.com/koast18/livecontainer-kingcard-proxy/releases/download/v0.5.71/LiveProxyConsole-0.5.71.ipa",
+          "localizedDescription": "跨进程诊断版：每个进程每30秒把自己的状态写入共享日志，任意控制台都能通过 statusTail 看到全部进程（含上游失败分步计数与请求结构快照）。用于直接对比私有App与共享App的现场。"
         }
       ]
     }
