@@ -728,10 +728,10 @@ assert _netinfo.exists(), 'the network-info unit is missing'
 _ni = _netinfo.read_text(encoding='utf-8')
 assert 'CTTelephonyNetworkInfo' in _ni, 'MCC/MNC is no longer read from CoreTelephony'
 assert 'respondsToSelector' in _ni, 'CoreTelephony access is not guarded (could crash a host app)'
-# 不得导入 CoreTelephony 头文件：该头在 iOS SDK 里的路径不稳定（实测
-# 'CoreTelephony/CoreTelephony.h' file not found 会让 Build 直接失败），而本单元完全靠
-# NSClassFromString + objc_msgSend 动态访问，不需要它的任何类型或符号。
-assert 'CoreTelephony/CoreTelephony.h' not in _ni, \
+# 不得导入 CoreTelephony 头文件：该头在 iOS SDK 里的路径不稳定（实测会让 Build 直接失败），
+# 而本单元完全靠 NSClassFromString + objc_msgSend 动态访问，不需要它的任何类型或符号。
+# 注意：只匹配真正的 import/include 语句 —— 注释里提到文件名是允许的（此前守卫曾误伤注释）。
+assert not re.search(r'^\s*#\s*(import|include)\s*[<"]CoreTelephony', _ni, re.M), \
     'the CoreTelephony header is imported again (unstable SDK path breaks the build)'
 assert 'objc_msgSend' in _ni, \
     'CoreTelephony is no longer accessed dynamically (header import would be required)'
