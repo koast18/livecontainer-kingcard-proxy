@@ -7,20 +7,20 @@
       "name": "LiveProxy 控制台",
       "bundleIdentifier": "com.liveproxy.console",
       "developerName": "koast18",
-      "version": "0.5.78",
-      "versionDate": "2026-09-28T00:40:00Z",
+      "version": "0.5.79",
+      "versionDate": "2026-09-28T05:26:00Z",
       "versionDescription": "LiveProxy 控制台：LiveContainer 任意 App HTTP 代理开关、非 TCP 丢弃、10 分钟粒度蜂窝流量统计。首次打开自动下载 dylib。",
-      "downloadURL": "https://gh-proxy.com/https://github.com/koast18/livecontainer-kingcard-proxy/releases/download/v0.5.78/LiveProxyConsole-0.5.78.ipa",
+      "downloadURL": "https://gh-proxy.com/https://github.com/koast18/livecontainer-kingcard-proxy/releases/download/v0.5.79/LiveProxyConsole-0.5.79.ipa",
       "localizedDescription": "LiveContainer 内任意 App 走 HTTP 代理的控制台 IPA。依赖 LCProxyControl dylib（自动下载到 LiveContainer Tweaks 目录），支持代理开关、丢弃非 TCP、蜂窝网络上传/下载流量统计（10 分钟时段）。",
       "iconURL": "https://raw.githubusercontent.com/koast18/livecontainer-kingcard-proxy/master/AltStore/icon.png",
       "tintColor": "2E7D32",
       "size": 19474,
       "versions": [
         {
-          "version": "0.5.78",
-          "date": "2026-09-28T00:40:00Z",
-          "downloadURL": "https://gh-proxy.com/https://github.com/koast18/livecontainer-kingcard-proxy/releases/download/v0.5.78/LiveProxyConsole-0.5.78.ipa",
-          "localizedDescription": "按协议文档要求，用真实网络参数（type_name/subtype/MCC-MNC）申请与当前网络匹配的代理池，避免拿到可能不在王卡免流白名单内的通用池。含 /api/diag 诊断、后台断网修复、闪退修复。"
+          "version": "0.5.79",
+          "date": "2026-09-28T05:26:00Z",
+          "downloadURL": "https://gh-proxy.com/https://github.com/koast18/livecontainer-kingcard-proxy/releases/download/v0.5.79/LiveProxyConsole-0.5.79.ipa",
+          "localizedDescription": "控制台新增诊断面板：一屏看清配置读写链路、网络参数、转发器与监听、代理链端口、路由发布、凭证池与身份来源、上游分步失败、运行环境（私有/共享）与其它进程现场。含真实网络参数申请代理池。"
         }
       ]
     }
