@@ -84,7 +84,20 @@ assert 'removeObjectForKey:@"refreshLog"' in king, 'UI refresh log is persisted 
 assert 'kingcard-refresh.log' in king, 'missing cross-process refresh log'
 assert 'appendSharedRefreshLogEntry:' in king, 'refresh log entries are not shared across processes'
 assert 'LCProxyKingSharedRefreshLogMaxLines' in king, 'shared refresh log is not size capped'
-assert 'trimAppendLogAtPath:' in king, 'append-only logs are never trimmed'
+# 追加/裁剪已抽到独立单元 LCProxySharedLog（可观测性职责，不属于凭证状态机）。
+# 守卫改为：既要确认 LCProxyKing 走的是该单元，也要确认该单元本身仍然做裁剪。
+_sharedlog = Path('Tweak/Sources/LCProxySharedLog.m').read_text(encoding='utf-8')
+assert 'trimAppendLogAtPath:' not in king, \
+    'log trimming was re-inlined into LCProxyKing (should live in LCProxySharedLog)'
+assert 'LCProxySharedLogAppendLine' in king and 'LCProxySharedLogTrim' in king, \
+    'LCProxyKing no longer uses the shared-log unit'
+assert 'void LCProxySharedLogTrim' in _sharedlog, 'append-only logs are never trimmed'
+assert 'O_APPEND' in _sharedlog, 'shared-log append is no longer atomic (O_APPEND lost)'
+assert 'int fd = open(' in _sharedlog and 'close(fd)' in _sharedlog, \
+    'shared-log append no longer uses a raw single write()'
+# "尽力而为"契约：写日志失败绝不能让转发受影响，因此不得出现错误传播。
+assert 'return NO;' in _sharedlog and 'NSJSONSerialization' in _sharedlog, \
+    'shared-log unit no longer validates records before writing'
 assert '[self appendSharedRefreshLogEntry:entry];' in king, \
     'pushRefreshLog does not publish to the cross-process refresh log'
 server = Path('Tweak/Sources/LCProxyServer.m').read_text(encoding='utf-8')

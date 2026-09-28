@@ -2,6 +2,7 @@
 #import "KPKIngCore.h"
 #import "KPKQueenCore.h"
 #import "LCProxyPaths.h"
+#import "LCProxySharedLog.h"
 #import "LCProxyConfig.h"
 #import "LCProxyKingClient.h"
 #import "Version.h"
@@ -151,7 +152,6 @@ NSString *const LCProxyForwarderLifecycleChangedNotification = @"LCProxyForwarde
 - (void)appendCredentialRecord:(NSDictionary *)record;
 - (NSMutableDictionary *)newestValidRecordFromLog;
 - (void)trimCredentialLogIfNeeded;
-- (void)trimAppendLogAtPath:(NSString *)path maxLines:(NSUInteger)maxLines;
 - (void)appendSharedRefreshLogEntry:(NSDictionary *)entry;
 - (void)notifyForwarderLifecycle:(NSString *)reason;
 @end
@@ -1018,35 +1018,19 @@ static const NSTimeInterval LCProxyKingChainRepairMinInterval = 20.0;
 }
 
 - (void)trimCredentialLogIfNeeded {
-    [self trimAppendLogAtPath:[self credentialLogPath] maxLines:LCProxyKingCredentialLogMaxLines];
+    LCProxySharedLogTrim([self credentialLogPath], LCProxyKingCredentialLogMaxLines);
 }
 
 // 通用的"追加式日志裁剪"：超过上限就把后半段留下、前半段丢掉。写入失败静默忽略
 // ——这些日志纯属诊断，任何 IO 问题都不能影响转发。
-- (void)trimAppendLogAtPath:(NSString *)path maxLines:(NSUInteger)maxLines {
-    if (!path.length || maxLines == 0) return;
-    NSString *text = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
-    if (!text.length) return;
-    NSArray<NSString *> *all = [text componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
-    NSMutableArray<NSString *> *kept = [NSMutableArray array];
-    for (NSString *l in all) {
-        if (l.length) [kept addObject:l];
-    }
-    if (kept.count <= maxLines) return;
-    NSUInteger keep = MAX((NSUInteger)1, maxLines / 2);
-    NSRange cut = NSMakeRange(kept.count - keep, keep);
-    NSString *out = [[kept subarrayWithRange:cut] componentsJoinedByString:@"\n"];
-    [out writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
-}
-
 // 把一行紧凑的取号记录追加到 App Group 共享日志文件，让任何 LiveContainer 实例
 // 的控制台都能看到本进程的取号历史 —— 共享 App 进程的内部状态此前完全不可见
-// （文件应用看不到 App Group，console 又只能读到自己的进程）。与凭证日志同一
-// 思路：O_APPEND 行级追加、无需加锁、任何失败静默忽略（纯诊断）。
+// （文件应用看不到 App Group，console 又只能读到自己的进程）。
+// 追加/裁剪的实现已抽到 LCProxySharedLog（见该文件关于"尽力而为"语义的说明）；
+// 这里只负责把记录**规范化**成固定字段。
 - (void)appendSharedRefreshLogEntry:(NSDictionary *)entry {
     NSString *dir = [[self credentialLogPath] stringByDeletingLastPathComponent];
     if (!dir.length) return;
-    NSString *path = [dir stringByAppendingPathComponent:@"kingcard-refresh.log"];
     NSDictionary *compact = @{
         @"ts": [entry[@"ts"] isKindOfClass:[NSNumber class]] ? entry[@"ts"] : @([[NSDate date] timeIntervalSince1970]),
         @"pid": @(getpid()),
@@ -1055,17 +1039,8 @@ static const NSTimeInterval LCProxyKingChainRepairMinInterval = 20.0;
         @"ms": [entry[@"ms"] isKindOfClass:[NSNumber class]] ? entry[@"ms"] : @0,
         @"msg": [entry[@"msg"] isKindOfClass:[NSString class]] ? entry[@"msg"] : @"",
     };
-    if (![NSJSONSerialization isValidJSONObject:compact]) return;
-    NSData *line = [NSJSONSerialization dataWithJSONObject:compact options:0 error:nil];
-    if (!line.length) return;
-    NSMutableData *payload = [line mutableCopy];
-    [payload appendData:[@"\n" dataUsingEncoding:NSUTF8StringEncoding]];
-    int fd = open(path.fileSystemRepresentation, O_WRONLY | O_APPEND | O_CREAT, 0644);
-    if (fd < 0) return;
-    ssize_t ignored = write(fd, payload.bytes, payload.length);
-    (void)ignored;
-    close(fd);
-    [self trimAppendLogAtPath:path maxLines:LCProxyKingSharedRefreshLogMaxLines];
+    LCProxySharedLogAppendLine(dir, @"kingcard-refresh.log",
+                               LCProxyKingSharedRefreshLogMaxLines, compact);
 }
 
 // 把本进程的紧凑状态快照追加到 App Group 共享日志 kingcard-status.log。
@@ -1137,18 +1112,8 @@ static const NSTimeInterval LCProxyKingChainRepairMinInterval = 20.0;
         };
     }
 
-    if (![NSJSONSerialization isValidJSONObject:d]) return;
-    NSData *line = [NSJSONSerialization dataWithJSONObject:d options:0 error:nil];
-    if (!line.length) return;
-    NSString *path = [dir stringByAppendingPathComponent:@"kingcard-status.log"];
-    NSMutableData *payload = [line mutableCopy];
-    [payload appendData:[@"\n" dataUsingEncoding:NSUTF8StringEncoding]];
-    int fd = open(path.fileSystemRepresentation, O_WRONLY | O_APPEND | O_CREAT, 0644);
-    if (fd < 0) return;
-    ssize_t ignored = write(fd, payload.bytes, payload.length);
-    (void)ignored;
-    close(fd);
-    [self trimAppendLogAtPath:path maxLines:LCProxyKingSharedStatusLogMaxLines];
+    LCProxySharedLogAppendLine(dir, @"kingcard-status.log",
+                               LCProxyKingSharedStatusLogMaxLines, d);
 }
 
 // 取"最新且仍有效"的一条。损坏行、过期行、与当前设置不匹配的行全部跳过；
