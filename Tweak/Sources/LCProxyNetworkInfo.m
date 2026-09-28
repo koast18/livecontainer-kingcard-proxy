@@ -1,9 +1,12 @@
 #import "LCProxyNetworkInfo.h"
 #import <objc/message.h>
 
-// CoreTelephony 以弱链接方式使用：在某些环境（无 SIM、模拟器、受限沙箱）下相关类可能
-// 不存在或返回空，本单元必须在这种情形下安静退化，绝不能让宿主 App 崩溃。
-#import <CoreTelephony/CoreTelephony.h>
+// 刻意**不**导入 <CoreTelephony/CoreTelephony.h>：
+//   · 本单元完全通过 NSClassFromString + respondsToSelector + objc_msgSend 动态访问
+//     CTCarrier/CTTelephonyNetworkInfo，不使用任何 CoreTelephony 的类型或符号；
+//   · 该头文件在 iOS SDK 里的路径并不稳定，导入它会让编译（以及不同 SDK 版本）变脆。
+// 运行时依赖由 build_ios.sh 的 -weak_framework CoreTelephony 保证：
+// 框架可用时被映射（类查得到），不可用时安静退化 —— 这正是"宁可退化也不崩宿主"的意图。
 
 NSString *LCProxyNetworkTypeName(BOOL cellularActive) {
     return cellularActive ? @"MOBILE" : @"WIFI";
