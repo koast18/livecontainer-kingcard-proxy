@@ -47,6 +47,8 @@ enum dns_lookup_flavor lcproxy_control_get_resolver(void);
 // Real-time network path hints (NWPathMonitor updates routing fail-closed)
 void     lcproxy_network_monitor_update(int known, int non_cellular);
 int      lcproxy_network_should_direct(void);
+// 网络路径是否已被 NWPathMonitor 确认为可用（satisfied）。
+int      lcproxy_network_is_known(void);
 
 // Cellular traffic statistics
 int      lcproxy_stats_is_cellular(void);

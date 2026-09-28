@@ -3,6 +3,7 @@
 #import "KPKQueenCore.h"
 #import "LCProxyPaths.h"
 #import "LCProxySharedLog.h"
+#import "LCProxyNetworkInfo.h"
 #import "LCProxyConfig.h"
 #import "LCProxyKingClient.h"
 #import "Version.h"
@@ -125,6 +126,8 @@ NSString *const LCProxyForwarderLifecycleChangedNotification = @"LCProxyForwarde
 - (void)startRefreshTimer;
 - (void)stopRefreshTimer;
 - (void)scheduleRefreshRetryAfter:(NSTimeInterval)delay;
+// 组装 RemoteNetworkInfo（服务端据此挑选代理池）；未设置时用运行时探测值补齐。
+- (NSDictionary *)networkParamsFromSettings:(NSDictionary *)settings;
 - (BOOL)stateHasFreshCredentials:(NSDictionary *)state;
 - (BOOL)stateHasFreshCredentials:(NSDictionary *)state matchingSettings:(NSDictionary *)settings;
 // leadTime = 0 表示"此刻是否仍可用"（装载缓存/判断能否继续服务时必须用这个）；
@@ -1320,6 +1323,57 @@ static const NSUInteger KP_LATENCY_PROBE_MAX = 8;
     return sortedHead;
 }
 
+// 组装向运营商申请代理池时使用的 RemoteNetworkInfo 参数。
+//
+// 关键点：服务端**按这些字段挑选代理 IP**，而协议文档（Tools/queen_proxy_kit/docs/
+// protocol.md §4）明确写着：不传真实网络信息时只能拿到**通用池**，"可能不在联通王卡
+// 免流 IP 白名单内"。实测现场里这些值长期是默认占位（UNKNOW / NULLNULL），即一直在申请
+// 通用池 —— 这会让免流通道被上游拒绝。
+//
+// 因此：**只在值仍是占位（未设置）时**用运行时探测值补齐；用户显式设置过的一律尊重。
+// 可在 iOS 上准确采集的是 type_name / subtype / mccmnc；APN 字符串无公开 API（Android 才有），
+// 保持原值不动。
+- (NSDictionary *)networkParamsFromSettings:(NSDictionary *)settings {
+    BOOL satisfied = lcproxy_network_is_known() != 0;
+    BOOL cellular = lcproxy_stats_is_cellular() != 0;
+    BOOL detected = NO;
+
+    NSString *typeName = [settings[@"kingTypeName"] isKindOfClass:[NSString class]] ? settings[@"kingTypeName"] : @"";
+    if (!typeName.length || [typeName isEqualToString:@"UNKNOW"]) {
+        typeName = LCProxyNetworkTypeName(cellular);
+        detected = YES;
+    }
+
+    NSNumber *subtypeNum = [settings[@"kingSubtype"] isKindOfClass:[NSNumber class]] ? settings[@"kingSubtype"] : nil;
+    NSInteger subtype = subtypeNum ? subtypeNum.integerValue : 0;
+    // 仅当"类型也是占位值"时才认为 subtype 未设置（0 是蜂窝的合法取值，不能无条件覆盖）。
+    BOOL subtypeUnset = (!subtypeNum) ||
+                        ([settings[@"kingTypeName"] isKindOfClass:[NSString class]] &&
+                         [settings[@"kingTypeName"] isEqualToString:@"UNKNOW"]);
+    if (subtypeUnset) {
+        subtype = LCProxyNetworkSubtype(cellular, satisfied);
+        detected = YES;
+    }
+
+    NSString *mccmnc = [settings[@"kingMccmnc"] isKindOfClass:[NSString class]] ? settings[@"kingMccmnc"] : @"";
+    if (!mccmnc.length || [mccmnc isEqualToString:@"NULLNULL"]) {
+        mccmnc = LCProxyNetworkMccMnc();
+        if (![mccmnc isEqualToString:@"NULLNULL"]) detected = YES;
+    }
+
+    return @{
+        @"apn": [settings[@"kingApn"] isKindOfClass:[NSString class]] && [settings[@"kingApn"] length]
+                 ? settings[@"kingApn"] : @"UNKNOW",
+        @"typeName": typeName,
+        @"subtype": @(subtype),
+        @"extraInfo": [settings[@"kingExtraInfo"] isKindOfClass:[NSString class]] && [settings[@"kingExtraInfo"] length]
+                 ? settings[@"kingExtraInfo"] : @"UNKNOW",
+        @"mccmnc": mccmnc,
+        @"cardType": [settings[@"kingCardType"] isKindOfClass:[NSNumber class]] ? settings[@"kingCardType"] : @1,
+        @"detected": @(detected),
+    };
+}
+
 - (NSString *)localRandomGuid {
     uint8_t bytes[16];
     arc4random_buf(bytes, sizeof(bytes));
@@ -1646,14 +1700,10 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
     NSNumber *proxyExpireEpoch = [state[@"proxyExpireEpoch"] isKindOfClass:[NSNumber class]] ? state[@"proxyExpireEpoch"] : nil;
     double nowEpoch2 = [[NSDate date] timeIntervalSince1970];
     if (force || !queenHttp.count || !queenHttps.count || !proxyExpireEpoch || proxyExpireEpoch.doubleValue <= nowEpoch2 + LCProxyKingRefreshLeadTime) {
-        NSDictionary *params = @{
-            @"apn": [settings[@"kingApn"] isKindOfClass:[NSString class]] ? settings[@"kingApn"] : @"UNKNOW",
-            @"typeName": [settings[@"kingTypeName"] isKindOfClass:[NSString class]] ? settings[@"kingTypeName"] : @"UNKNOW",
-            @"subtype": [settings[@"kingSubtype"] isKindOfClass:[NSNumber class]] ? settings[@"kingSubtype"] : @0,
-            @"extraInfo": [settings[@"kingExtraInfo"] isKindOfClass:[NSString class]] ? settings[@"kingExtraInfo"] : @"UNKNOW",
-            @"mccmnc": [settings[@"kingMccmnc"] isKindOfClass:[NSString class]] ? settings[@"kingMccmnc"] : @"NULLNULL",
-            @"cardType": [settings[@"kingCardType"] isKindOfClass:[NSNumber class]] ? settings[@"kingCardType"] : @1,
-        };
+        NSDictionary *params = [self networkParamsFromSettings:settings];
+        [steps appendFormat:@"网络参数: type=%@ subtype=%@ mccmnc=%@ apn=%@%@\n",
+            params[@"typeName"], params[@"subtype"], params[@"mccmnc"], params[@"apn"],
+            params[@"detected"] ? @" (部分为运行时探测)" : @""];
         NSError *proxyErr = nil;
         NSDictionary *proxyInfo = [self syncFetchProxies:guid qua2:qua2 params:params timeout:timeout error:&proxyErr];
         if (!proxyInfo) {

@@ -401,6 +401,12 @@ int lcproxy_network_should_direct(void) {
     return lc_network_known && lc_network_non_cellular;
 }
 
+// 网络路径是否已被 NWPathMonitor 确认为"可用"（satisfied）。
+// 用于向运营商上报准确的 RemoteNetworkInfo.subtype（服务端据此挑选代理池）。
+int lcproxy_network_is_known(void) {
+    return lc_network_known;
+}
+
 // 热路径专用：只读取缓存，不在每个 read/write 上跑 getifaddrs。
 // 缓存由 lcproxy_stats_is_cellular() 刷新（LCProxyStats 定时 flush 前会调用）。
 static int lcproxy_stats_is_cellular_fast(void) {

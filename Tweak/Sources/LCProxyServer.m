@@ -6,6 +6,7 @@
 #import "lcproxy_bridge.h"
 #import "LCProxyKing.h"
 #import "LCProxyDiagnosis.h"
+#import "LCProxyNetworkInfo.h"
 #import "KPKIngCore.h"
 #import "Version.h"
 #include "webkit_proxy.h"
@@ -140,6 +141,20 @@ static const NSUInteger LCProxyDefaultPort = 19092;
     d[@"guestDataDirectory"] = LCProxyGuestDataDirectory() ?: @"";
     d[@"sharedDataDirectory"] = LCProxySharedDataDirectory() ?: @"";
     d[@"canonicalDataDirectory"] = LCProxyCanonicalDataDirectory();
+    // 运行时可探测到的网络参数。服务端按这些字段挑选代理池；若它们是占位值
+    // （UNKNOW/NULLNULL），拿到的就是"通用池"，可能不在王卡免流白名单内。
+    // 暴露出来便于核对"实际会上报什么"。
+    {
+        BOOL satisfied = lcproxy_network_is_known() != 0;
+        BOOL cellular = lcproxy_stats_is_cellular() != 0;
+        d[@"networkDetected"] = @{
+            @"typeName": LCProxyNetworkTypeName(cellular),
+            @"subtype": @(LCProxyNetworkSubtype(cellular, satisfied)),
+            @"mccmnc": LCProxyNetworkMccMnc(),
+            @"cellular": @(cellular),
+            @"pathSatisfied": @(satisfied),
+        };
+    }
     d[@"dataDirectories"] = LCProxyAllDataDirectories();
     d[@"trafficLogPath"] = [LCProxyDataDirectory() stringByAppendingPathComponent:@"traffic.log"];
     d[@"king"] = [[LCProxyKing shared] status];

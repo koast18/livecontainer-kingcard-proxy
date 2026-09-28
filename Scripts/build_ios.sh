@@ -75,6 +75,7 @@ clang -dynamiclib -arch $ARCH -mios-version-min=$MIN -isysroot "$SDK" \
   -framework CFNetwork \
   -framework Security \
   -framework CoreServices \
+  -weak_framework CoreTelephony \
   -lz \
   -o "$OUT"
 

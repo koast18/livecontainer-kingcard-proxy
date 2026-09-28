@@ -22,8 +22,17 @@ assert 'LCProxyKingRefreshLeadTime = 2 * 60;' in king, \
     'missing LCProxyKingRefreshLeadTime constant'
 
 # `hasFreshCachedState` must gate the startup/foreground refresh decision.
-assert 'lcproxy_stats_is_cellular' not in king, 'LCProxyKing must not use the old cellular stats judge'
+# 注意：`lcproxy_stats_is_cellular` 曾被禁止出现在 LCProxyKing 中（当时用于"是否走直连"的
+# 判定，正确做法是用 effectiveProxyModeForSettings + lcproxy_network_should_direct）。
+# 现在它有一个**正当且唯一**的用途：采集 RemoteNetworkInfo 的 type_name/subtype 上报给
+# 运营商。因此改为约束"不得用于模式/直连判定"，而不是完全禁止。
 assert 'effectiveProxyModeForSettings' in king, 'LCProxyKing must use effective mode'
+# 它只能出现在 networkParamsFromSettings 里（网络参数采集），不得用于模式判定。
+for _m in re.finditer(r'lcproxy_stats_is_cellular', king):
+    _head = king.rfind('- (', 0, _m.start())
+    _method = king[_head:king.find('{', _head)] if _head >= 0 else ''
+    assert 'networkParamsFromSettings' in _method, \
+        'lcproxy_stats_is_cellular is used outside network-parameter detection (mode judgement?)'
 assert 'hasFreshCachedState' in king, 'missing hasFreshCachedState'
 assert re.search(r'if\s*\(!\s*\[self\s+hasFreshCachedState\]\s*\)', king), \
     'applyConfig does not skip refresh when fresh cache exists'
@@ -708,6 +717,34 @@ assert 'LCProxyDiagLevelBad' in _diag and 'LCProxyDiagLevelWarn' in _diag, \
 # 纯函数约束：诊断不得自己取锁/读文件/发请求（否则它就不能在 CI 上单测，也可能引入死锁）。
 for _forbidden in ('[self ', 'NSFileManager', 'dispatch_', 'pthread_'):
     assert _forbidden not in _diag, f'diagnosis unit is no longer pure (found {_forbidden})'
+
+# ★ RemoteNetworkInfo 必须用运行时探测值补齐占位（协议文档 §4 明确要求）。
+#
+# 服务端按 type_name/subtype/mccmnc 挑选代理池；文档写明不传真实网络信息时只能拿到
+# **通用池**，"可能不在联通王卡免流 IP 白名单内"。实测现场长期是 UNKNOW/NULLNULL，
+# 即一直在申请通用池 —— 这会让免流通道被上游拒绝（表现为拿到连接后零字节关闭）。
+_netinfo = Path('Tweak/Sources/LCProxyNetworkInfo.m')
+assert _netinfo.exists(), 'the network-info unit is missing'
+_ni = _netinfo.read_text(encoding='utf-8')
+assert 'CTTelephonyNetworkInfo' in _ni, 'MCC/MNC is no longer read from CoreTelephony'
+assert 'respondsToSelector' in _ni, 'CoreTelephony access is not guarded (could crash a host app)'
+assert 'return @"NULLNULL";' in _ni, 'the network-info unit no longer degrades to NULLNULL'
+assert 'networkParamsFromSettings' in king, 'RemoteNetworkInfo is not assembled by a named helper'
+assert 'LCProxyNetworkMccMnc()' in king, \
+    'the placeholder mccmnc is no longer replaced by the detected value'
+assert 'LCProxyNetworkTypeName(' in king, \
+    'the placeholder type_name is no longer replaced by the detected value'
+# 用户显式设置过的值必须被尊重（只在仍是占位时才覆盖）。
+assert 'isEqualToString:@"UNKNOW"' in king and 'isEqualToString:@"NULLNULL"' in king, \
+    'network params are overwritten even when the user set them explicitly'
+# 构建必须弱链接 CoreTelephony（缺失时安静退化）。
+_build_sh = Path('Scripts/build_ios.sh').read_text(encoding='utf-8')
+assert 'weak_framework CoreTelephony' in _build_sh, \
+    'CoreTelephony is not weakly linked (link/runtime failure)'
+assert 'd[@"networkDetected"]' in server, \
+    '/api/status does not expose the detected network parameters'
+assert 'LCProxyNetworkMccMnc' in server, \
+    'the console does not report which mccmnc would be sent upstream'
 
 print('king cache/refresh logic static checks OK')
 PY
