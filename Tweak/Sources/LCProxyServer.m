@@ -458,6 +458,36 @@ static const NSUInteger LCProxyDefaultPort = 19092;
         return [self json:@{ @"ok": @YES, @"msg": @"已丢弃缓存凭证并开始重新领取；约 2~3 秒后再看 king.upstreamDiag 与 liveHttpsPool。" }];
     }];
 
+    // 就地自检端点：在**当前进程**里真做一次端到端 CONNECT 尝试，逐步报告结果。
+    //
+    // 这是"私有能用、共享不能用"唯一能定性的测量：累计计数器只说历史，这个说此刻。
+    // 放在后台队列执行（最多约 40 秒网络往返），避免阻塞 GCDWebServer 的线程。
+    [server addHandlerForMethod:@"GET" path:@"/api/selfcheck" requestClass:[GCDWebServerRequest class]
+                   processBlock:^GCDWebServerResponse *(GCDWebServerRequest *request) {
+        __block NSDictionary *report = nil;
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            @try {
+                report = [[LCProxyKing shared] selfCheck];
+            } @catch (NSException *e) {
+                report = @{ @"ok": @NO, @"stage": @"exception",
+                            @"msg": [NSString stringWithFormat:@"%@: %@", e.name, e.reason] };
+            }
+            dispatch_semaphore_signal(sem);
+        });
+        // 上限 60 秒：自检最长约 4 个节点 × 10 秒，留出余量。
+        dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(60 * NSEC_PER_SEC)));
+        if (!report) {
+            report = @{ @"ok": @NO, @"stage": @"timeout", @"msg": @"自检超时（网络往返未返回）" };
+        }
+        NSMutableDictionary *out = [NSMutableDictionary dictionaryWithDictionary:report];
+        out[@"pid"] = @(getpid());
+        out[@"bundleId"] = [self currentBundleId];
+        out[@"version"] = [NSString stringWithUTF8String:KPTWEAK_VERSION];
+        out[@"isSharedTweaks"] = @([LCProxyDylibPath() containsString:@"/LiveContainer/Tweaks/"]);
+        return [self json:out];
+    }];
+
     [server addHandlerForMethod:@"POST" path:@"/api/config" requestClass:[GCDWebServerDataRequest class]
                    processBlock:^GCDWebServerResponse *(GCDWebServerRequest *request) {
         NSDictionary *body = [self jsonBody:request];

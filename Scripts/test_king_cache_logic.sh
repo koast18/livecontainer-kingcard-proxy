@@ -779,5 +779,35 @@ assert 'd[@"networkDetected"]' in server, \
 assert 'LCProxyNetworkMccMnc' in server, \
     'the console does not report which mccmnc would be sent upstream'
 
+# ★ 就地自检：唯一能回答"此刻、这个进程里转发器到底行不行"的测量。
+# 累计计数器只说历史；"私有能用、共享不能用"只能靠在各自进程各做一次真实尝试来判定。
+assert 'kp_forwarder_selfcheck' in core, 'the in-place self-check is missing from the C core'
+assert 'kp_selfcheck_result' in Path('Tweak/Sources/KPKIngCore.h').read_text(encoding='utf-8'), \
+    'the self-check result type is not exposed in the C header'
+_core_ck = core[core.index('int kp_forwarder_selfcheck('):]
+_core_ck = _core_ck[:_core_ck.index('\n}\n') + 3]
+# 自检必须复用真实转发所用的同一套调用（否则测的是另一条平行实现）。
+for _fn in ('kp_connect_host', 'kp_build_queen_connect_request', 'kp_recv_until'):
+    assert _fn in _core_ck, f'the self-check does not use the real path ({_fn})'
+# 必须区分"对端干净关闭"与"读超时/被重置"——这正是此前长期缺失的判据。
+assert 'recv_eof' in _core_ck and 'recv_errno' in _core_ck, \
+    'the self-check does not distinguish EOF from timeout/reset'
+assert 'selfCheck' in king, 'LCProxyKing does not expose the self-check'
+assert 'kp_forwarder_retain' in king, \
+    'the self-check does not retain the forwarder (use-after-free risk)'
+assert '/api/selfcheck' in server, 'the /api/selfcheck endpoint is missing'
+_server_ck = server[server.index('/api/selfcheck'):]
+_server_ck = _server_ck[:_server_ck.index('}];') + 3]
+assert 'dispatch_async' in _server_ck and 'dispatch_semaphore' in _server_ck, \
+    '/api/selfcheck blocks the web server thread instead of running off-thread'
+assert 'isSharedTweaks' in _server_ck, \
+    '/api/selfcheck does not label which tweak path (private vs shared) it ran in'
+# 控制台必须提供自检按钮与私有/共享对比（否则用户无从下手）。
+_console = Path('Resources/console.html').read_text(encoding='utf-8')
+assert 'selfcheckBtn' in _console and '/api/selfcheck' in _console, \
+    'the console has no self-check button'
+assert 'fmtCompare' in _console and '首处差异' in _console, \
+    'the console does not diff private vs shared snapshots'
+
 print('king cache/refresh logic static checks OK')
 PY

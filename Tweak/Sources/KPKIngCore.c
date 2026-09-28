@@ -2876,6 +2876,113 @@ int kp_forwarder_probe_local(kp_forwarder *fw, int timeout_ms) {
     return 1;
 }
 
+// 就地自检：真去连王卡节点、发 CONNECT、读响应，把每一步原样报出。
+//
+// 与真实转发路径共用同一套底层调用（kp_connect_host / kp_build_queen_connect_request /
+// kp_recv_until），因此它测的正是"真实转发会不会成功"，而不是另一条平行实现。
+// 只读取转发器状态与代理池，不改动任何状态；调用方负责不持锁。
+int kp_forwarder_selfcheck(kp_forwarder *fw, kp_selfcheck_result *out) {
+    if (!fw || !out) return -1;
+    memset(out, 0, sizeof(*out));
+    snprintf(out->stage, sizeof(out->stage), "start");
+
+    // 代理池与凭证快照（只在 cred_mutex 下取）。
+    char proxy_snapshot[KP_SELFCHECK_MAX_ATTEMPTS][64];
+    int proxy_count = 0;
+    int https_pool_count = 0;
+    pthread_mutex_lock(&fw->cred_mutex);
+    https_pool_count = fw->https_pool.count;
+    out->pool_http = fw->http_pool.count;
+    out->pool_https = fw->https_pool.count;
+    out->has_guid = fw->guid[0] ? 1 : 0;
+    out->has_token = (fw->token[0] && fw->qkey[0]) ? 1 : 0;
+    for (int i = 0; i < https_pool_count && i < KP_SELFCHECK_MAX_ATTEMPTS; i++) {
+        // 直接复制池里的 "host:port" 字符串，稍后逐项解析（避免在锁内做更多工作）。
+        snprintf(proxy_snapshot[proxy_count], sizeof(proxy_snapshot[0]),
+                 "%s", fw->https_pool.items[i]);
+        if (proxy_snapshot[proxy_count][0]) proxy_count++;
+    }
+    pthread_mutex_unlock(&fw->cred_mutex);
+
+    if (https_pool_count == 0) {
+        snprintf(out->stage, sizeof(out->stage), "pool-empty");
+        return 0;
+    }
+    if (!out->has_token) {
+        snprintf(out->stage, sizeof(out->stage), "no-credentials");
+        return 0;
+    }
+
+    // 逐个节点做一次真实 CONNECT（目标用 www.gstatic.com:80，与健康检查一致）。
+    for (int i = 0; i < proxy_count; i++) {
+        char host[128] = {0};
+        int port = 0;
+        char tmp[64];
+        snprintf(tmp, sizeof(tmp), "%s", proxy_snapshot[i]);
+        char *colon = strrchr(tmp, ':');
+        if (!colon) continue;
+        *colon = '\0';
+        port = atoi(colon + 1);
+        if (port <= 0 || port > 65535) continue;
+        snprintf(host, sizeof(host), "%s", tmp);
+
+        kp_selfcheck_attempt *e = &out->per[out->attempts];
+        snprintf(e->proxy, sizeof(e->proxy), "%s:%d", host, port);
+        out->attempts++;
+
+        errno = 0;
+        int up = kp_connect_host(host, port, 10000);
+        if (up < 0) {
+            e->connect_ok = 0;
+            e->connect_errno = errno;
+            continue;
+        }
+        e->connect_ok = 1;
+
+        char creq[2048];
+        char qkey_val[512];
+        int cn = kp_build_queen_connect_request(fw, "www.gstatic.com", 80,
+                                                creq, sizeof(creq),
+                                                qkey_val, sizeof(qkey_val));
+        if (cn <= 0) {
+            e->send_ok = 0;
+            kp_upstream_close(fw, &up);
+            continue;
+        }
+        errno = 0;
+        if (kp_send_all(up, creq, (size_t)cn) != 0) {
+            e->send_ok = 0;
+            kp_upstream_close(fw, &up);
+            continue;
+        }
+        e->send_ok = 1;
+
+        char resp[512];
+        size_t rgot = 0;
+        errno = 0;
+        int recv_rc = kp_recv_until(up, resp, sizeof(resp), &rgot, 10000);
+        e->recv_bytes = (int)rgot;
+        e->recv_errno = errno;
+        e->recv_eof = (rgot == 0 && errno == 0) ? 1 : 0;
+        if (rgot) {
+            size_t n = rgot < sizeof(e->resp) - 1 ? rgot : sizeof(e->resp) - 1;
+            for (size_t k = 0; k < n; k++) {
+                unsigned char ch = (unsigned char)resp[k];
+                e->resp[k] = (ch >= 32 && ch < 127) ? (char)ch : '.';
+            }
+            e->resp[n] = '\0';
+            e->code = kp_parse_status_code(resp, rgot);
+            if (e->code >= 200 && e->code < 300) out->any_ok = 1;
+        }
+        (void)recv_rc;
+        kp_upstream_close(fw, &up);
+        if (out->attempts >= KP_SELFCHECK_MAX_ATTEMPTS) break;
+    }
+
+    snprintf(out->stage, sizeof(out->stage), "done");
+    return 0;
+}
+
 // 返回 0 = 所有转发线程已退出，可安全 free；
 // 返回 -1 = 超过 KP_FORWARDER_STOP_GRACE_MS 仍有线程存活（典型：卡在取号 hook
 // 的网络等待）。此时调用方绝不能 free（use-after-free），应把 fw 当僵尸泄漏。

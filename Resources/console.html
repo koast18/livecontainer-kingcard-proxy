@@ -114,6 +114,20 @@ th:first-child,td:first-child { text-align:left; }
     </div>
   </div>
 
+  <div class="card" id="selfcheckCard">
+    <h2>就地自检（本进程能不能真的转发）</h2>
+    <div class="msg" style="color:#8b949e;font-size:12px">在**当前这个进程**里真去连王卡节点、发 CONNECT、读响应。私有 App 与共享 App 各跑一次，就能直接对照出差异。最长约 40 秒。</div>
+    <div style="margin-top:8px"><button id="selfcheckBtn">运行自检</button></div>
+    <div class="msg" id="selfcheckMsg" style="font-weight:600"></div>
+    <div id="selfcheckDetail" style="white-space:pre-wrap;font-size:12px;color:#8b949e;margin-top:6px;max-height:260px;overflow-y:auto;border:1px solid #30363d;border-radius:8px;padding:8px"></div>
+  </div>
+
+  <div class="card" id="compareCard">
+    <h2>私有 vs 共享 对比（首处差异）</h2>
+    <div class="msg" style="color:#8b949e;font-size:12px">来自所有进程写入的共享状态日志。若两边行为不同而每个字段都一样，说明差异不在这些可观测项里。</div>
+    <div id="compareTable" style="white-space:pre-wrap;font-size:12px;margin-top:6px;max-height:260px;overflow-y:auto;border:1px solid #30363d;border-radius:8px;padding:8px"></div>
+  </div>
+
   <div class="card" id="diagCard">
     <h2>诊断（一键定位每个环节）</h2>
     <div class="msg" id="diagSummary" style="font-size:14px;font-weight:600">正在诊断…</div>
@@ -334,12 +348,119 @@ async function loadDiag() {
     + '\nguest目录=' + (sb.guestDataDirectory||'')
     + '\n候选目录:\n' + ((sb.candidateDataDirectories||[]).map(x => '  · ' + x).join('\n'));
   $('diagStatusTail').textContent = fmtTail(d.statusTail);
+  $('compareTable').textContent = fmtCompare(d.statusTail);
   $('diagRefreshLog').textContent = (d.refreshLogShared || []).map(l => {
     try { const o = JSON.parse(l); return fmtLogTime(o.ts) + ' [' + (o.ok?'成功':'失败') + '] pid=' + o.pid + ' ' + o.src + '\n' + (o.msg||''); }
     catch (e) { return l; }
   }).join('\n---\n');
 }
 $('diagReloadBtn').onclick = loadDiag;
+
+// ---- 就地自检 ----
+function fmtSelfcheck(d) {
+  if (!d) return '';
+  const lines = [];
+  lines.push('进程: pid=' + (d.pid||'?') + ' bundle=' + (d.bundleId||'?')
+    + (d.isSharedTweaks ? '  [共享 tweaks 路径]' : '  [私有 tweaks 路径]'));
+  lines.push('结论: ' + (d.ok ? '✅ 能转发' : '❌ 无法转发') + '  stage=' + (d.stage||'?'));
+  if (d.forwarderPort != null) lines.push('转发器端口=' + d.forwarderPort
+    + ' 真监听=' + (d.listenProbeOk?1:0) + ' 路由已发布=' + (d.routePublished?1:0));
+  lines.push('池: http=' + (d.poolHttp||0) + ' https=' + (d.poolHttps||0)
+    + ' / 有GUID=' + (d.hasGuid?1:0) + ' 有Token=' + (d.hasToken?1:0)
+    + ' / 身份来源=' + (d.guidSource || '—'));
+  if (d.lastError) lines.push('lastError: ' + d.lastError);
+  (d.attempts||[]).forEach((a,i) => {
+    lines.push('  #' + (i+1) + ' ' + a.proxy
+      + '  connect=' + (a.connectOK?('ok'):('FAIL errno='+a.connectErrno))
+      + ' send=' + (a.sendOK?'ok':'FAIL')
+      + ' recv=' + a.recvBytes + 'B'
+      + (a.recvBytes === 0 ? (a.recvEOF ? ' (对端关闭)' : (' (errno='+a.recvErrno+')')) : '')
+      + ' code=' + a.code
+      + (a.resp ? ('\n       resp: ' + a.resp) : ''));
+  });
+  lines.push('');
+  lines.push(d.interpretation || '');
+  return lines.join('\n');
+}
+async function runSelfcheck() {
+  const btn = $('selfcheckBtn');
+  btn.disabled = true;
+  $('selfcheckMsg').textContent = '自检中…（真实网络往返，最长约 40 秒）';
+  $('selfcheckMsg').style.color = '#d29922';
+  try {
+    const d = await api('/api/selfcheck');
+    $('selfcheckMsg').textContent = (d.ok ? '✅ 本进程能转发' : '❌ 本进程无法转发') + ' — ' + (d.stage || '');
+    $('selfcheckMsg').style.color = d.ok ? '#3fb950' : '#f85149';
+    $('selfcheckDetail').textContent = fmtSelfcheck(d);
+  } catch (e) {
+    $('selfcheckMsg').textContent = '自检请求失败: ' + e;
+    $('selfcheckMsg').style.color = '#f85149';
+  } finally {
+    btn.disabled = false;
+  }
+}
+$('selfcheckBtn').onclick = runSelfcheck;
+
+// ---- 私有 vs 共享 对比 ----
+// 取共享状态日志里最近的快照，按 isSharedTweaks 分成两组，逐字段找出**首处差异**。
+function fmtCompare(lines) {
+  if (!lines || !lines.length) return '（暂无跨进程快照；两个环境各跑一会儿再看）';
+  const seen = new Map();
+  lines.forEach(l => {
+    try {
+      const o = JSON.parse(l);
+      const key = (o.isSharedTweaks ? 'shared' : 'private');
+      if (!seen.has(key)) seen.set(key, { o, n: 0 });
+      seen.get(key).n++;
+    } catch (e) {}
+  });
+  const priv = seen.get('private'), sh = seen.get('shared');
+  const out = [];
+  out.push('样本：私有 ' + (priv?priv.n:0) + ' 条，共享 ' + (sh?sh.n:0) + ' 条');
+  if (!priv || !sh) {
+    out.push('⚠ 需要两个环境都运行过（各自打开 App 用一会儿）才能对比。');
+    if (priv) out.push('（已看到私有进程：pid=' + priv.o.pid + ' bundle=' + priv.o.bundle + '）');
+    if (sh) out.push('（已看到共享进程：pid=' + sh.o.pid + ' bundle=' + sh.o.bundle + '）');
+    return out.join('\n');
+  }
+  const a = priv.o, b = sh.o;
+  out.push('私有 pid=' + a.pid + ' bundle=' + a.bundle + ' ver=' + a.ver);
+  out.push('共享 pid=' + b.pid + ' bundle=' + b.bundle + ' ver=' + b.ver);
+  const FIELDS = [
+    ['ver','版本'], ['port','转发器端口'], ['chainPort','链端口'], ['overridePort','override'],
+    ['running','运行'], ['listenOk','真监听'], ['ready','就绪'],
+    ['vErr','lastError'],
+  ];
+  let firstDiff = null;
+  FIELDS.forEach(([k,label]) => {
+    const av = a[k], bv = b[k];
+    const same = JSON.stringify(av) === JSON.stringify(bv);
+    if (!same && firstDiff === null) firstDiff = label + '（私有=' + JSON.stringify(av) + ' 共享=' + JSON.stringify(bv) + '）';
+    out.push((same ? '  = ' : '  ≠ ') + label + ': 私有=' + JSON.stringify(av) + ' 共享=' + JSON.stringify(bv));
+  });
+  // 上游分步计数与池
+  const upa = a.up || {}, upb = b.up || {};
+  const UPS = [['connectFail','上游连接失败'],['sendFail','上游发送失败'],['recvFail','上游零字节'],
+               ['recvEof','  其中对端关闭'],['recvRst','  其中被重置'],['recvTimeout','  其中读超时'],
+               ['credCode','凭证被拒(820/821/823)'],['otherCode','其它状态码'],['tunnelNoData','隧道无数据']];
+  UPS.forEach(([k,label]) => {
+    const av = upa[k], bv = upb[k];
+    const same = JSON.stringify(av) === JSON.stringify(bv);
+    if (!same && firstDiff === null && av != null) firstDiff = label + '（私有=' + av + ' 共享=' + bv + '）';
+    out.push((same ? '  = ' : '  ≠ ') + label + ': 私有=' + (av==null?'—':av) + ' 共享=' + (bv==null?'—':bv));
+  });
+  ['pool','connects','reject','clients'].forEach(k => {
+    const av = a[k], bv = b[k];
+    out.push((JSON.stringify(av)===JSON.stringify(bv) ? '  = ' : '  ≠ ') + k + ': 私有=' + JSON.stringify(av) + ' 共享=' + JSON.stringify(bv));
+  });
+  if (upa.req || upb.req) {
+    out.push('  私有请求: ' + (upa.req || '—'));
+    out.push('  共享请求: ' + (upb.req || '—'));
+  }
+  out.push('');
+  out.push(firstDiff ? ('★ 首处差异：' + firstDiff) : '★ 未发现差异 —— 差异不在这批可观测项里。');
+  return out.join('\n');
+}
 
 async function loadStats() {
   const s = await api('/api/stats');

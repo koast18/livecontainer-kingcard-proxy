@@ -643,6 +643,76 @@ static const NSTimeInterval LCProxyKingLifecycleNotifyMinInterval = 5.0;
 // 进程写坏），则每个读它的进程都会拿坏凭证去连、被运营商零字节关闭 —— 而自己重新领一套
 // 的进程却正常。这正好能造成"私有正常、共享不正常"。该动作把 newIdentityRequested 置位
 // 并立即强制刷新，刷新完成后新记录成为日志里最新的一条，其他进程也会随之用上。
+// 就地自检：在本进程里真做一次端到端 CONNECT 尝试。
+//
+// 关键点：它测的是**这个进程此刻**的能力，因此"私有 vs 共享"只要各自跑一次就能对照。
+// 寻找转发器时用 retain/release 保护（与 syncFetchGuid 同一模式），且**不持锁做网络 I/O**。
+- (NSDictionary *)selfCheck {
+    [self.lock lock];
+    kp_forwarder *fw = self.forwarder;
+    BOOL retained = (fw != NULL) && (kp_forwarder_retain(fw) == 0);
+    int port = fw ? kp_forwarder_port(fw) : 0;
+    BOOL listenProbe = fw ? (kp_forwarder_is_listening(fw) == 1) : NO;
+    BOOL routePublished = self.routePublished;
+    NSString *err = self.lastError ?: @"";
+    [self.lock unlock];
+
+    if (!retained) {
+        return @{ @"ok": @NO,
+                  @"stage": @"no-forwarder",
+                  @"msg": @"本进程没有可用的转发器，自检无法进行",
+                  @"forwarderPort": @(port),
+                  @"routePublished": @(routePublished),
+                  @"lastError": err };
+    }
+
+    kp_selfcheck_result r;
+    memset(&r, 0, sizeof(r));
+    kp_forwarder_selfcheck(fw, &r);
+    kp_forwarder_release(fw);
+
+    // 身份来源（诊断需要区分运营商下发的真身份与启动引导用的本地身份）。
+    NSDictionary *st = [self loadState];
+    NSString *gs = [st[@"guidSource"] isKindOfClass:[NSString class]] ? st[@"guidSource"] : @"";
+    snprintf(r.guid_source, sizeof(r.guid_source), "%s", gs.UTF8String ?: "");
+
+    NSMutableArray *attempts = [NSMutableArray array];
+    for (int i = 0; i < r.attempts; i++) {
+        kp_selfcheck_attempt *e = &r.per[i];
+        [attempts addObject:@{
+            @"proxy": [NSString stringWithUTF8String:e->proxy] ?: @"",
+            @"connectOK": @(e->connect_ok),
+            @"connectErrno": @(e->connect_errno),
+            @"sendOK": @(e->send_ok),
+            @"recvBytes": @(e->recv_bytes),
+            @"recvEOF": @(e->recv_eof),
+            @"recvErrno": @(e->recv_errno),
+            @"code": @(e->code),
+            @"resp": [NSString stringWithUTF8String:e->resp] ?: @"",
+        }];
+    }
+
+    return @{
+        @"ok": @(r.any_ok),
+        @"stage": [NSString stringWithUTF8String:r.stage] ?: @"",
+        @"attempts": attempts,
+        @"poolHttp": @(r.pool_http),
+        @"poolHttps": @(r.pool_https),
+        @"hasGuid": @(r.has_guid),
+        @"hasToken": @(r.has_token),
+        @"guidSource": gs,
+        @"forwarderPort": @(port),
+        @"listenProbeOk": @(listenProbe),
+        @"routePublished": @(routePublished),
+        @"lastError": err,
+        @"interpretation": r.any_ok
+            ? @"本进程的转发器**能**把一个 CONNECT 送到王卡节点并拿到 2xx —— 链路本身是通的。"
+            : @"本进程的转发器**无法**完成一次 CONNECT。请看 attempts 里每一项停在哪一步："
+              @"connectOK=0 表示 TCP 层就失败；sendOK=0 表示请求没发出去；"
+              @"recvBytes=0 表示上游零字节（再看 recvEOF/recvErrno 区分 对端关闭 / 读超时 / 被重置）。",
+    };
+}
+
 - (void)resetSharedCredentialsAndRefresh {
     [self.lock lock];
     self.newIdentityRequested = YES;

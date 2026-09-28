@@ -311,6 +311,43 @@ typedef struct {
 
 void kp_forwarder_get_stats(kp_forwarder *fw, kp_forwarder_stats *stats);
 
+// ---------- 就地自检（决定性测量）----------
+//
+// 累计计数器只能告诉我们"历史上失败了多少次"，无法回答"**此刻、这个进程**里转发器到底
+// 能不能把一个 CONNECT 送到王卡节点并拿到响应"。而"私有能用、共享不能用"这类差异，
+// 恰恰只能靠**在各自进程里各做一次真实尝试**来判定。
+//
+// 本函数就做这一件事：取代理池里的节点，逐个真去 connect → 发 CONNECT → 读响应，
+// 把每一步的结果（含 errno 与上游原始字节）原样记录下来，不做任何猜测性解释。
+#define KP_SELFCHECK_MAX_ATTEMPTS 4
+typedef struct {
+    char proxy[64];      ///< 目标节点 host:port
+    int connect_ok;      ///< TCP 是否连上
+    int connect_errno;   ///< connect 失败时的 errno
+    int send_ok;         ///< CONNECT 请求是否发完
+    int recv_bytes;      ///< 读到的响应字节数（0 = 上游零字节）
+    int recv_eof;        ///< 1 = 对端干净关闭(recv==0)
+    int recv_errno;      ///< recv 出错时的 errno（35=EAGAIN 读超时, 54=ECONNRESET）
+    int code;            ///< 解析到的状态码（0 = 没拿到）
+    char resp[200];      ///< 上游响应原文（不可打印字符替换为 .）
+} kp_selfcheck_attempt;
+
+typedef struct {
+    int attempts;
+    kp_selfcheck_attempt per[KP_SELFCHECK_MAX_ATTEMPTS];
+    int any_ok;              ///< 是否有任一节点成功返回 2xx
+    int pool_http;           ///< 参与自检的池大小
+    int pool_https;
+    int has_guid;            ///< 转发器里是否有 GUID
+    int has_token;           ///< 是否有 Q-Token/Q-Key
+    char guid_source[16];    ///< pbproxy / local（由调用方写入，见 LCProxyKing）
+    char stage[24];          ///< 整体阶段：pool-empty / no-credentials / done
+} kp_selfcheck_result;
+
+/// 就地自检。会做真实的网络往返（每个节点最多约 10 秒），因此**不要**在持有任何锁时调用。
+/// 返回 0 表示自检本身执行完成（不代表上游可用，看 any_ok）。
+int kp_forwarder_selfcheck(kp_forwarder *fw, kp_selfcheck_result *out);
+
 /// 最近触发直连兜底的目标域名（环形缓冲，最多 16 条）。
 int kp_forwarder_direct_host_count(kp_forwarder *fw);
 int kp_forwarder_get_direct_host(kp_forwarder *fw, int index,
