@@ -705,8 +705,25 @@ for _f in ('Tweak/Sources/LCProxyDiagnosis.h', 'Tweak/Sources/LCProxyDiagnosis.m
            'Scripts/test_lcproxy_diagnosis.m', 'Scripts/test_lcproxy_diagnosis.sh'):
     assert Path(_f).exists(), f'diagnosis unit missing: {_f}'
 assert '/api/diag' in server, '/api/diag endpoint is missing'
-assert 'LCProxyDiagnose(payload)' in server, '/api/diag does not run the diagnosis unit'
+assert 'LCProxyDiagnose(' in server, '/api/diag does not run the diagnosis unit'
 assert 'LCProxyDiagnosis.h' in server, '/api/diag does not import the diagnosis unit'
+# 诊断必须覆盖"配置读写链路"与"运行环境/跨进程"两块，而不只是网络。
+assert 'configDiag' in server and 'configDiag' in Path('Tweak/Sources/LCProxyDiagnosis.m').read_text(encoding='utf-8'), \
+    '/api/diag does not include the config read/write trail'
+assert 'configDiagnostics' in config, \
+    'LCProxyConfig does not expose the config read/write diagnostics'
+assert 'networkDetected' in server, '/api/diag does not include detected network params'
+assert 'endpoints' in server and 'sandbox' in server, \
+    '/api/diag does not include sandbox/environment info (private vs shared)'
+assert 'statusTail' in server, '/api/diag does not include other processes status'
+# 保存结果必须被记录（"保存看似有用、读取却不对"只能靠它定位）。
+assert 'lastSavePerDirectory' in config and 'readBackOK' in config, \
+    'the save result is not recorded/verified (cannot explain save-vs-read asymmetry)'
+# 诊断必须只读：不得在诊断路径里写文件（否则会改变被诊断的状态）。
+_cfgdiag = config[config.index('- (NSDictionary *)configDiagnostics {'):]
+_cfgdiag = _cfgdiag[:_cfgdiag.index('\n}\n') + 3]
+for _w in ('writeToFile', 'synchronizeSettings', 'createDirectoryAtPath'):
+    assert _w not in _cfgdiag, f'configDiagnostics must be read-only (found {_w})'
 _diag = Path('Tweak/Sources/LCProxyDiagnosis.m').read_text(encoding='utf-8')
 # 关键判据必须都在：真监听、链端口、路由发布、零字节上游、池为空、引导身份。
 for _needle in ('listenProbeOk', 'chainProxyPort', 'routePublished', 'recvFail',

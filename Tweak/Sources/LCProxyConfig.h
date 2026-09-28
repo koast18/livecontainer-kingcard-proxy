@@ -41,6 +41,20 @@ extern NSString *const LCProxyForwarderLifecycleChangedNotification;
 /// Diagnostic snapshot for the web console.
 - (NSDictionary *)runtimeDiagnostics;
 
+/// 配置读写**全链路**诊断：把"读了哪些目录、每个目录里文件长什么样、最终用了哪一份、
+/// 为什么、以及上次保存写成功了哪些目录"逐项摊开。
+///
+/// 为什么需要它：用户报告"控制台读配置不正常，但保存似乎有用" —— 这种**读写不对称**只能靠
+/// 把每一步摊开才能定位（是 App Group 取不到？文件在但解析失败？还是保存只写进了非权威目录？）。
+/// 此前的状态字典只有 settingsPath / settingsExists 两个字段，无法区分这些情况。
+///
+/// 只读、无副作用；不做任何补偿性写入（诊断绝不能改变被诊断的状态）。
+- (NSDictionary *)configDiagnostics;
+
+/// 供事务性接口使用：在指定目录里读取并解析 settings.json（nil 表示不存在/不可解析）。
+/// 诊断与迁移路径共用同一实现，避免"诊断看到的"与"实际用的"不一致。
+- (nullable NSDictionary *)settingsInDirectory:(NSString *)directory;
+
 @end
 
 NS_ASSUME_NONNULL_END

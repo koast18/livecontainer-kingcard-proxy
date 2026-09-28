@@ -400,7 +400,11 @@ static const NSUInteger LCProxyDefaultPort = 19092;
                    processBlock:^GCDWebServerResponse *(GCDWebServerRequest *request) {
         NSDictionary *payload = [self configPayload];
         NSMutableDictionary *out = [NSMutableDictionary dictionary];
-        [out addEntriesFromDictionary:LCProxyDiagnose(payload)];
+        // 诊断需要配置全链路信息，但 configPayload 里只有精简字段 —— 这里单独取一份塞进去
+        // （键名与诊断单元约定的 "configDiag" 一致）。
+        NSMutableDictionary *diagPayload = [payload mutableCopy];
+        diagPayload[@"configDiag"] = [[LCProxyConfig shared] configDiagnostics];
+        [out addEntriesFromDictionary:LCProxyDiagnose(diagPayload)];
         out[@"pid"] = payload[@"pid"] ?: @0;
         out[@"bundleId"] = payload[@"bundleId"] ?: @"";
         out[@"version"] = payload[@"version"] ?: @"";
@@ -419,8 +423,27 @@ static const NSUInteger LCProxyDefaultPort = 19092;
             @"lastError": king[@"lastError"] ?: @"",
             @"upstreamDiag": king[@"upstreamDiag"] ?: @{},
         };
+        // 配置读写全链路现场（读/写不对称只能靠它定位）+ 运行时可探测的网络参数。
+        out[@"configDiag"] = diagPayload[@"configDiag"] ?: @{};
+        out[@"networkDetected"] = payload[@"networkDetected"] ?: @{};
+        out[@"endpoints"] = @{
+            @"forwarderPort": payload[@"forwarderPort"] ?: @0,
+            @"proxyOverridePort": payload[@"proxyOverridePort"] ?: @0,
+            @"sandbox": @{
+                @"home": payload[@"home"] ?: @"",
+                @"lcHomePath": payload[@"lcHomePath"] ?: @"",
+                @"dataDirectory": payload[@"dataDirectory"] ?: @"",
+                @"canonicalDataDirectory": payload[@"canonicalDataDirectory"] ?: @"",
+                @"guestDataDirectory": payload[@"guestDataDirectory"] ?: @"",
+                @"sharedDataDirectory": payload[@"sharedDataDirectory"] ?: @"",
+                @"dylibPath": payload[@"dylibPath"] ?: @"",
+                @"dylibLoadsTail": payload[@"dylibLoadsTail"] ?: @[],
+                @"candidateDataDirectories": payload[@"dataDirectories"] ?: @[],
+            },
+        };
         // 所有进程的现场（含私有/共享对照）——这正是"私有正常、共享不正常"的判定依据。
         out[@"statusTail"] = [self tailOfAppGroupLog:@"kingcard-status.log" maxLines:24];
+        out[@"refreshLogShared"] = [self tailOfAppGroupLog:@"kingcard-refresh.log" maxLines:20];
         return [self json:out];
     }];
 

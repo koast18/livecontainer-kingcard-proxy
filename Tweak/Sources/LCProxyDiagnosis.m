@@ -191,6 +191,67 @@ NSDictionary *LCProxyDiagnose(NSDictionary *payload) {
                        (unsigned long)swallowed.count, swallowed.firstObject ?: @"");
     }
 
+    // ---- 配置读写全链路（读写不对称只能靠这里定位）----
+    NSDictionary *cfg = [payload[@"configDiag"] isKindOfClass:[NSDictionary class]] ? payload[@"configDiag"] : nil;
+    if (cfg) {
+        NSString *src = LCProxyDiagStr(cfg, @"source");
+        if ([src isEqualToString:@"defaults"]) {
+            LCProxyDiagAdd(verdict, LCProxyDiagLevelBad,
+                           @"**任何目录都读不到可解析的 settings.json**，当前在用内置默认值"
+                           @"（默认是 custom/127.0.0.1:8080）。这会造成「保存过但读不回来」"
+                           @"的现象：保存能写进某些目录，但权威目录读不到。");
+        } else if ([src hasPrefix:@"fallback"]) {
+            LCProxyDiagAdd(verdict, LCProxyDiagLevelWarn,
+                           @"权威目录没有 settings.json，正在用其它目录里最新的副本。"
+                           @"私有/共享进程看到的可能是**不同**的副本 —— 这正是两边行为不一致的常见原因。");
+        }
+
+        NSString *canonical = LCProxyDiagStr(cfg, @"canonicalDirectory");
+        NSArray *dirs = [cfg[@"directories"] isKindOfClass:[NSArray class]] ? cfg[@"directories"] : @[];
+        NSUInteger readable = 0, writable = 0;
+        for (NSDictionary *d in dirs) {
+            if (![d isKindOfClass:[NSDictionary class]]) continue;
+            if ([LCProxyDiagNum(d, @"settingsReadable") boolValue]) readable++;
+            if ([LCProxyDiagNum(d, @"writable") boolValue]) writable++;
+        }
+        LCProxyDiagAdd(verdict, LCProxyDiagLevelOk,
+                       @"配置：权威目录 %@；候选 %lu 个（可写 %lu，读出 settings 成功 %lu）。",
+                       canonical.lastPathComponent ?: canonical,
+                       (unsigned long)dirs.count, (unsigned long)writable, (unsigned long)readable);
+        if (dirs.count && readable == 0) {
+            LCProxyDiagAdd(verdict, LCProxyDiagLevelBad,
+                           @"所有候选目录都读不出 settings.json —— 配置读取本身是坏的。");
+        }
+
+        NSString *saveErr = LCProxyDiagStr(cfg, @"lastSaveError");
+        if (saveErr.length) {
+            LCProxyDiagAdd(verdict, LCProxyDiagLevelWarn, @"上次保存报错：%@", saveErr);
+        }
+        NSArray *saved = [cfg[@"lastSavePerDirectory"] isKindOfClass:[NSArray class]] ? cfg[@"lastSavePerDirectory"] : @[];
+        NSUInteger saveOk = 0, saveFail = 0, readBackBad = 0;
+        for (NSDictionary *d in saved) {
+            if (![d isKindOfClass:[NSDictionary class]]) continue;
+            if ([LCProxyDiagNum(d, @"readBackOK") boolValue]) saveOk++; else { saveFail++; readBackBad++; }
+        }
+        if (saved.count) {
+            if (readBackBad > 0) {
+                LCProxyDiagAdd(verdict, LCProxyDiagLevelBad,
+                               @"上次保存：%lu 个目录写入后可读回、%lu 个**读不回来** —— "
+                               @"这直接解释「保存看似有用、读取却不对」。",
+                               (unsigned long)saveOk, (unsigned long)saveFail);
+            } else {
+                LCProxyDiagAdd(verdict, LCProxyDiagLevelOk,
+                               @"上次保存：%lu 个目录全部写入并能读回。", (unsigned long)saveOk);
+            }
+        }
+        NSString *effMode = LCProxyDiagStr(cfg, @"effectiveProxyMode");
+        if (effMode.length && ![effMode isEqualToString:@"kingcard"]) {
+            LCProxyDiagAdd(verdict, LCProxyDiagLevelBad,
+                           @"**实际生效的配置里 proxyMode=「%@」而不是 kingcard** —— "
+                           @"界面显示的开关不代表真正生效的值。", effMode);
+        }
+    }
+
     // ---- 汇总 ----
     LCProxyDiagLevel worst = LCProxyDiagLevelOk;
     NSUInteger bad = 0, warn = 0;

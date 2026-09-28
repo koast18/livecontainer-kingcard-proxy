@@ -151,6 +151,58 @@ int main(void) {
             expect_text(p, @"820/821/823", "credential rejection names the codes");
         }
 
+        // ⑩ 配置文件读不到（回退到内置默认值）——"保存看似有用、读取却不对"的形态。
+        {
+            NSMutableDictionary *p = baseline();
+            p[@"configDiag"] = @{
+                @"source": @"defaults",
+                @"canonicalDirectory": @"/AppGroup/LiveContainer/LCProxy",
+                @"effectiveProxyMode": @"custom",
+                @"trail": @[ @"任何目录都没有可解析的 settings.json → 使用内置默认值" ],
+                @"directories": @[
+                    @{ @"dir": @"/AppGroup/LiveContainer/LCProxy", @"isCanonical": @YES,
+                       @"writable": @YES, @"settingsExists": @YES, @"settingsReadable": @NO,
+                       @"confExists": @YES },
+                ],
+                @"lastSaveAt": @1, @"lastSaveBytes": @100, @"lastSaveError": @"",
+                @"lastSavePerDirectory": @[ @{ @"dir": @"/x", @"result": @"写入失败: 权限不足",
+                                              @"readBackOK": @NO } ],
+            };
+            expect_level(p, LCProxyDiagLevelBad, "unreadable config is BAD");
+            expect_text(p, @"读不到可解析的 settings.json", "unreadable config is named");
+            expect_text(p, @"读不回来", "save-vs-readback asymmetry is surfaced");
+        }
+
+        // ⑪ 权威目录缺失、回退到其它目录的最新副本（私有/共享可能看到不同副本）。
+        {
+            NSMutableDictionary *p = baseline();
+            p[@"configDiag"] = @{
+                @"source": @"fallback(mtime-newest)",
+                @"canonicalDirectory": @"/AppGroup/LiveContainer/LCProxy",
+                @"effectiveProxyMode": @"kingcard",
+                @"trail": @[ @"权威目录没有 settings.json，回退到最新副本" ],
+                @"directories": @[ @{ @"dir": @"/p", @"settingsReadable": @YES, @"writable": @YES } ],
+                @"lastSavePerDirectory": @[],
+            };
+            expect_level(p, LCProxyDiagLevelWarn, "fallback config source is a WARN");
+            expect_text(p, @"最新的副本", "fallback is explained (private/shared may differ)");
+        }
+
+        // ⑫ 生效配置里 proxyMode 不是 kingcard —— 界面显示与真正生效值不一致。
+        {
+            NSMutableDictionary *p = baseline();
+            p[@"configDiag"] = @{
+                @"source": @"canonical",
+                @"canonicalDirectory": @"/AppGroup/LiveContainer/LCProxy",
+                @"effectiveProxyMode": @"custom",
+                @"trail": @[],
+                @"directories": @[ @{ @"dir": @"/x", @"settingsReadable": @YES, @"writable": @YES } ],
+                @"lastSavePerDirectory": @[ @{ @"dir": @"/x", @"readBackOK": @YES } ],
+            };
+            expect_level(p, LCProxyDiagLevelBad, "effective mode != kingcard is BAD");
+            expect_text(p, @"而不是 kingcard", "the passed-over mode is named explicitly");
+        }
+
         // ⑧ 空输入不得崩溃，且要明确说"拿不到数据"。
         expect_level(@{}, LCProxyDiagLevelWarn, "empty payload does not crash");
         expect_level(nil, LCProxyDiagLevelWarn, "nil payload does not crash");

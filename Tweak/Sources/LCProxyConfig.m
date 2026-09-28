@@ -42,6 +42,11 @@ static nw_path_monitor_t g_networkMonitor;
 // 王卡转发器缺失时的持续重启状态：fail-closed 丢包期间按退避不断尝试重建，
 // 并在进入该状态时通知用户（绝不直连——直连会消耗通用流量）。
 @property (nonatomic, assign) BOOL forwarderUnavailable;
+// 上次保存的结果（供 /api/diag）：写进了哪些目录、字节数、错误、能否读回。
+@property (nonatomic, assign) NSTimeInterval lastSaveAt;
+@property (nonatomic, assign) NSUInteger lastSaveBytes;
+@property (nonatomic, copy) NSString *lastSaveError;
+@property (nonatomic, copy) NSArray *lastSavePerDirectory;
 @property (nonatomic, assign) NSUInteger forwarderRetryCount;
 @property (nonatomic, assign) BOOL forwarderRetryScheduled;
 - (void)checkNetworkAndApplyIfNeeded;
@@ -56,9 +61,11 @@ static nw_path_monitor_t g_networkMonitor;
 - (void)schedulePostRecoveryHealthCheck;
 - (void)noteForwarderAvailability:(BOOL)available;
 - (void)scheduleForwarderRecoveryRetry;
+// 记录/读取"上次保存写进了哪些目录"；见 synchronizeSettings。
+- (void)noteSaveDiagnostics:(NSArray *)perDir bytes:(NSUInteger)bytes error:(NSString *)error;
 - (void)resetRecoveryBudgets;
 - (NSDictionary *)mergedSettingsFrom:(NSDictionary *)settings;
-- (NSDictionary *)settingsInDirectory:(NSString *)directory;
+// settingsInDirectory: 已在公开头文件声明（诊断与迁移共用）。
 - (NSDictionary *)newestFallbackSettings;
 - (BOOL)synchronizeSettings:(NSDictionary *)settings;
 @end
@@ -178,25 +185,56 @@ static nw_path_monitor_t g_networkMonitor;
 - (BOOL)synchronizeSettings:(NSDictionary *)settings {
     NSError *err = nil;
     NSData *data = [NSJSONSerialization dataWithJSONObject:settings options:NSJSONWritingPrettyPrinted error:&err];
-    if (!data) return NO;
+    if (!data) {
+        [self noteSaveDiagnostics:@{} bytes:0 error:[NSString stringWithFormat:@"序列化失败: %@", err.localizedDescription ?: @"?"]];
+        return NO;
+    }
     BOOL wroteAny = NO;
+    NSMutableArray *perDir = [NSMutableArray array];
     for (NSString *dir in LCProxyAllDataDirectories()) {
         if (!dir.length) continue;
+        NSString *dirResult = @"?";
+        NSError *dirErr = nil;
         if (![[NSFileManager defaultManager] createDirectoryAtPath:dir
-                                      withIntermediateDirectories:YES attributes:nil error:&err]) {
+                                      withIntermediateDirectories:YES attributes:nil error:&dirErr]) {
+            dirResult = [NSString stringWithFormat:@"不可创建目录: %@", dirErr.localizedDescription ?: @"?"];
+            [perDir addObject:@{ @"dir": dir, @"result": dirResult }];
             continue;
         }
         NSString *settingsPath = [dir stringByAppendingPathComponent:LCProxySettingsFile];
         NSData *existing = [NSData dataWithContentsOfFile:settingsPath];
-        if ([existing isEqualToData:data] ||
-            [data writeToFile:settingsPath options:NSDataWritingAtomic error:&err]) {
+        if ([existing isEqualToData:data]) {
             wroteAny = YES;
+            dirResult = @"内容已一致";
+        } else if ([data writeToFile:settingsPath options:NSDataWritingAtomic error:&dirErr]) {
+            wroteAny = YES;
+            dirResult = @"已写入";
+        } else {
+            dirResult = [NSString stringWithFormat:@"写入失败: %@", dirErr.localizedDescription ?: @"?"];
         }
+        // 回读校验：写入成功不等于"下次读取能得到同样内容"（权限/沙箱/符号链接都可能作梗）。
+        NSDictionary *readBack = [self settingsInDirectory:dir];
+        BOOL verified = readBack && readBack.count > 0;
+        [perDir addObject:@{ @"dir": dir, @"result": dirResult, @"readBackOK": @(verified) }];
+        if (!verified) wroteAny = NO;
+
         if ([self writeProxychainsConf:settings toDirectory:dir]) {
             wroteAny = YES;
         }
     }
+    [self noteSaveDiagnostics:perDir bytes:data.length error:nil];
     return wroteAny;
+}
+
+// 记录上次保存的结果，供 /api/diag 展示"保存到底写进了哪里、能否读回"。
+// 用户报告的"保存似乎有用但读取不正常"正需要这组数据来判断。
+- (void)noteSaveDiagnostics:(NSArray *)perDir bytes:(NSUInteger)bytes error:(NSString *)error {
+    [self.lock lock];
+    self.lastSaveAt = [[NSDate date] timeIntervalSince1970];
+    self.lastSaveBytes = bytes;
+    self.lastSaveError = error ?: @"";
+    self.lastSavePerDirectory = perDir ?: @[];
+    [self.lock unlock];
 }
 
 - (BOOL)saveSettings:(NSDictionary *)settings {
@@ -376,6 +414,90 @@ static nw_path_monitor_t g_networkMonitor;
     @synchronized(self) {
         return _networkGeneration;
     }
+}
+
+// ---------------------------------------------------------------------------
+// 配置读写**全链路**诊断
+// ---------------------------------------------------------------------------
+//
+// 用户报告："控制台读配置不正常，但保存似乎有用" —— 这种**读写不对称**无法靠
+// settingsPath/settingsExists 两个字段判断。这里把每一步摊开：
+//   · 权威目录（canonical）是哪个、它可写吗？
+//   · 每个候选目录里 settings.json / proxychains.conf 是否存在、大小、修改时间、
+//     能否解析、解析出多少键、关键键（proxyMode）是什么？
+//   · 最终 load 用的是哪一份、为什么（权威命中 / 回退到最新 / 落到默认值）？
+//   · 上次保存分别写进了哪些目录、能否读回？
+// 只读、不写 —— 诊断绝不能改变被诊断的状态。
+- (NSDictionary *)configDiagnostics {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *canonical = self.dataDirectory;
+    NSArray<NSString *> *dirs = LCProxyAllDataDirectories();
+
+    NSMutableArray *perDir = [NSMutableArray array];
+    for (NSString *dir in dirs) {
+        if (!dir.length) continue;
+        NSMutableDictionary *e = [NSMutableDictionary dictionary];
+        e[@"dir"] = dir;
+        e[@"isCanonical"] = @([dir isEqualToString:canonical]);
+        e[@"writable"] = @([fm isWritableFileAtPath:dir]);
+
+        NSString *sp = [dir stringByAppendingPathComponent:LCProxySettingsFile];
+        BOOL settingsExists = [fm fileExistsAtPath:sp];
+        e[@"settingsExists"] = @(settingsExists);
+        if (settingsExists) {
+            NSDictionary *attrs = [fm attributesOfItemAtPath:sp error:nil];
+            e[@"settingsSize"] = attrs[NSFileSize] ?: @0;
+            NSDate *mtime = attrs[NSFileModificationDate];
+            e[@"settingsMtime"] = mtime ? @(mtime.timeIntervalSince1970) : @0;
+            // 能否真的读出来并解析成字典 —— "文件存在"不等于"读得到"。
+            NSDictionary *obj = [self settingsInDirectory:dir];
+            e[@"settingsReadable"] = @(obj != nil);
+            if (obj) {
+                e[@"settingsKeyCount"] = @(obj.count);
+                id mode = obj[@"proxyMode"];
+                e[@"settingsProxyMode"] = [mode isKindOfClass:[NSString class]] ? mode : @"";
+            }
+        }
+        NSString *cp = [dir stringByAppendingPathComponent:LCProxyConfFile];
+        e[@"confExists"] = @([fm fileExistsAtPath:cp]);
+        [perDir addObject:e];
+    }
+
+    // 复现 load 的决策过程（只读，不做任何补偿性写入）。
+    NSDictionary *canonicalRaw = [self settingsInDirectory:canonical];
+    NSDictionary *fallbackRaw = [self newestFallbackSettings];
+    NSString *source = @"defaults";
+    NSMutableArray *trail = [NSMutableArray array];
+    if (canonicalRaw) {
+        source = @"canonical";
+        [trail addObject:@"权威目录存在 settings.json，直接使用它"];
+    } else if (fallbackRaw) {
+        source = @"fallback(mtime-newest)";
+        [trail addObject:@"权威目录没有 settings.json，回退到修改时间最新的其它目录副本"];
+    } else {
+        [trail addObject:@"任何目录都没有可解析的 settings.json → 使用内置默认值（王卡模式下这是致命混淆点）"];
+    }
+
+    NSDictionary *effectiveSettings = [self load];
+    NSDictionary *result = @{
+        @"canonicalDirectory": canonical ?: @"",
+        @"settingsPath": [self settingsPath] ?: @"",
+        @"confPath": [self proxychainsConfPath] ?: @"",
+        @"source": source,
+        @"trail": trail,
+        @"directories": perDir,
+        @"effectiveProxyMode": [effectiveSettings[@"proxyMode"] isKindOfClass:[NSString class]]
+                                ? effectiveSettings[@"proxyMode"] : @"",
+        @"effectiveKingTypeName": [effectiveSettings[@"kingTypeName"] isKindOfClass:[NSString class]]
+                                ? effectiveSettings[@"kingTypeName"] : @"",
+        @"effectiveMccmnc": [effectiveSettings[@"kingMccmnc"] isKindOfClass:[NSString class]]
+                                ? effectiveSettings[@"kingMccmnc"] : @"",
+        @"lastSaveAt": @(self.lastSaveAt),
+        @"lastSaveBytes": @(self.lastSaveBytes),
+        @"lastSaveError": self.lastSaveError ?: @"",
+        @"lastSavePerDirectory": self.lastSavePerDirectory ?: @[],
+    };
+    return result;
 }
 
 - (NSDictionary *)runtimeDiagnostics {
