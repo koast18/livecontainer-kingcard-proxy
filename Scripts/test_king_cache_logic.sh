@@ -724,6 +724,15 @@ _cfgdiag = config[config.index('- (NSDictionary *)configDiagnostics {'):]
 _cfgdiag = _cfgdiag[:_cfgdiag.index('\n}\n') + 3]
 for _w in ('writeToFile', 'synchronizeSettings', 'createDirectoryAtPath'):
     assert _w not in _cfgdiag, f'configDiagnostics must be read-only (found {_w})'
+# LCProxyConfig **没有** lock 属性（其写入都在串行 runtimeQueue 上）。用 @synchronized(self)
+# 保护保存结果字段即可。曾因凭空假设 self.lock 导致编译失败（Build 红）。
+assert 'self.lock' not in config, \
+    'LCProxyConfig has no lock property; assume-one-and-it-fails-to-compile'
+assert '@synchronized (self)' in config, \
+    'the save-result fields are not protected at all'
+# noteSaveDiagnostics 的 perDir 参数是 NSArray；传 @{} 会编译失败。
+assert 'noteSaveDiagnostics:@[]' in config, \
+    'noteSaveDiagnostics is called with a dictionary instead of an array (compile error)'
 _diag = Path('Tweak/Sources/LCProxyDiagnosis.m').read_text(encoding='utf-8')
 # 关键判据必须都在：真监听、链端口、路由发布、零字节上游、池为空、引导身份。
 for _needle in ('listenProbeOk', 'chainProxyPort', 'routePublished', 'recvFail',

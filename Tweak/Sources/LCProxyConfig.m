@@ -186,7 +186,7 @@ static nw_path_monitor_t g_networkMonitor;
     NSError *err = nil;
     NSData *data = [NSJSONSerialization dataWithJSONObject:settings options:NSJSONWritingPrettyPrinted error:&err];
     if (!data) {
-        [self noteSaveDiagnostics:@{} bytes:0 error:[NSString stringWithFormat:@"序列化失败: %@", err.localizedDescription ?: @"?"]];
+        [self noteSaveDiagnostics:@[] bytes:0 error:[NSString stringWithFormat:@"序列化失败: %@", err.localizedDescription ?: @"?"]];
         return NO;
     }
     BOOL wroteAny = NO;
@@ -228,13 +228,17 @@ static nw_path_monitor_t g_networkMonitor;
 
 // 记录上次保存的结果，供 /api/diag 展示"保存到底写进了哪里、能否读回"。
 // 用户报告的"保存似乎有用但读取不正常"正需要这组数据来判断。
+//
+// 注意：LCProxyConfig **没有**自己的锁（它的写入都在串行 runtimeQueue 上，读取是只读快照）。
+// 这里用 @synchronized(self) 保护这几个字段的赋值，避免与读取方（诊断）交错时看到半更新的
+// 组合；不做任何可能回头的调用，因此不会引入锁序问题。
 - (void)noteSaveDiagnostics:(NSArray *)perDir bytes:(NSUInteger)bytes error:(NSString *)error {
-    [self.lock lock];
-    self.lastSaveAt = [[NSDate date] timeIntervalSince1970];
-    self.lastSaveBytes = bytes;
-    self.lastSaveError = error ?: @"";
-    self.lastSavePerDirectory = perDir ?: @[];
-    [self.lock unlock];
+    @synchronized (self) {
+        self.lastSaveAt = [[NSDate date] timeIntervalSince1970];
+        self.lastSaveBytes = bytes;
+        self.lastSaveError = error ?: @"";
+        self.lastSavePerDirectory = perDir ?: @[];
+    }
 }
 
 - (BOOL)saveSettings:(NSDictionary *)settings {
@@ -479,6 +483,14 @@ static nw_path_monitor_t g_networkMonitor;
     }
 
     NSDictionary *effectiveSettings = [self load];
+    // 上次保存结果与写入方用同一把 @synchronized 读取，避免看到半更新的组合。
+    NSTimeInterval saveAt; NSUInteger saveBytes; NSString *saveErr; NSArray *savePerDir;
+    @synchronized (self) {
+        saveAt = self.lastSaveAt;
+        saveBytes = self.lastSaveBytes;
+        saveErr = self.lastSaveError ?: @"";
+        savePerDir = self.lastSavePerDirectory ?: @[];
+    }
     NSDictionary *result = @{
         @"canonicalDirectory": canonical ?: @"",
         @"settingsPath": [self settingsPath] ?: @"",
@@ -492,10 +504,10 @@ static nw_path_monitor_t g_networkMonitor;
                                 ? effectiveSettings[@"kingTypeName"] : @"",
         @"effectiveMccmnc": [effectiveSettings[@"kingMccmnc"] isKindOfClass:[NSString class]]
                                 ? effectiveSettings[@"kingMccmnc"] : @"",
-        @"lastSaveAt": @(self.lastSaveAt),
-        @"lastSaveBytes": @(self.lastSaveBytes),
-        @"lastSaveError": self.lastSaveError ?: @"",
-        @"lastSavePerDirectory": self.lastSavePerDirectory ?: @[],
+        @"lastSaveAt": @(saveAt),
+        @"lastSaveBytes": @(saveBytes),
+        @"lastSaveError": saveErr,
+        @"lastSavePerDirectory": savePerDir,
     };
     return result;
 }
