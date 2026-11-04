@@ -180,6 +180,7 @@ th:first-child,td:first-child { text-align:left; }
     <div class="row"><span class="k">核心代理数</span><span class="v" id="proxyCount">…</span></div>
     <div class="row"><span class="k">控制端口</span><span class="v" id="port">…</span></div>
     <div class="row"><span class="k">宿主进程形态</span><span class="v" id="hostProcessType">…</span></div>
+    <div class="row"><span class="k">Tweaks 清单</span><span class="v" id="tweaksInventory">…</span></div>
     <p class="msg">提示：修改代理地址或端口后，建议重启一次被代理 App，确保 WKWebView 等系统组件也使用新配置。</p>
   </div>
 </main>
@@ -242,6 +243,17 @@ async function loadStatus() {
   $('hostProcessType').textContent =
     (s.hostProcessType || '?') + (s.isExtensionHosted ? '（appex 宿主）' : '（UIApplication 宿主）')
     + (s.isSharedTweaks ? ' · 共享 tweaks' : ' · 私有 tweaks') + ' · pid=' + (s.pid||'?');
+  // 共享 App 加载的是 App Group Tweaks 里控制台复制过去的副本；与私有目录版本不一致时
+  // 共享 App 跑的是旧代码 —— 这是"私有正常、共享断网"唯一确定性的成因，必须直接提示。
+  {
+    const inv = s.tweaksInventory || {};
+    const act = side => ((inv[side] || {}).files || []).map(f => f.name).filter(n => /\.dylib$/.test(n));
+    const p = act('private'), sh = act('shared');
+    let msg = '私有: ' + (p.join(', ') || '无') + ' | 共享: ' + (sh.join(', ') || '无');
+    if (p.length && sh.length && p.sort().join() !== sh.sort().join()) msg = '⚠ 版本不一致，共享 App 跑的是旧 dylib — ' + msg;
+    else if (p.length && !sh.length) msg = '⚠ 共享目录没有已启用 dylib，共享 App 不会被代理 — ' + msg;
+    $('tweaksInventory').textContent = msg;
+  }
   if (dirty) return;
   $('proxyEnabled').checked = !!s.proxyEnabled;
   $('blockNonTcp').checked = !!s.blockNonTcp;

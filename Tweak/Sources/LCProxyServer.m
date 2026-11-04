@@ -178,6 +178,10 @@ static const NSUInteger LCProxyDefaultPort = 19092;
     // 每个进程加载 dylib 的事实（时间/pid/版本/路径/bundle）。用于确认共享 App
     // 到底加载了哪个版本 —— 这是"修复是否真的生效"的唯一可靠依据。
     d[@"dylibLoadsTail"] = [self tailOfAppGroupLog:@"dylib-loads.log" maxLines:20];
+    // 两个 Tweaks 目录里的 LCProxyControl-* 清单。共享 App 加载的是 App Group Tweaks
+    // 里**控制台复制过去的副本**（LiveContainer 不会给该目录签名），私有 App 加载的是
+    // 用户签名的那份 —— 二者版本不一致是"私有正常、共享失效"唯一确定性的成因。
+    d[@"tweaksInventory"] = [self tweaksInventory];
     NSDictionary *runtimeDiag = [[LCProxyConfig shared] runtimeDiagnostics];
     if ([runtimeDiag isKindOfClass:[NSDictionary class]]) {
         d[@"runtime"] = runtimeDiag;
@@ -185,6 +189,45 @@ static const NSUInteger LCProxyDefaultPort = 19092;
     NSDictionary *stats = [[LCProxyStats shared] aggregate];
     d[@"kingAggregate"] = stats[@"forwarder"] ?: @{};
     return d;
+}
+
+// 只读列目录（不签名校验、不改动任何文件）。失败一律返回空，纯诊断。
+- (NSDictionary *)tweaksInventory {
+    NSMutableDictionary *out = [NSMutableDictionary dictionary];
+    @try {
+        NSMutableDictionary<NSString *, NSString *> *dirs = [NSMutableDictionary dictionary];
+        const char *home = getenv("LC_HOME_PATH");
+        if (home && home[0]) {
+            NSString *h = @(home);
+            if (![[h lastPathComponent] isEqualToString:@"Documents"]) {
+                h = [h stringByAppendingPathComponent:@"Documents"];
+            }
+            dirs[@"private"] = [h stringByAppendingPathComponent:@"Tweaks"];
+        }
+        NSString *shared = LCProxySharedDataDirectory();
+        if (shared.length) {
+            dirs[@"shared"] = [[shared stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"Tweaks"];
+        }
+        for (NSString *key in dirs) {
+            NSString *dir = dirs[key];
+            NSMutableArray *files = [NSMutableArray array];
+            for (NSString *f in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil] ?: @[]) {
+                if (![f hasPrefix:@"LCProxyControl"]) continue;
+                NSDictionary *attrs = [[NSFileManager defaultManager]
+                    attributesOfItemAtPath:[dir stringByAppendingPathComponent:f] error:nil];
+                [files addObject:@{
+                    @"name": f,
+                    @"size": attrs[NSFileSize] ?: @0,
+                    @"mtime": @([attrs.fileModificationDate timeIntervalSince1970]),
+                }];
+            }
+            out[key] = @{ @"dir": dir, @"files": files };
+        }
+    } @catch (NSException *e) {
+        LCProxyRecordSwallowedException(@"tweaksInventory", e);
+    }
+    out[@"loaded"] = LCProxyDylibPath() ?: @"";
+    return out;
 }
 
 #pragma mark - Proxy exit IP test

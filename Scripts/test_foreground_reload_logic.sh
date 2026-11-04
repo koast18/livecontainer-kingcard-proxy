@@ -219,5 +219,16 @@ assert 'if (!kp_forwarder_serving(fw) || fw->listen_port <= 0) return 0;' in cor
     'probe_local can report a dead listener as alive via kernel backlog'
 assert 'int kp_forwarder_listener_error(kp_forwarder *fw);' in Path('Tweak/Sources/KPKIngCore.h').read_text(encoding='utf-8')
 
+# 共享 App 加载的 dylib 是 App Group Tweaks 里的副本：诊断必须同时列出两个目录的清单，
+# 控制台必须在版本不一致时直接提示（"私有正常、共享失效"唯一确定性的成因）。
+_srv = Path('Tweak/Sources/LCProxyServer.m').read_text(encoding='utf-8')
+assert 'd[@"tweaksInventory"] = [self tweaksInventory];' in _srv, 'status lost the Tweaks inventory'
+_inv = _srv[_srv.find('- (NSDictionary *)tweaksInventory {'):]
+_inv = _inv[:_inv.find('#pragma mark')]
+assert 'removeItem' not in _inv and 'moveItem' not in _inv and 'copyItem' not in _inv,     'tweaksInventory must be read-only'
+_html = Path('Resources/console.html').read_text(encoding='utf-8')
+assert 'id="tweaksInventory"' in _html and 's.tweaksInventory' in _html, 'console lost the Tweaks inventory row'
+assert 'tweaksInventory' in Path('Tweak/Sources/ConsoleHTML.h').read_text(encoding='utf-8'),     'ConsoleHTML.h not regenerated after console.html change'
+
 print('foreground reload / shared-app forwarder static checks OK')
 PY
