@@ -888,3 +888,45 @@ https://cdn.jsdelivr.net/gh/koast18/livecontainer-kingcard-proxy@master/AltStore
   - `d8cebed` / `090e911` 后台/熄屏双修复 + 回归审计（0.5.74/75）
   - `09b2fcb` / `fc99e09` / `d783649` 跨进程可观测 → `/api/diag` → `/api/selfcheck`（0.5.71/76/80）
   - `090e911` ⚠️ **同时引入了 §0.1 的嵌套锁死锁**（0.5.75）—— 读它时请同时看 `LCProxyKing.m` 的 `status`
+
+---
+
+## 19. 共享 vs 私有：加载内容与路径的逐项源码核对（v0.5.81 之后补充）
+
+> 结论先行：**数据/配置/凭证路径两边一致；真正不同的是"加载哪个 dylib 文件"和"宿主进程形态"。**
+> 前者是唯一能让"私有正常、共享失效"**确定性**成立的机制，且一条日志即可判定。
+
+| 环节 | 私有 App | 共享 App | 依据 | 是否影响转发 |
+|---|---|---|---|---|
+| Tweak 扫描目录 | `<LC_HOME>/Documents/Tweaks` | `<AppGroup>/LiveContainer/Tweaks` | `LCBootstrap.m:347`（`LC_GLOBAL_TWEAKS_FOLDER`）、`TweakLoader.m` | **是** |
+| 该目录的 dylib 由谁放、谁签名 | 控制台下载 → 用户在 LC 签名 | **只有控制台 `AutoUpdater` 在"私有侧已签名"后复制过去**；LC 的 `signApp` 只签 `lcGroupTweakPath/<tweakFolder>` 子目录与私有根，**从不签 App Group Tweaks 根** | `LCAppModel.swift:437-459`、`AutoUpdater.m:runAutoUpdate` | **是** |
+| settings / proxychains.conf | canonical `<AppGroup>/LiveContainer/LCProxy` | 同左 | `LCProxyConfig.dataDirectory`、`set_config_path` 钉死 C 层路径 | 否（两边相同） |
+| 凭证日志 / 取号日志 / 状态快照 | canonical | 同左 | `credentialLogPath`、`appendShared*` | 否 |
+| `LCProxyDataDirectory()`（由 dylib 路径反推） | `<LC_HOME>/Documents/LCProxy` | `<AppGroup>/LiveContainer/LCProxy` | `LCProxyPaths.m` | 否：只用于 stats / reset-stats / 显示 |
+| `LC_HOME_PATH` 回落 | — | 仅在 canonical 无 settings 时一次性迁移 | `LCProxyConfig.load`、`common.c` | 否 |
+| 请求构造 / 网络参数 | 进程无关 | 同左 | §7.3、`LCProxyNetworkInfo.m` | 否 |
+| `hookDlopen` | 可开 | 强制关 | `LCBootstrap.m:525` | 否（不影响 TweakLoader 的 dlopen） |
+| 宿主 | 主 App 进程 | multitask 下常为 `LiveProcess.appex`（`NSExtensionHost*` 通知） | `LCAppModel.swift:274`、`LiveProcess/main.m` | 是（v0.5.81 双订阅 + 墙钟心跳已覆盖） |
+| `Dead10ccFix` | 不安装 | 安装：切后台时给持锁文件打 `can-suspend-locked`，让进程**被挂起而不是被杀** | `Dead10ccFix.m:37-44` | 是：共享 App 更常经历"长挂起→恢复"，正是 H2/H3 场景 |
+
+### 19.1 唯一的"确定性"共享专属机制：App Group Tweaks 里是旧版 dylib
+
+共享 App 加载的 dylib **不是用户刚签名的那个文件**，而是控制台复制过去的副本。只要发生下列任一情况，
+私有 App 跑新版、共享 App 仍跑旧版（或没有 dylib）：
+
+1. 签名新版后**没有再打开一次控制台**（复制只在控制台启动时的 `runAutoUpdate` 里发生）；
+2. 控制台进程拿不到 `LCSharedUtils.appGroupID`（`sharedTweaksDirectory` 返回 nil → 直接跳过复制，仅写一行 diag）；
+3. 旧版已签名副本仍在共享目录：`enforceSingleActiveDylibIn` 只在 `normalSigned` 为真时才把目标设为新版。
+
+v0.5.75–v0.5.80 的 dylib 都带 §0.1 的 `status` 自死锁。**共享目录停在这些版本之一 + 控制台每 5s 轮询 `/api/status`**
+（`console.html` 的 `setInterval(refresh, 5000)`），足以让共享 App 的 King 层永久锁死、心跳与续期停摆 → 最终断网；
+而私有侧已是修好的版本 → 正常。这同时解释了 A（只坏共享）与 B（过一段时间才坏）。
+
+**判定只需一条日志**：控制台 `/api/diag` 的 `dylibLoadsTail`，找共享 App 的 bundle 那一行：
+`version` ≠ 私有那一行的 `version`，或 `dylib` 路径下的文件名版本更旧 → 成立。
+
+### 19.2 CI 状态
+
+v0.5.81（`6abb1a2` + 测试修正 `c5015e8`）已推到 `ci/v0.5.81-check` 分支，macOS CI **全绿**
+（含 iOS dylib 编译/链接、`test_forwarder_stop` 的死监听器用例）。未合入 master、未打 tag、未改 AltStore 源。
+修正点：`find_listen_fd` 原用 `SO_ACCEPTCONN`，Darwin 上 getsockopt 不可靠，改为"无 peer 的同端口 socket"。
