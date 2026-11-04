@@ -1336,6 +1336,13 @@ struct kp_forwarder {
 
     int listen_fd;
     int running;
+    // 监听 socket 已失效（iOS 挂起期间回收 socket 资源后，poll 返回 POLLERR/POLLHUP/
+    // POLLNVAL 或 accept 持续报致命错误）。0 = 正常；>0 = 致命 errno；-1 = poll revents 报错；
+    // -2 = ECONNABORTED 连续不断（defunct 的典型形态）。
+    // 与 running 分开：running 仍只由 start/stop 管理，stop/free/retain 语义完全不变；
+    // 只有对外的 is_running / listen_fd_valid / probe_local 据此报告"已死"，
+    // 从而让所有健康判据（含心跳的弱判据）都能看到真实状态并触发重建。
+    int listener_error;
     uint64_t pbproxy_bootstrap_deadline_ms;
     uint64_t pbproxy_bootstrap_lease;
     uint64_t pbproxy_bootstrap_next_lease;
@@ -1365,6 +1372,15 @@ static int kp_forwarder_running(const kp_forwarder *fw) {
 
 static int kp_forwarder_listen_fd(const kp_forwarder *fw) {
     return fw ? __atomic_load_n(&fw->listen_fd, __ATOMIC_ACQUIRE) : -1;
+}
+
+static int kp_forwarder_listener_error_value(const kp_forwarder *fw) {
+    return fw ? __atomic_load_n(&fw->listener_error, __ATOMIC_ACQUIRE) : 0;
+}
+
+// 对外"监听器活着"：已启动、未停止、且 accept 循环没有判定监听 socket 失效。
+static int kp_forwarder_serving(const kp_forwarder *fw) {
+    return kp_forwarder_running(fw) && kp_forwarder_listener_error_value(fw) == 0;
 }
 
 static void kp_stat_increment(uint64_t *value) {
@@ -2593,8 +2609,32 @@ static void *kp_client_thread(void *arg) {
     return NULL;
 }
 
+// accept 失败分类。
+//
+// 旧实现对 poll 的错误 revents 和 accept 的任何失败一律 `continue`：iOS 挂起期间回收
+// 监听 socket 后（Apple TN2277：被回收 socket 的错误码"刻意不作规定"），poll 立即返回
+// 就绪、accept 立即失败，循环以 100% CPU 空转，而 running 恒为 1 —— 于是 isRunning /
+// listen_fd_valid 永远报"健康"，心跳永不重建，表现为后台/熄屏后彻底断网且不恢复。
+//
+// 现在：
+//   · 资源暂时不足（EMFILE/ENFILE/ENOBUFS/ENOMEM）与 EINTR/EAGAIN：退避后重试，绝不判死
+//     （判死会触发重建，而重建同样需要 fd，只会更糟）；
+//   · ECONNABORTED：单次属于正常（对端在 accept 前 RST），但**连续**大量出现即 defunct；
+//   · 其余 errno（EBADF/EINVAL/ENOTSOCK/EOPNOTSUPP/…）：监听 socket 已失效，判死退出。
+#define KP_ACCEPT_BACKOFF_US 50000
+#define KP_ACCEPT_ABORT_STREAK_DEAD 64
+
+static void kp_forwarder_mark_listener_dead(kp_forwarder *fw, int code) {
+    int expected = 0;
+    if (code == 0) code = -1;
+    __atomic_compare_exchange_n(&fw->listener_error, &expected, code, 0,
+                                __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+    kp_dbg("[fw] listener on port %d marked dead (code=%d)", fw->listen_port, code);
+}
+
 static void *kp_forwarder_run(void *arg) {
     kp_forwarder *fw = arg;
+    int abort_streak = 0;
     while (kp_forwarder_running(fw)) {
         struct sockaddr_in peer;
         socklen_t plen = sizeof(peer);
@@ -2609,15 +2649,42 @@ static void *kp_forwarder_run(void *arg) {
         pfd.events = POLLIN;
         pfd.revents = 0;
         int pr = poll(&pfd, 1, KP_FORWARDER_ACCEPT_POLL_MS);
-        if (pr <= 0) {
-            // 超时 / EINTR / 出错：回到循环顶部重新检查 running 与 listen_fd。
+        if (pr == 0) continue;  // 超时：回到循环顶部重新检查 running 与 listen_fd。
+        if (pr < 0) {
+            int perr = errno;
+            if (!kp_forwarder_running(fw)) break;
+            if (perr == EINTR || perr == EAGAIN) continue;
+            // poll 本身对单个 fd 出错（如 EBADF 之外的 EINVAL/ENOMEM）：退避，避免空转。
+            usleep(KP_ACCEPT_BACKOFF_US);
             continue;
+        }
+        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            // 停止流程 shutdown 监听 fd 时也会走到这里：running 已为 0，直接退出即可。
+            if (!kp_forwarder_running(fw)) break;
+            kp_forwarder_mark_listener_dead(fw, -1);
+            break;
         }
         int client = accept(listen_fd, (struct sockaddr *)&peer, &plen);
         if (client < 0) {
+            int aerr = errno;
             if (!kp_forwarder_running(fw)) break;
-            continue;
+            if (aerr == EINTR || aerr == EAGAIN || aerr == EWOULDBLOCK) continue;
+            if (aerr == EMFILE || aerr == ENFILE || aerr == ENOBUFS || aerr == ENOMEM) {
+                usleep(KP_ACCEPT_BACKOFF_US);
+                continue;
+            }
+            if (aerr == ECONNABORTED) {
+                if (++abort_streak >= KP_ACCEPT_ABORT_STREAK_DEAD) {
+                    kp_forwarder_mark_listener_dead(fw, -2);
+                    break;
+                }
+                usleep(KP_ACCEPT_BACKOFF_US / 10);
+                continue;
+            }
+            kp_forwarder_mark_listener_dead(fw, aerr > 0 ? aerr : -1);
+            break;
         }
+        abort_streak = 0;
         // 高速下载并发上限：超出则立即拒绝，避免线程风暴耗尽进程资源。
         pthread_mutex_lock(&fw->client_lock);
         int over = !kp_forwarder_running(fw) ||
@@ -2812,6 +2879,7 @@ int kp_forwarder_start(kp_forwarder *fw) {
             fw->listen_port = ntohs(sin6->sin6_port);
         }
     }
+    __atomic_store_n(&fw->listener_error, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&fw->listen_fd, fd, __ATOMIC_RELEASE);
     __atomic_store_n(&fw->running, 1, __ATOMIC_RELEASE);
     if (pthread_create(&fw->thread, NULL, kp_forwarder_run, fw) != 0) {
@@ -2848,7 +2916,7 @@ int kp_forwarder_active_clients(kp_forwarder *fw) {
 }
 
 int kp_forwarder_listen_fd_valid(kp_forwarder *fw) {
-    return kp_forwarder_running(fw) && kp_forwarder_listen_fd(fw) >= 0;
+    return kp_forwarder_serving(fw) && kp_forwarder_listen_fd(fw) >= 0;
 }
 
 // ★ 真正的"还在监听"检查：真去连一次 listen_port，而不是只看 fd 号。
@@ -2869,7 +2937,9 @@ int kp_forwarder_is_listening(kp_forwarder *fw) {
 }
 
 int kp_forwarder_probe_local(kp_forwarder *fw, int timeout_ms) {
-    if (!kp_forwarder_running(fw) || fw->listen_port <= 0) return 0;
+    // 必须先看 listener_error：accept 线程已退出时，内核仍可能替 backlog 完成三次握手，
+    // connect 会"成功"但永远没人 accept —— 仅凭 connect 成功会把死监听器判成活的。
+    if (!kp_forwarder_serving(fw) || fw->listen_port <= 0) return 0;
     int fd = kp_connect_host("127.0.0.1", fw->listen_port, timeout_ms);
     if (fd < 0) return 0;
     KP_CLOSESOCK(fd);
@@ -3063,7 +3133,8 @@ void kp_forwarder_free(kp_forwarder *fw) {
     free(fw);
 }
 
-int kp_forwarder_is_running(kp_forwarder *fw) { return kp_forwarder_running(fw); }
+int kp_forwarder_is_running(kp_forwarder *fw) { return kp_forwarder_serving(fw); }
+int kp_forwarder_listener_error(kp_forwarder *fw) { return kp_forwarder_listener_error_value(fw); }
 int kp_forwarder_port(kp_forwarder *fw) { return fw ? fw->listen_port : 0; }
 
 void kp_forwarder_get_stats(kp_forwarder *fw, kp_forwarder_stats *stats) {

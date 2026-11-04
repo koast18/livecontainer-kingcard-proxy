@@ -13,6 +13,27 @@ NSString * _Nullable LCProxySharedDataDirectory(void);
 NSString *LCProxyCanonicalDataDirectory(void);
 NSArray<NSString *> *LCProxyAllDataDirectories(void);
 
+#pragma mark - 宿主进程形态
+
+/// 本进程属于 LiveContainer 的哪一种宿主形态：
+///
+/// - `@"liveprocess"`：LiveProcess.appex（URL scheme `*.liveprocess`）。由
+///   `xpc_main` / `_xpc_objc_uimain` 承载，`UIApplicationMain` 在
+///   `LiveProcess/main.m` 里被**整体替换**，因此 `UIApplication*` 生命周期通知
+///   **不会**被投递 —— 对应的通知族是 `NSExtensionHost*`。
+/// - `@"uiapp"`：LiveContainer 主 App 进程（普通 UIApplication 生命周期）。
+///
+/// 为什么必须区分：LiveContainer 把**共享 App** 在 multitask 场景下交给 free 的 LC
+/// 实例（见 `LiveContainerSwiftUI/Models/LCAppModel.swift` 的 `uiIsShared` 分支），
+/// 那个实例往往正是 `liveprocess`。tweak 若只订阅 `UIApplication*`，在这类进程里
+/// 「回前台恢复 / 切后台清理」**一次都不会触发**，转发器与 override 只能停在陈旧
+/// 状态上。LiveContainer 自己的 `LiveContainer/Tweaks/Dead10ccFix.m` 就是按
+/// `isLiveProcess` 在两个通知族之间切换的。
+NSString *LCProxyHostProcessType(void);
+
+/// `LCProxyHostProcessType() == @"liveprocess"`。
+BOOL LCProxyIsExtensionHostedProcess(void);
+
 #pragma mark - 崩溃加固
 
 /// 记录一次被兜住的 ObjC 异常。

@@ -179,6 +179,7 @@ th:first-child,td:first-child { text-align:left; }
     <div class="row"><span class="k">配置存在</span><span class="v" id="confExists">…</span></div>
     <div class="row"><span class="k">核心代理数</span><span class="v" id="proxyCount">…</span></div>
     <div class="row"><span class="k">控制端口</span><span class="v" id="port">…</span></div>
+    <div class="row"><span class="k">宿主进程形态</span><span class="v" id="hostProcessType">…</span></div>
     <p class="msg">提示：修改代理地址或端口后，建议重启一次被代理 App，确保 WKWebView 等系统组件也使用新配置。</p>
   </div>
 </main>
@@ -236,6 +237,11 @@ async function loadStatus() {
   $('confExists').textContent = s.proxychainsConfExists ? '是' : '否';
   $('proxyCount').textContent = s.proxyCount != null ? String(s.proxyCount) : '—';
   $('port').textContent = s.serverPort || '—';
+  // 本控制台只反映“提供这个端口的进程”。多进程（共享 App 跑在另一个 LC 实例里）时
+  // 必须一眼看出看到的是谁，否则会把别的进程的“全绿”当成出问题那个进程的现场。
+  $('hostProcessType').textContent =
+    (s.hostProcessType || '?') + (s.isExtensionHosted ? '（appex 宿主）' : '（UIApplication 宿主）')
+    + (s.isSharedTweaks ? ' · 共享 tweaks' : ' · 私有 tweaks') + ' · pid=' + (s.pid||'?');
   if (dirty) return;
   $('proxyEnabled').checked = !!s.proxyEnabled;
   $('blockNonTcp').checked = !!s.blockNonTcp;
@@ -290,6 +296,7 @@ function fmtTail(lines) {
   return lines.map(l => {
     try { const o = JSON.parse(l);
       return 'pid=' + o.pid + (o.isSharedTweaks ? ' [共享]' : ' [私有]')
+        + ' host=' + (o.hostType || '?')
         + ' ver=' + (o.ver||'?') + ' port=' + (o.port||0) + ' chain=' + (o.chainPort||0)
         + ' run=' + (o.running?1:0) + ' listen=' + (o.listenOk?1:0)
         + ' ready=' + (o.ready?1:0) + ' pool=' + JSON.stringify(o.pool||[])
@@ -361,7 +368,9 @@ function fmtSelfcheck(d) {
   if (!d) return '';
   const lines = [];
   lines.push('进程: pid=' + (d.pid||'?') + ' bundle=' + (d.bundleId||'?')
-    + (d.isSharedTweaks ? '  [共享 tweaks 路径]' : '  [私有 tweaks 路径]'));
+    + (d.isSharedTweaks ? '  [共享 tweaks 路径]' : '  [私有 tweaks 路径]')
+    + '  host=' + (d.hostProcessType || '?')
+    + (d.isExtensionHosted ? '（LiveProcess.appex）' : '（UIApplication）'));
   lines.push('结论: ' + (d.ok ? '✅ 能转发' : '❌ 无法转发') + '  stage=' + (d.stage||'?'));
   if (d.forwarderPort != null) lines.push('转发器端口=' + d.forwarderPort
     + ' 真监听=' + (d.listenProbeOk?1:0) + ' 路由已发布=' + (d.routePublished?1:0));
@@ -424,10 +433,10 @@ function fmtCompare(lines) {
     return out.join('\n');
   }
   const a = priv.o, b = sh.o;
-  out.push('私有 pid=' + a.pid + ' bundle=' + a.bundle + ' ver=' + a.ver);
-  out.push('共享 pid=' + b.pid + ' bundle=' + b.bundle + ' ver=' + b.ver);
+  out.push('私有 pid=' + a.pid + ' bundle=' + a.bundle + ' ver=' + a.ver + ' host=' + (a.hostType||'?'));
+  out.push('共享 pid=' + b.pid + ' bundle=' + b.bundle + ' ver=' + b.ver + ' host=' + (b.hostType||'?'));
   const FIELDS = [
-    ['ver','版本'], ['port','转发器端口'], ['chainPort','链端口'], ['overridePort','override'],
+    ['ver','版本'], ['hostType','宿主形态'], ['port','转发器端口'], ['chainPort','链端口'], ['overridePort','override'],
     ['running','运行'], ['listenOk','真监听'], ['ready','就绪'],
     ['vErr','lastError'],
   ];

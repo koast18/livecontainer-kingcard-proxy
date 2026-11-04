@@ -256,8 +256,13 @@ int kp_forwarder_probe_local(kp_forwarder *fw, int timeout_ms);
 /// 释放。
 void kp_forwarder_free(kp_forwarder *fw);
 
-/// 当前是否在监听。
+/// 当前是否在监听：已启动、未停止，且 accept 循环未判定监听 socket 失效。
+/// （监听 socket 被 iOS 回收后返回 0，让心跳/复用判据触发重建；仍需 stop/free 回收。）
 int kp_forwarder_is_running(kp_forwarder *fw);
+
+/// 监听失效原因：0 = 正常；>0 = accept 的致命 errno；-1 = poll 报 ERR/HUP/NVAL；
+/// -2 = ECONNABORTED 连续不断。仅用于诊断。
+int kp_forwarder_listener_error(kp_forwarder *fw);
 
 /// 监听端口。
 int kp_forwarder_port(kp_forwarder *fw);

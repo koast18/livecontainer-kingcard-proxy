@@ -8,10 +8,9 @@
 #import "Version.h"
 #include <fcntl.h>
 #include <unistd.h>
+#include <objc/message.h>   // LCProxyObserveLifecycleNotifications 用 objc_msgSend 按 SEL 派发
 
-static id<NSObject> g_lcDidBecomeActiveObserver;
-static id<NSObject> g_lcDidEnterBackgroundObserver;
-static id<NSObject> g_lcWillEnterForegroundObserver;
+static id<NSObject> g_lcLifecycleObservers;   // NSArray<id<NSObject>>，两个通知族的全部订阅
 static id<NSObject> g_lcForwarderUnavailableObserver;
 static id<NSObject> g_lcForwarderLifecycleObserver;
 
@@ -131,6 +130,62 @@ static void LCProxyShowBanner(NSDictionary *settings) {
     });
 }
 
+// 生命周期通知必须**同时**订阅两个通知族。
+//
+// LiveContainer 有两种宿主进程（见 LCProxyPaths.h 的 LCProxyHostProcessType）：
+//   · 主 App 进程（livecontainer://）      → UIApplication* 通知
+//   · LiveProcess.appex（*.liveprocess://）→ NSExtensionHost* 通知
+// 后者的 `UIApplicationMain` 被 LiveProcess/main.m 整体替换（xpc_main 承载），
+// UIApplication 的 active/foreground/background 通知根本不会被投递。共享 App 在
+// multitask 场景下正是被交给这类实例运行的，因此只订阅 UIApplication* 会让
+// 「回前台恢复」「切后台清理」在这类进程里彻底失效 —— 转发器与 override 永远停在
+// 陈旧状态，表现为“横幅还在、完全连不上”。
+//
+// 订阅两个族的成本为零（不存在的通知永远不会被投递），所以无条件全订阅，
+// 不做进程形态判断 —— 判断错了就等于又回到“猜”。
+//
+// 投递队列用 nil（在投递线程上同步执行）而不是 mainQueue：
+//   · 这些 handler 只做 `dispatch_async` 到 runtimeQueue，不碰 UI，本来就与线程无关；
+//   · appex 进程的主队列排空时机不可依赖，用 nil 可去掉这一层不确定性。
+static void LCProxyObserveLifecycleNotifications(void) {
+    NSArray<NSArray *> *families = @[
+        // 主 App 进程
+        @[UIApplicationDidBecomeActiveNotification,
+          UIApplicationWillEnterForegroundNotification,
+          UIApplicationDidEnterBackgroundNotification],
+        // LiveProcess.appex（XPC 服务宿主）
+        @[NSExtensionHostDidBecomeActiveNotification,
+          NSExtensionHostWillEnterForegroundNotification,
+          NSExtensionHostDidEnterBackgroundNotification],
+    ];
+    NSDictionary<NSString *, NSString *> *routing = @{
+        UIApplicationDidBecomeActiveNotification: @"notifyDidBecomeActive",
+        UIApplicationWillEnterForegroundNotification: @"notifyWillEnterForeground",
+        UIApplicationDidEnterBackgroundNotification: @"notifyDidEnterBackground",
+        NSExtensionHostDidBecomeActiveNotification: @"notifyDidBecomeActive",
+        NSExtensionHostWillEnterForegroundNotification: @"notifyWillEnterForeground",
+        NSExtensionHostDidEnterBackgroundNotification: @"notifyDidEnterBackground",
+    };
+    NSMutableArray<id<NSObject>> *tokens = [NSMutableArray array];
+    for (NSArray<NSString *> *family in families) {
+        for (NSString *name in family) {
+            SEL sel = NSSelectorFromString(routing[name]);
+            if (!sel) continue;
+            id<NSObject> token = [[NSNotificationCenter defaultCenter]
+                addObserverForName:name object:nil queue:nil
+                     usingBlock:^(NSNotification * _Nonnull note) {
+                (void)note;
+                LCProxyConfig *cfg = [LCProxyConfig shared];
+                if ([cfg respondsToSelector:sel]) {
+                    ((void (*)(id, SEL))objc_msgSend)(cfg, sel);
+                }
+            }];
+            if (token) [tokens addObject:token];
+        }
+    }
+    g_lcLifecycleObservers = tokens;
+}
+
 __attribute__((constructor))
 static void LCProxyControlConstructor(void) {
     @autoreleasepool {
@@ -173,29 +228,8 @@ static void LCProxyControlConstructor(void) {
         LCProxyShowBanner(initialSettings);
         [[LCProxyConfig shared] startNetworkMonitor];
 
-        g_lcDidBecomeActiveObserver =
-        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
-                                                          object:nil
-                                                           queue:[NSOperationQueue mainQueue]
-                                                      usingBlock:^(NSNotification * _Nonnull note) {
-            [[LCProxyConfig shared] notifyDidBecomeActive];
-        }];
-
-        g_lcWillEnterForegroundObserver =
-        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationWillEnterForegroundNotification
-                                                          object:nil
-                                                           queue:[NSOperationQueue mainQueue]
-                                                      usingBlock:^(NSNotification * _Nonnull note) {
-            [[LCProxyConfig shared] notifyWillEnterForeground];
-        }];
-
-        g_lcDidEnterBackgroundObserver =
-        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidEnterBackgroundNotification
-                                                          object:nil
-                                                           queue:[NSOperationQueue mainQueue]
-                                                      usingBlock:^(NSNotification * _Nonnull note) {
-            [[LCProxyConfig shared] notifyDidEnterBackground];
-        }];
+        // 两个通知族都要订阅，见 LCProxyObserveLifecycleNotifications 的说明。
+        LCProxyObserveLifecycleNotifications();
 
         g_lcForwarderUnavailableObserver =
         [[NSNotificationCenter defaultCenter] addObserverForName:LCProxyForwarderUnavailableNotification

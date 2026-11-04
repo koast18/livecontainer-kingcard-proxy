@@ -108,6 +108,17 @@ NSArray<NSString *> *LCProxyAllDataDirectories(void) {
     return [dirs sortedArrayUsingSelector:@selector(compare:)];
 }
 
+NSString *LCProxyHostProcessType(void) {
+    // LiveProcess/main.m 在调用 LiveContainerMain 之前 `setenv("LP_HOME_PATH", ...)`，
+    // 且只在该 appex 里设置 —— 这是区分两种宿主形态最可靠、无副作用的判据。
+    const char *lpHome = getenv("LP_HOME_PATH");
+    return (lpHome && lpHome[0]) ? @"liveprocess" : @"uiapp";
+}
+
+BOOL LCProxyIsExtensionHostedProcess(void) {
+    return [LCProxyHostProcessType() isEqualToString:@"liveprocess"];
+}
+
 // ---------------------------------------------------------------------------
 // 崩溃加固：兜住并记录 ObjC 异常
 // ---------------------------------------------------------------------------

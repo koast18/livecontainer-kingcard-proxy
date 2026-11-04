@@ -336,8 +336,11 @@ assert 'lcproxy_control_set_proxy_override("127.0.0.1", port)' in king, \
 assert 'lcproxy_control_reload_config()' in king, \
     'direct heal does not make the C layer re-read the pinned override'
 _heal = king[king.index('- (void)healMissingForwarderDirectly {'):]
-assert 'if ([self isRunning]) return;' in _heal, \
+assert 'if (!suspect && [self isRunning]) return;' in _heal, \
     'direct heal lacks the already-healthy guard (would churn forwarders)'
+# 安装时仍须复查：只替换缺失的或就是心跳判死的那个实例；别人刚装好的健康实例不动。
+assert 'self.forwarder != suspect &&\n        kp_forwarder_is_running(self.forwarder) == 1' in _heal, \
+    'direct heal may replace a healthy forwarder installed concurrently'
 assert 'kp_forwarder_stop(old' not in _heal and 'kp_forwarder_free(old' not in _heal, \
     'direct heal blocks on the old forwarder (defeats the purpose of bypassing the wedge)'
 
@@ -367,14 +370,17 @@ assert apply_cfg.index('self.forwarder = NULL') < apply_cfg.index('kp_forwarder_
 # 的 runtime apply，进而永久卡死整个串行 runtimeQueue 与 override 更新 —— 实测形态
 # 即 forwarderPort=0 / proxyOverridePort 恒等于旧值 / desiredForwarderRunning=true /
 # forwarderDiscardCount=0 / lastForwarderLifecycle=""。
-assert 'BOOL healthyRunning = shouldRun && self.forwarder != NULL' in apply_cfg, \
+assert 'BOOL healthyRunning = shouldRun && probeListening && self.forwarder != NULL' in apply_cfg, \
     'applyConfig does not gate reuse on the forwarder actually being healthy'
 # ⚠️ 这里曾断言用 kp_forwarder_listen_fd_valid（只看 fd 号）。那是**错的**：
 # 进入后台/熄屏会让监听 socket 失效，而 fd 号依旧 >= 0、running 标志仍为真，于是"健康"
 # 判断永远成立、转发器永远不重建 → 切后台后彻底断网且不再恢复（实测回归）。
 # 必须用真去 connect 一次的 kp_forwarder_is_listening()。
-assert 'kp_forwarder_is_listening(self.forwarder) == 1' in apply_cfg, \
+# 探活必须在 self.lock 外、retain 保护下进行，且重新取锁后确认仍是同一个转发器。
+assert 'kp_forwarder_is_listening(probeForwarder) == 1' in apply_cfg, \
     'reuse does not really probe the listen socket (fd-number check only => background regression)'
+assert 'self.forwarder == probeForwarder' in apply_cfg, \
+    'reuse gate does not confirm the probed forwarder is still installed'
 assert 'kp_forwarder_listen_fd_valid(self.forwarder) == 1' not in apply_cfg, \
     'the reuse gate went back to the fd-number check (background/screen-off regression)'
 assert '!forceRestart' not in apply_cfg, \
@@ -393,8 +399,8 @@ assert 'lcproxy_control_get_proxy_override' in _hb, \
     'heartbeat does not verify the published override port'
 assert 'lcproxy_control_set_proxy_override("127.0.0.1", port)' in _hb, \
     'heartbeat does not repin the override to the live forwarder port'
-assert 'healMissingForwarderDirectly' in _hb, \
-    'heartbeat does not heal a missing forwarder'
+assert 'healForwarderDirectlyReplacing:suspect' in _hb, \
+    'heartbeat does not heal a missing/dead forwarder'
 # 心跳不得取 lifecycleLock、也不得依赖 runtimeQueue（否则它自己就会被卡住的 apply
 # 堵死，失去兜底意义）。
 assert 'lifecycleLock' not in _hb, \
@@ -690,10 +696,11 @@ assert 'kp_forwarder_is_listening' in core, \
 _hb3 = king
 assert 'kp_forwarder_listen_fd_valid(self.forwarder) == 1;' not in _hb3, \
     'the forwarder-reuse gate is back to the fd-number check (background/screen-off regression)'
-assert re.search(r'kp_forwarder_is_listening\(self\.forwarder\) == 1;', king), \
+assert re.search(r'kp_forwarder_is_listening\(probeForwarder\) == 1\)', king), \
     'the forwarder-reuse gate does not use the real listen probe'
-assert 'kp_forwarder_is_listening(fw) == 1;' in king, \
-    'route publication does not require a real listen probe'
+_pub = king[king.index('- (void)publishRouteForSettings:'):king.index('- (NSString *)settingsSignature:')]
+assert 'kp_forwarder_is_listening(probeForwarder) == 1' in _pub and 'probeListening && fw == probeForwarder' in _pub, \
+    'route publication does not require a real listen probe on the installed forwarder'
 assert 'd[@"listenProbeOk"]' in king, \
     'the real listen-probe result is not exposed in status'
 

@@ -91,6 +91,8 @@ NSString *const LCProxyForwarderLifecycleChangedNotification = @"LCProxyForwarde
 @property (nonatomic, assign) NSUInteger heartbeatChainRepairCount;
 @property (nonatomic, assign) NSTimeInterval lastChainRepairRequestAt;
 @property (nonatomic, assign) NSTimeInterval lastHeartbeatAt;
+// 心跳真探活连续失败次数（仅 heartbeatQueue 串行访问）。
+@property (nonatomic, assign) NSInteger heartbeatProbeFailStreak;
 // 上次向共享日志写状态快照的时间；见 appendSharedStatusSnapshot。
 @property (nonatomic, assign) NSTimeInterval lastSharedSnapshotAt;
 @property (nonatomic, assign) void *forwarderPtr;
@@ -141,6 +143,7 @@ NSString *const LCProxyForwarderLifecycleChangedNotification = @"LCProxyForwarde
 - (void)requestBackgroundRefresh;
 - (void)retireForwarder:(kp_forwarder *)fw;
 - (void)healMissingForwarderDirectly;
+- (void)healForwarderDirectlyReplacing:(kp_forwarder *)suspect;
 - (void)startLivenessHeartbeat;
 - (void)heartbeatTick;
 
@@ -248,6 +251,16 @@ static const NSTimeInterval LCProxyKingLifecycleNotifyMinInterval = 5.0;
     NSString *signature = [self settingsSignature:settings];
     kp_forwarder *oldForwarder = NULL;
     kp_forwarder *newForwarder = NULL;
+    // 真·监听探测（阻塞 connect，最长 500ms）必须在 self.lock 外做：锁内 retain 快照，
+    // 锁外探测，再重新取锁并确认 self.forwarder 仍是刚才探测的那一个。
+    kp_forwarder *probeForwarder = NULL;
+    [self.lock lock];
+    if (shouldRun && self.forwarder && kp_forwarder_retain(self.forwarder) == 0) {
+        probeForwarder = self.forwarder;
+    }
+    [self.lock unlock];
+    BOOL probeListening = probeForwarder ? (kp_forwarder_is_listening(probeForwarder) == 1) : NO;
+    if (probeForwarder) kp_forwarder_release(probeForwarder);
 
     [self.lock lock];
     // 复用健康转发器：**即便 forceRestart 为真**，只要现有转发器仍在运行且监听 fd
@@ -267,9 +280,9 @@ static const NSTimeInterval LCProxyKingLifecycleNotifyMinInterval = 5.0;
     // 因此把"是否复用"的判据从"是否要求重启"改成"现役转发器是否真的健康"：
     // 健康就复用（并就地重装凭证），不健康才重建。这既消除了绝大部分 teardown
     // 窗口，也让每次切前后台/切网都不再中断转发。
-    BOOL healthyRunning = shouldRun && self.forwarder != NULL &&
-                          kp_forwarder_is_running(self.forwarder) == 1 &&
-                          kp_forwarder_is_listening(self.forwarder) == 1;
+    BOOL healthyRunning = shouldRun && probeListening && self.forwarder != NULL &&
+                          self.forwarder == probeForwarder &&
+                          kp_forwarder_is_running(self.forwarder) == 1;
     BOOL alreadyRunning = healthyRunning;
     if (alreadyRunning) {
         kp_forwarder *fw = self.forwarder;
@@ -421,7 +434,12 @@ static const NSTimeInterval LCProxyKingLifecycleNotifyMinInterval = 5.0;
 }
 
 - (void)heartbeatTick {
+    // 墙钟间隔检测挂起：dispatch 定时器基于 mach 时间，进程挂起/设备睡眠期间不推进；
+    // NSDate 是墙钟，照常推进。两次心跳之间墙钟跳了远超周期的时间 = 刚从挂起中恢复。
+    NSTimeInterval previousBeat = self.lastHeartbeatAt;
     self.lastHeartbeatAt = [[NSDate date] timeIntervalSince1970];
+    BOOL resumedFromSuspend = previousBeat > 0 &&
+        (self.lastHeartbeatAt - previousBeat) > LCProxyKingLivenessInterval * 3;
 
     // 周期性把状态快照写进共享日志（让其他进程的控制台也能看到本进程）。
     // 放在最前面：即使转发器缺失、后面提前 return，本进程的状态也必须可见 ——
@@ -442,16 +460,63 @@ static const NSTimeInterval LCProxyKingLifecycleNotifyMinInterval = 5.0;
     [self.lock unlock];
     if (!shouldRun) return;
 
-    int port = [self localForwarderPort];
-    if (port <= 0 || ![self isRunning]) {
+    // 刚从挂起恢复：续期定时器同样基于 mach 时间，挂起期间没走，恢复后还要再等最多
+    // 一个周期（120s）才会去续期 —— 而挂起超过 Q-Token 有效期时手上的凭证早已过期（B3）。
+    // 这里立即请求一次**非强制**刷新：缓存仍新鲜则只是本地命中、不发网络请求；
+    // 已过期才真正取号。取号成功后 finishRefresh 会自行重启续期定时器。
+    if (resumedFromSuspend) {
+        [self appendSharedRefreshLogEntry:@{
+            @"ok": @YES,
+            @"src": @"heartbeat-resume",
+            @"ms": @0,
+            @"msg": [NSString stringWithFormat:@"心跳间隔 %.0fs（进程曾挂起），请求校验/续期凭证",
+                     self.lastHeartbeatAt - previousBeat],
+        }];
+        [self refreshCredentialsAsync];
+    }
+
+    // ★ 必须用真探活，而不是只看内存标志的 isRunning。
+    //
+    // 挂起期间 iOS 可能回收监听 socket：fd 号不变、running 仍为 1。若只看 isRunning，
+    // 心跳永远认为"健康"，永不重建。探活在 self.lock 外做（锁内 retain 快照 → 锁外 connect
+    // → release），按 retain 成功与否决定是否 release。
+    // 连续 2 次失败才判死，避免一次瞬时超时（极端负载下的 backlog 满）触发不必要的重建。
+    // （accept 循环已判定监听失效时 listener_error != 0，证据确凿，立即自愈。）
+    int port = 0;
+    BOOL listening = NO;
+    // 仅作身份标识传给自愈（在锁内与 self.forwarder 比较），绝不在锁外解引用。
+    kp_forwarder *suspect = NULL;
+    {
+        kp_forwarder *probeForwarder = NULL;
+        [self.lock lock];
+        if (self.forwarder && kp_forwarder_retain(self.forwarder) == 0) {
+            probeForwarder = self.forwarder;
+            port = kp_forwarder_port(probeForwarder);
+        }
+        [self.lock unlock];
+        if (probeForwarder) {
+            listening = kp_forwarder_is_listening(probeForwarder) == 1;
+            BOOL listenerDead = kp_forwarder_listener_error(probeForwarder) != 0;
+            kp_forwarder_release(probeForwarder);
+            if (listening) {
+                self.heartbeatProbeFailStreak = 0;
+            } else if (!listenerDead && ++self.heartbeatProbeFailStreak < 2) {
+                return;  // 第一次失败：下一拍再确认。
+            } else {
+                suspect = probeForwarder;
+            }
+        }
+    }
+    if (port <= 0 || !listening) {
+        self.heartbeatProbeFailStreak = 0;
         self.heartbeatHealCount++;
         [self appendSharedRefreshLogEntry:@{
             @"ok": @NO,
             @"src": @"heartbeat-heal",
             @"ms": @0,
-            @"msg": [NSString stringWithFormat:@"转发器缺失，心跳触发直接自愈 (port=%d)", port],
+            @"msg": [NSString stringWithFormat:@"转发器缺失或监听已失效，心跳触发直接自愈 (port=%d)", port],
         }];
-        [self healMissingForwarderDirectly];
+        [self healForwarderDirectlyReplacing:suspect];
         return;
     }
 
@@ -539,7 +604,14 @@ static const NSTimeInterval LCProxyKingLifecycleNotifyMinInterval = 5.0;
 //    循环有界等待，其线程 ≤500ms 自行退出，故回收不会长期占住队列）；
 //  · 重复调用安全：开头复查 isRunning，已被别人修好就直接返回。
 - (void)healMissingForwarderDirectly {
-    if ([self isRunning]) return;
+    [self healForwarderDirectlyReplacing:NULL];
+}
+
+// suspect：心跳真探活已确认不再监听的那个转发器（可为 NULL）。它的 is_running 可能仍为 1
+// （socket 失效但 poll 未报错），所以不能再用 isRunning 提前返回，否则自愈永远不发生。
+// 只替换仍是 suspect 的那个实例；若期间已被别人换成了健康的新实例，就丢弃本次成果。
+- (void)healForwarderDirectlyReplacing:(kp_forwarder *)suspect {
+    if (!suspect && [self isRunning]) return;
 
     kp_forwarder *fw = kp_forwarder_new("127.0.0.1", 0, "", 0);
     if (!fw) return;
@@ -556,17 +628,27 @@ static const NSTimeInterval LCProxyKingLifecycleNotifyMinInterval = 5.0;
     }
 
     [self.lock lock];
-    if (self.forwarder != NULL) {
-        // 期间已有别人装上转发器：丢弃本次成果，避免两个实例并存。
+    if (self.forwarder != NULL && self.forwarder != suspect &&
+        kp_forwarder_is_running(self.forwarder) == 1) {
+        // 期间已有别人装上健康的转发器：丢弃本次成果，避免两个实例并存。
         [self.lock unlock];
         [self retireForwarder:fw];
         return;
     }
+    // 现役转发器为空，或对象还在但监听已死（is_running==0：accept 循环判定监听
+    // socket 失效）。旧实现只处理"为空"，对"对象在、监听死"会把新建的转发器丢掉并返回，
+    // 自愈形同虚设。这里在锁内原子替换：谁把旧指针从 self.forwarder 摘下，谁负责回收，
+    // 与 applyConfig 的所有权规则一致，不会双释放。
     kp_forwarder *old = self.forwarder;
     self.forwarder = fw;
     self.desiredForwarderRunning = YES;
+    // 已发布的路由必须跟着换端口：否则 syncFetchGuid 会拿 publishedForwarderPort（旧的、
+    // 已无人监听的端口）去取号，而路由校验只比较 self.forwarder 指针，发现不了。
+    // override 下面立即钉到同一个端口，二者保持一致。
+    if (self.routePublished) self.publishedForwarderPort = port;
     [self.lock unlock];
 
+    // 旧实例交给回收队列异步 stop/free（绝不在本路径同步等待）。
     [self retireForwarder:old];
 
     // 直接钉住 override 并让 C 层按新端口重解析配置 —— 不等 runtimeQueue。
@@ -599,10 +681,22 @@ static const NSTimeInterval LCProxyKingLifecycleNotifyMinInterval = 5.0;
     BOOL isKingRoute = proxyActive && [effectiveMode isEqualToString:@"kingcard"];
     int port = 0;
     BOOL published = NO;
+    // 锁内 retain 快照 → 锁外探测 → 重新取锁并确认仍是同一个转发器。
+    // 探测是阻塞 connect（最长 500ms），持 self.lock 做会拖慢所有持锁方。
+    kp_forwarder *probeForwarder = NULL;
+    [self.lock lock];
+    if (isKingRoute && self.forwarder && kp_forwarder_retain(self.forwarder) == 0) {
+        probeForwarder = self.forwarder;
+    }
+    [self.lock unlock];
+    BOOL probeListening = probeForwarder ? (kp_forwarder_is_listening(probeForwarder) == 1) : NO;
+    if (probeForwarder) kp_forwarder_release(probeForwarder);
+
     [self.lock lock];
     kp_forwarder *fw = self.forwarder;
     port = fw ? kp_forwarder_port(fw) : 0;
-    published = isKingRoute && port > 0 && kp_forwarder_is_listening(fw) == 1;
+    published = isKingRoute && port > 0 && probeListening && fw == probeForwarder &&
+                kp_forwarder_is_running(fw) == 1;
     self.routePublished = published;
     self.publishedForwarderPort = published ? port : 0;
     [self.lock unlock];
@@ -652,10 +746,11 @@ static const NSTimeInterval LCProxyKingLifecycleNotifyMinInterval = 5.0;
     kp_forwarder *fw = self.forwarder;
     BOOL retained = (fw != NULL) && (kp_forwarder_retain(fw) == 0);
     int port = fw ? kp_forwarder_port(fw) : 0;
-    BOOL listenProbe = fw ? (kp_forwarder_is_listening(fw) == 1) : NO;
     BOOL routePublished = self.routePublished;
     NSString *err = self.lastError ?: @"";
     [self.lock unlock];
+    // 探测是阻塞 connect（最长 500ms），必须在锁外做；retain 已保证 fw 不被回收。
+    BOOL listenProbe = retained ? (kp_forwarder_is_listening(fw) == 1) : NO;
 
     if (!retained) {
         return @{ @"ok": @NO,
@@ -1132,7 +1227,9 @@ static const NSTimeInterval LCProxyKingChainRepairMinInterval = 20.0;
     int fwdPort = self.forwarder ? kp_forwarder_port(self.forwarder) : 0;
     BOOL running = self.forwarder != NULL && kp_forwarder_is_running(self.forwarder) == 1;
     BOOL listenOk = self.forwarder ? (kp_forwarder_listen_fd_valid(self.forwarder) == 1) : NO;
-    kp_forwarder *fw = self.forwarder;
+    int listenerError = self.forwarder ? kp_forwarder_listener_error(self.forwarder) : 0;
+    // 锁外还要读 fw 的统计：必须 retain，否则 applyConfig/回收队列可能在此期间 free 它。
+    kp_forwarder *fw = (self.forwarder && kp_forwarder_retain(self.forwarder) == 0) ? self.forwarder : NULL;
     BOOL ready = self.lastRefreshSuccess;
     NSString *err = self.lastError ?: @"";
     [self.lock unlock];
@@ -1149,12 +1246,18 @@ static const NSTimeInterval LCProxyKingChainRepairMinInterval = 20.0;
     d[@"bundle"] = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
     d[@"ver"] = [NSString stringWithUTF8String:KPTWEAK_VERSION];
     d[@"isSharedTweaks"] = @([LCProxyDylibPath() containsString:@"/LiveContainer/Tweaks/"]);
+    // 宿主形态。共享 App 在 multitask 下会被交给另一个 LC 实例（往往是 liveprocess），
+    // 而那种进程里 UIApplication* 生命周期通知不会被投递 —— 跨进程对比时必须能看出来，
+    // 否则“私有正常/共享不正常”会被误读成同一类进程的差异。
+    d[@"hostType"] = LCProxyHostProcessType();
+    d[@"isExtensionHosted"] = @(LCProxyIsExtensionHostedProcess());
     d[@"home"] = NSHomeDirectory() ?: @"";
     d[@"port"] = @(fwdPort);
     d[@"chainPort"] = @(lcproxy_control_get_applied_override_port());
     d[@"overridePort"] = @(ovPort);
     d[@"running"] = @(running);
     d[@"listenOk"] = @(listenOk);
+    d[@"listenerError"] = @(listenerError);
     d[@"ready"] = @(ready);
     d[@"vErr"] = err.length > 80 ? [err substringToIndex:80] : err;
 
@@ -1183,6 +1286,7 @@ static const NSTimeInterval LCProxyKingChainRepairMinInterval = 20.0;
             @"lastResp": [NSString stringWithUTF8String:stats.last_up_resp] ?: @"",
             @"req": [NSString stringWithUTF8String:stats.last_creq] ?: @"",
         };
+        kp_forwarder_release(fw);
     }
 
     LCProxySharedLogAppendLine(dir, @"kingcard-status.log",
@@ -1252,14 +1356,18 @@ static const NSTimeInterval LCProxyKingChainRepairMinInterval = 20.0;
     NSTimeInterval requestTimeout = MIN(MAX(timeout, 1.0), 15.0);
     NSTimeInterval requestWindow = requestTimeout + 10.0;
     NSTimeInterval permitLifetime = requestWindow + LCProxyKingPBProxyBootstrapSetupAllowance;
+    // 锁内只做 retain 快照；真·监听探测（阻塞 connect，最长 500ms）在锁外做，再重新取锁
+    // 确认路由与转发器都没变。注意：只有 retain 成功时才允许 release（旧实现在未 retain
+    // 时也 release，会扣掉别人持有的 retained_clients，让 stop 提前回收仍在用的转发器）。
     [self.lock lock];
     kp_forwarder *forwarder = self.forwarder;
+    BOOL retained = self.routePublished && forwarder != NULL && kp_forwarder_retain(forwarder) == 0;
+    [self.lock unlock];
+    BOOL listening = retained && kp_forwarder_is_listening(forwarder) == 1;
+
+    [self.lock lock];
     int port = self.publishedForwarderPort;
-    BOOL routePublished = self.routePublished && forwarder != NULL &&
-                          kp_forwarder_is_listening(forwarder) == 1;
-    if (routePublished) {
-        routePublished = kp_forwarder_retain(forwarder) == 0;
-    }
+    BOOL routePublished = listening && self.routePublished && self.forwarder == forwarder;
     NSString *bootstrapPassword = [NSUUID UUID].UUIDString;
     NSString *bootstrapCredential = [NSString stringWithFormat:@"lcproxy-bootstrap:%@", bootstrapPassword];
     NSString *bootstrapAuthorization = [NSString stringWithFormat:@"Basic %@",
@@ -1272,7 +1380,7 @@ static const NSTimeInterval LCProxyKingChainRepairMinInterval = 20.0;
     }
     [self.lock unlock];
     if (!routePublished) {
-        if (forwarder) kp_forwarder_release(forwarder);
+        if (retained) kp_forwarder_release(forwarder);
         if (outErr) *outErr = [NSError errorWithDomain:@"LCProxyKing" code:-20
             userInfo:@{NSLocalizedDescriptionKey: @"王卡本地路由尚未发布"}];
         return nil;
@@ -1866,9 +1974,13 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
         [self.lock lock];
         kp_forwarder *fw = self.forwarder;
         int port = fw ? kp_forwarder_port(fw) : 0;
+        // 必须 retain：下面的探活在锁外、最长约 5s，期间心跳自愈可能把 fw 摘下并交给
+        // 回收队列（不受 lifecycleLock 约束）。retain 让 stop 等待我们释放后才 free。
+        BOOL retained = fw != NULL && kp_forwarder_retain(fw) == 0;
         [self.lock unlock];
 
-        if (!fw || port <= 0 || kp_forwarder_listen_fd_valid(fw) != 1) {
+        if (!retained || port <= 0 || kp_forwarder_listen_fd_valid(fw) != 1) {
+            if (retained) kp_forwarder_release(fw);
             [self.lock lock];
             self.lastHealthCheckOk = NO;
             self.lastHealthCheckAt = [[NSDate date] timeIntervalSince1970];
@@ -1883,6 +1995,7 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
             // credentials, so the probe credentials below can be arbitrary.
             proxyOk = kp_probe_generate204("127.0.0.1", port, "probe", "probe", 4000) == 1;
         }
+        kp_forwarder_release(fw);
 
         [self.lock lock];
         self.lastHealthCheckOk = listenOk && proxyOk;
@@ -1958,21 +2071,33 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
     // 运营商不认，仅应短暂存在）/ 空（旧记录）。它能一眼区分"身份是假的"这类故障。
     // 必须在取 self.lock **之前**读（loadState 用 cacheLock，锁序不允许嵌套）。
     NSString *guidSourceText = [state[@"guidSource"] isKindOfClass:[NSString class]] ? state[@"guidSource"] : @"";
+    // ★ 真·监听检查：实际 connect 一次 listen_port（最长 500ms）。
+    // listenFdValid 只看 fd 号 —— 后台/熄屏会让 socket 失效而 fd 依旧 >= 0，于是它恒为 1。
+    //
+    // 必须在**不持有** self.lock 时探测：
+    //   ① v0.5.75 起这里曾在已持有 self.lock 的区段里再 [self.lock lock] 取快照。
+    //      self.lock 是 NSLock、不可重入 → 第一次调用 status 就让本线程永久挂死，
+    //      并把 self.lock 永久占住：heartbeat / applyConfig / refresh / syncFetchGuid
+    //      全部卡死，凭证到期（Q-Token 7200s）后整个 App 断网且永不恢复。
+    //      控制台页面每 5s 轮询 /api/status，所以“打开过控制台”就足以触发。
+    //   ② 探测本身是阻塞 connect，持锁探测会把所有持锁方拖慢最多 500ms。
+    // 做法：锁内 retain（保证锁外探测时 fw 不被回收），锁外探测，然后 release。
+    // retain 失败 = 转发器已停止，探测结果本来就是 0。
+    kp_forwarder *fwForProbe = NULL;
+    [self.lock lock];
+    if (self.forwarder && kp_forwarder_retain(self.forwarder) == 0) fwForProbe = self.forwarder;
+    [self.lock unlock];
+    int listenProbeOk = fwForProbe ? kp_forwarder_is_listening(fwForProbe) : 0;
+    if (fwForProbe) kp_forwarder_release(fwForProbe);
+
     [self.lock lock];
     NSMutableDictionary *d = [NSMutableDictionary dictionary];
     d[@"running"] = @([self isRunning]);
     d[@"forwarderPort"] = @(self.forwarder ? kp_forwarder_port(self.forwarder) : 0);
     d[@"activeForwarderClients"] = @(self.forwarder ? kp_forwarder_active_clients(self.forwarder) : 0);
     d[@"listenFdValid"] = @(self.forwarder ? kp_forwarder_listen_fd_valid(self.forwarder) : 0);
-    // ★ 真·监听检查：实际 connect 一次 listen_port。
-    // listenFdValid 只看 fd 号 —— 后台/熄屏会让 socket 失效而 fd 依旧 >= 0，于是它恒为 1，
-    // 这正是"切后台后永久断网"此前无法从 status 看出的原因。本字段才是真相。
-    {
-        [self.lock lock];
-        kp_forwarder *fwForProbe = self.forwarder;
-        [self.lock unlock];
-        d[@"listenProbeOk"] = @(fwForProbe ? kp_forwarder_is_listening(fwForProbe) : 0);
-    }
+    // 探测结果在上面锁外取得（见注释）；这里只回填。
+    d[@"listenProbeOk"] = @(listenProbeOk);
     d[@"lastHealthCheckOk"] = @(self.lastHealthCheckOk);
     d[@"lastHealthCheckAt"] = @(self.lastHealthCheckAt);
     d[@"lastRefreshSuccess"] = @(self.lastRefreshSuccess);
@@ -1993,6 +2118,8 @@ static const NSUInteger LCProxyKingRefreshLogMax = 20;
     d[@"heartbeatRepinCount"] = @(self.heartbeatRepinCount);
     d[@"heartbeatChainRepairCount"] = @(self.heartbeatChainRepairCount);
     d[@"lastHeartbeatAt"] = @(self.lastHeartbeatAt);
+    // accept 循环判定的监听失效原因（0 = 正常；>0 errno；-1 poll ERR/HUP/NVAL；-2 连续 ECONNABORTED）。
+    d[@"listenerError"] = @(self.forwarder ? kp_forwarder_listener_error(self.forwarder) : 0);
     d[@"credentialLogPath"] = logPath;
     d[@"credentialCacheCount"] = @(self.cachedCredentialState.count);
     d[@"refreshLog"] = [self.refreshLog copy];

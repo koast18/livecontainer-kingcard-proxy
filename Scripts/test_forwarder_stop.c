@@ -23,6 +23,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -255,10 +256,71 @@ static void test_stop_idle_forwarder(void) {
     kp_forwarder_free(fw);
 }
 
+// 监听 socket 失效（模拟 iOS 挂起期间回收 socket：fd 号不变、running 仍为 1）。
+//
+// 用 dup2 把一个非 socket（/dev/null）顶替到监听 fd 号上：poll 立即"就绪"、accept 立即
+// 报 ENOTSOCK。旧实现对此一律 continue —— 100% CPU 空转、is_running 永远为 1，于是所有
+// 健康判据都说"健康"，心跳永不重建（后台/熄屏后彻底断网且不恢复）。
+// 断言：1) 1 秒内 is_running 变为 0、listener_error 非 0；2) stop/free 仍然正常且快速。
+static int find_listen_fd(int port) {
+    for (int fd = 3; fd < 1024; fd++) {
+        struct sockaddr_in a;
+        socklen_t len = sizeof(a);
+        if (getsockname(fd, (struct sockaddr *)&a, &len) != 0) continue;
+        if (a.sin_family != AF_INET || ntohs(a.sin_port) != port) continue;
+        int acc = 0;
+        socklen_t alen = sizeof(acc);
+        if (getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN, &acc, &alen) == 0 && acc) return fd;
+    }
+    return -1;
+}
+
+static void test_dead_listener_detected(void) {
+    printf("start test: dead listener socket is reported as not running\n");
+    kp_forwarder *fw = kp_forwarder_new("127.0.0.1", 0, "", 0);
+    if (!fw || kp_forwarder_start(fw) != 0) {
+        printf("FAIL: cannot start forwarder\n");
+        test_failed = 1;
+        return;
+    }
+    int lfd = find_listen_fd(kp_forwarder_port(fw));
+    int devnull = open("/dev/null", O_RDONLY);
+    if (lfd < 0 || devnull < 0 || dup2(devnull, lfd) < 0) {
+        printf("FAIL: cannot locate/replace listen fd (lfd=%d)\n", lfd);
+        test_failed = 1;
+        if (devnull >= 0) close(devnull);
+        kp_forwarder_free(fw);
+        return;
+    }
+    close(devnull);
+    double t0 = now_sec();
+    while (kp_forwarder_is_running(fw) == 1 && now_sec() - t0 < 2.0) usleep(10000);
+    double dt = now_sec() - t0;
+    if (kp_forwarder_is_running(fw) != 0 || kp_forwarder_listener_error(fw) == 0 ||
+        kp_forwarder_listen_fd_valid(fw) != 0 || kp_forwarder_is_listening(fw) != 0) {
+        printf("FAIL: dead listener still reported healthy (running=%d err=%d)\n",
+               kp_forwarder_is_running(fw), kp_forwarder_listener_error(fw));
+        test_failed = 1;
+    } else {
+        printf("dead listener detected in %.0fms (err=%d) OK\n", dt * 1000.0,
+               kp_forwarder_listener_error(fw));
+    }
+    if (kp_forwarder_retain(fw) == 0) kp_forwarder_release(fw);
+    t0 = now_sec();
+    int rc = kp_forwarder_stop(fw);
+    dt = now_sec() - t0;
+    if (rc != 0 || dt > 1.0) {
+        printf("FAIL: stop after dead listener rc=%d dt=%.2fs\n", rc, dt);
+        test_failed = 1;
+    }
+    kp_forwarder_free(fw);
+}
+
 int main(void) {
     kp_set_debug_logger(NULL);
     test_stop_idle_forwarder();
     test_stop_wakes_blocked_relay();
+    test_dead_listener_detected();
     if (test_failed) {
         printf("forwarder stop tests FAILED\n");
         return 1;

@@ -22,6 +22,7 @@ static const NSUInteger LCProxyDefaultPort = 19092;
 
 @interface LCProxyServer ()
 @property (nonatomic, strong) GCDWebServer *server;
+- (void)recordConsoleEndpoint;
 @end
 
 @implementation LCProxyServer
@@ -114,6 +115,11 @@ static const NSUInteger LCProxyDefaultPort = 19092;
     d[@"effectiveMode"] = [[LCProxyConfig shared] effectiveProxyModeForSettings:cfg];
     d[@"proxyCount"] = @(lcproxy_control_get_proxy_count());
     d[@"serverPort"] = @(self.port);
+    // 宿主形态：自检端点只反映**提供该端口的那一个进程**，因此必须能一眼看出
+    // 它是主 App 进程还是 LiveProcess.appex，以及它是私有还是共享 tweaks 路径。
+    d[@"hostProcessType"] = LCProxyHostProcessType();
+    d[@"isExtensionHosted"] = @(LCProxyIsExtensionHostedProcess());
+    d[@"isSharedTweaks"] = @([LCProxyDylibPath() containsString:@"/LiveContainer/Tweaks/"]);
     d[@"version"] = [NSString stringWithUTF8String:KPTWEAK_VERSION];
     d[@"dylibVersion"] = [NSString stringWithUTF8String:KPTWEAK_VERSION];
     d[@"gitCommit"] = [NSString stringWithUTF8String:KPTWEAK_GIT_COMMIT];
@@ -408,6 +414,9 @@ static const NSUInteger LCProxyDefaultPort = 19092;
         out[@"pid"] = payload[@"pid"] ?: @0;
         out[@"bundleId"] = payload[@"bundleId"] ?: @"";
         out[@"version"] = payload[@"version"] ?: @"";
+        out[@"hostProcessType"] = LCProxyHostProcessType();
+        out[@"isExtensionHosted"] = @(LCProxyIsExtensionHostedProcess());
+        out[@"isSharedTweaks"] = @([LCProxyDylibPath() containsString:@"/LiveContainer/Tweaks/"]);
         // 本进程关键现场（便于快速核对，不必再翻整个 status）。
         NSDictionary *king = [payload[@"king"] isKindOfClass:[NSDictionary class]] ? payload[@"king"] : @{};
         out[@"king"] = @{
@@ -485,6 +494,10 @@ static const NSUInteger LCProxyDefaultPort = 19092;
         out[@"bundleId"] = [self currentBundleId];
         out[@"version"] = [NSString stringWithUTF8String:KPTWEAK_VERSION];
         out[@"isSharedTweaks"] = @([LCProxyDylibPath() containsString:@"/LiveContainer/Tweaks/"]);
+        // 自检测的是“**提供 19092/临时端口的这个进程**能不能转发”。必须同时标出宿主形态，
+        // 否则无法判断拿到的到底是不是出问题的那个进程（见 LCProxyPaths.h）。
+        out[@"hostProcessType"] = LCProxyHostProcessType();
+        out[@"isExtensionHosted"] = @(LCProxyIsExtensionHostedProcess());
         return [self json:out];
     }];
 
@@ -545,11 +558,56 @@ static const NSUInteger LCProxyDefaultPort = 19092;
         GCDWebServerOption_AutomaticallySuspendInBackground: @NO,
     } error:&err];
     if (!ok) {
-        NSLog(@"[LCProxy] web server start failed: %@", err.localizedDescription ?: @"?");
-        return NO;
+        // 19092 被另一个 LiveContainer 进程占着时，此前是**静默 headless** —— 于是
+        // “打开控制台”实际看到的永远是**抢到端口的那个进程**，而共享 App 往往跑在
+        // 另一个进程里。历次排查因此反复拿错现场（“每个字段都正常却连不上”）。
+        // 这里改为退到临时端口：**每个进程都一定有自己的控制台**，自检才能真的在
+        // 出问题的那一个进程里跑。
+        NSLog(@"[LCProxy] web server 19092 busy (%@), falling back to an ephemeral port",
+              err.localizedDescription ?: @"?");
+        err = nil;
+        ok = [server startWithOptions:@{
+            GCDWebServerOption_Port: @0,
+            GCDWebServerOption_BindToLocalhost: @YES,
+            GCDWebServerOption_AutomaticallySuspendInBackground: @NO,
+        } error:&err];
+        if (!ok) {
+            NSLog(@"[LCProxy] web server start failed: %@", err.localizedDescription ?: @"?");
+            return NO;
+        }
     }
     _server = server;
+    [self recordConsoleEndpoint];
     return YES;
+}
+
+// 把“本进程的控制台在哪个端口”写到 canonical 目录，让任何进程都能列出全部进程的
+// 控制台地址。没有它，多进程场景下无法确定 /api/selfcheck 测的到底是谁。
+- (void)recordConsoleEndpoint {
+    @try {
+        NSString *dir = LCProxyCanonicalDataDirectory();
+        if (!dir.length) return;
+        [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                                  withIntermediateDirectories:YES attributes:nil error:nil];
+        NSDictionary *entry = @{
+            @"ts": @([[NSDate date] timeIntervalSince1970]),
+            @"pid": @(getpid()),
+            @"port": @(self.port),
+            @"bundle": [self currentBundleId] ?: @"",
+            @"version": [NSString stringWithUTF8String:KPTWEAK_VERSION],
+            @"hostProcessType": LCProxyHostProcessType(),
+            @"isExtensionHosted": @(LCProxyIsExtensionHostedProcess()),
+            @"isSharedTweaks": @([LCProxyDylibPath() containsString:@"/LiveContainer/Tweaks/"]),
+        };
+        NSData *data = [NSJSONSerialization dataWithJSONObject:entry options:0 error:nil];
+        if (!data) return;
+        NSString *path = [dir stringByAppendingPathComponent:
+                          [NSString stringWithFormat:@"console-port-%d.json", getpid()]];
+        [data writeToFile:path atomically:YES];
+    } @catch (NSException *e) {
+        // 纯诊断，绝不能影响控制台本身。
+        LCProxyRecordSwallowedException(@"recordConsoleEndpoint", e);
+    }
 }
 
 @end
