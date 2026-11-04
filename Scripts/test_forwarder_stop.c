@@ -268,9 +268,13 @@ static int find_listen_fd(int port) {
         socklen_t len = sizeof(a);
         if (getsockname(fd, (struct sockaddr *)&a, &len) != 0) continue;
         if (a.sin_family != AF_INET || ntohs(a.sin_port) != port) continue;
-        int acc = 0;
-        socklen_t alen = sizeof(acc);
-        if (getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN, &acc, &alen) == 0 && acc) return fd;
+        // A listening socket has no peer. Darwin does not reliably report
+        // SO_ACCEPTCONN through getsockopt, so the peer check is the portable
+        // discriminator (accepted sockets share the local port but have a peer).
+        struct sockaddr_in peer;
+        socklen_t plen = sizeof(peer);
+        if (getpeername(fd, (struct sockaddr *)&peer, &plen) == 0) continue;
+        return fd;
     }
     return -1;
 }
